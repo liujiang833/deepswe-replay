@@ -166,8 +166,8 @@ git checkout <base> astropy/modeling/tests/test_separable.py
 ![操作构成](op_mix_count.png)
 
 ```
-读代码/搜索 8 (42%)   生成/检查patch 4 (21%)   跑测试 3 (16%)
-复现脚本 2 (11%)      改源码 1 (5%)            提交 1 (5%)
+读代码/搜索 8 (42%)              生成/检查patch 4 (21%)   跑测试(pytest) 3 (16%)
+复现脚本(python heredoc) 1 (5%)  验证脚本(同) 1 (5%)      改源码(同) 1 (5%)   提交 1 (5%)
 ```
 
 实际调用的程序：`git`×4、`sed`×3、`python`×3、`pytest`×3、`head`×2、`cat`×2、`ls`/`find`/`grep`/`echo` 各 1。
@@ -184,12 +184,18 @@ git checkout <base> astropy/modeling/tests/test_separable.py
 
 | 阶段 | 按次数 | 按执行时间 |
 |---|---:|---:|
-| 跑测试 | 3 次 · 16% | **8.31 s · 60%** |
-| 复现 / 验证脚本 | 2 次 · 11% | 2.98 s · 22% |
+| 跑测试（pytest） | 3 次 · 16% | **8.31 s · 60%** |
+| 复现脚本（python heredoc） | 1 次 · 5% | 1.95 s · 14% |
+| 验证脚本（python heredoc） | 1 次 · 5% | 1.02 s · 7% |
 | 读代码 / 搜索 | **8 次 · 42%** | 1.27 s · **9%** |
 | 生成 / 检查 patch | 4 次 · 21% | 0.72 s · 5% |
-| 改源码 | 1 次 · 5% | 0.26 s · 2% |
+| 改源码（python heredoc） | 1 次 · 5% | 0.26 s · 2% |
 | 提交 | 1 次 · 5% | 0.25 s · 2% |
+
+括号标的是命令形态而非"是不是 Python"：容器里的 `pytest` 本身就是 Python console script
+（`#!/opt/…/bin/python`），跑测试同样是 Python 进程；它显示成 `pytest` 只是因为模型敲的是
+`pytest -q …` 而不是 `python -m pytest`。有意义的区分是代码谁写的——heredoc 是模型现场写的，
+pytest 跑的是仓库里现成的测试。
 
 次数最多的读和搜几乎不花时间（每条 0.22–0.29s，大半还是 `docker exec` 的固定开销）；
 时间全被 pytest 吃掉。同样是 `python - <<'PY'`，复现脚本 1.95s（要 `import astropy`）、

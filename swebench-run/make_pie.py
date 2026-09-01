@@ -23,7 +23,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
-from analyze_traj import classify, split_commands, strip_cd
 
 font_manager.fontManager.addfont("/home/river/.local/share/fonts/WenQuanYiMicroHei.ttf")
 plt.rcParams["font.family"] = ["WenQuanYi Micro Hei"]
@@ -32,16 +31,21 @@ plt.rcParams["axes.unicode_minus"] = False
 SURFACE, INK, INK2, INK3 = "#fcfcfb", "#0b0b0b", "#52514e", "#8a8880"
 
 # fixed wedge order + fixed color per phase (validated as a ring, wrap included)
+# 标注写的是命令形态，不是"是不是 Python"——pytest 本身就是个 Python console script
+# (#!/opt/miniconda3/envs/testbed/bin/python)，跑测试同样是 Python 进程。
+# 有意义的区分是代码谁写的：heredoc 是模型现场写的，pytest 跑的是仓库里现成的测试。
+# 那三条 heredoc 之间再靠"正文写不写盘"和"相对改源码的位置"区分。
 PHASES = [
-    ("读代码 / 搜索",      "#2a78d6", ["read_file", "list_dir", "search_files", "search_content"]),
-    ("生成 / 检查 patch",  "#eb6834", ["make_patch", "vcs"]),
-    ("跑测试",             "#1baf7a", ["run_tests"]),
-    ("复现 / 验证脚本",    "#eda100", ["repro_script"]),
-    ("改源码",             "#e87ba4", ["edit_file"]),
-    ("提交",               "#008300", ["submit"]),
+    ("读代码 / 搜索",       "#2a78d6", ["read_file", "list_dir", "search_files", "search_content"]),
+    ("生成 / 检查 patch",   "#eb6834", ["make_patch", "vcs"]),
+    ("跑测试（pytest）",     "#1baf7a", ["run_tests"]),
+    ("复现脚本（python heredoc）", "#eda100", ["repro_script"]),
+    ("验证脚本（python heredoc）", "#4a3aa7", ["verify_script"]),
+    ("改源码（python heredoc）",   "#e87ba4", ["edit_file"]),
+    ("提交",                "#008300", ["submit"]),
 ]
 # which phase a whole command belongs to, when it mixes intents
-PRIORITY = ["submit", "run_tests", "edit_file", "repro_script",
+PRIORITY = ["submit", "run_tests", "edit_file", "repro_script", "verify_script",
             "make_patch", "vcs", "search_content", "search_files", "read_file", "list_dir"]
 INTENT2PHASE = {k: name for name, _, keys in PHASES for k in keys}
 
@@ -55,22 +59,27 @@ def by_count(res):
     return vals, "次", lambda v: f"{v:.0f} 次"
 
 
-def command_phase(cmd: str) -> str:
-    intents = set()
-    for op in split_commands(cmd):
-        _, real = strip_cd(op)
-        if real.strip():
-            intents.add(classify(real))
+def command_phase(call: dict) -> str:
+    """Phase of a whole command, from the intents the analyzer already assigned.
+
+    Deliberately NOT a re-classification: repro vs verify is decided in
+    analyze_traj by position relative to the first edit, and re-running
+    classify() here would silently collapse the two back together.
+    """
+    intents = {op["intent"] for op in call["ops"]}
     for p in PRIORITY:
         if p in intents:
             return INTENT2PHASE[p]
-    raise AssertionError(f"no phase for {cmd[:60]!r} ({intents})")
+    raise AssertionError(f"no phase for {call['command'][:60]!r} ({intents})")
 
 
-def by_time(timing):
+def by_time(timing, res):
+    rows, calls = timing["commands"], res["calls"]
+    assert len(rows) == len(calls), (len(rows), len(calls))
     vals = {name: 0.0 for name, _, _ in PHASES}
-    for row in timing["commands"]:
-        vals[command_phase(row["command"])] += row["seconds"]
+    for row, call in zip(rows, calls):
+        assert row["command"] == call["command"], f"order mismatch at #{row['n']}"
+        vals[command_phase(call)] += row["seconds"]
     return vals, "秒", lambda v: f"{v:.2f} s"
 
 
@@ -96,8 +105,8 @@ def draw(vals, unit_fmt, out, title, subtitle, takeaway):
     for side in (1, -1):
         grp = sorted([p for p in placed if p["side"] == side], key=lambda p: p["ly"])
         for a, b in zip(grp, grp[1:]):
-            if b["ly"] - a["ly"] < 0.36:
-                b["ly"] = a["ly"] + 0.36
+            if b["ly"] - a["ly"] < 0.34:
+                b["ly"] = a["ly"] + 0.34
         shift = max(0.0, max((p["ly"] for p in grp), default=0) - 1.24)
         for p in grp:
             p["ly"] -= shift
@@ -130,11 +139,11 @@ if __name__ == "__main__":
          f"{res['instance_id']}：agent 的 {res['n_real_ops']} 个 shell 操作构成（按次数）",
          f"已剥离 {res['n_cd_prefix']} 次 cd 前缀（每条 docker exec 都是新子 shell，必须重新 cd）"
          f"　·　{res['model']}　·　{res['n_steps']} 步 / ${res['instance_cost']:.4f}",
-         "读代码与搜索占 42%；真正修改源码的操作全程只有 1 次（5%）")
+         "读代码与搜索占 42%；模型自己写的 python 只有 3 段 heredoc：复现 / 验证 / 改源码各 1 次")
 
-    vals, _, fmt = by_time(timing)
+    vals, _, fmt = by_time(timing, res)
     draw(vals, fmt, "op_mix_time.png",
          f"{res['instance_id']}：同样 19 个操作，按容器内执行时间",
          f"14 条命令在同镜像中按原顺序重跑、取 3 次最小值，合计 {timing['total_seconds']:.2f}s"
          f"　·　{timing['image'].split('/')[-1]}",
-         "改成按时间看，结论翻转：跑测试独占 60%，读代码与搜索只剩 9%")
+         "按时间看结论翻转：pytest 独占 60%；同为 python heredoc，复现 1.95s 而改源码只要 0.26s")

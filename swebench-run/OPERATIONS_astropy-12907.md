@@ -163,30 +163,45 @@
 
 按工作阶段归并（饼图的 6 个扇区）：
 
-| 阶段 | 次数 | 占比 | 含哪些 |
-|---|---:|---:|---|
-| 读代码 / 搜索 | 8 | 42.1% | `read_file` 5 + `list_dir` 1 + `search_files` 1 + `search_content` 1 |
-| 生成 / 检查 patch | 4 | 21.1% | `make_patch` 3 + `vcs` 1 |
-| 跑测试 | 3 | 15.8% | `run_tests` 3 |
-| 复现 / 验证脚本 | 2 | 10.5% | `repro_script` 2 |
-| 改源码 | 1 | 5.3% | `edit_file` 1 |
-| 提交 | 1 | 5.3% | `submit` 1 |
+| 阶段 | 次数 | 占比 | 执行时间 | 含哪些 |
+|---|---:|---:|---:|---|
+| 读代码 / 搜索 | 8 | 42.1% | 1.27 s · 9.2% | `read_file` 5 + `list_dir` 1 + `search_files` 1 + `search_content` 1 |
+| 生成 / 检查 patch | 4 | 21.1% | 0.72 s · 5.2% | `make_patch` 3 + `vcs` 1 |
+| 跑测试（pytest） | 3 | 15.8% | **8.31 s · 60.3%** | `run_tests` 3 |
+| 复现脚本（python heredoc） | 1 | 5.3% | 1.95 s · 14.2% | `repro_script` 1 |
+| 验证脚本（python heredoc） | 1 | 5.3% | 1.02 s · 7.4% | `verify_script` 1 |
+| 改源码（python heredoc） | 1 | 5.3% | 0.26 s · 1.9% | `edit_file` 1 |
+| 提交 | 1 | 5.3% | 0.25 s · 1.8% | `submit` 1 |
 
-原始 10 类意图明细（饼图不直接画 10 类：6 个类别都只有 1 次、各占 5.3%，
-画成 10 个扇区里 6 个一模一样的细条，反而看不出东西）：
+> **括号里标的是命令形态，不是"是不是 Python"。** 容器里的 `pytest` 本身就是个 Python
+> console script（`#!/opt/miniconda3/envs/testbed/bin/python`），跑测试同样是 Python 进程；
+> 它在程序统计里显示成 `pytest` 而不是 `python`，只是因为模型敲的是 `pytest -q …`
+> 而不是 `python -m pytest`——那是 shell 层的程序名，不代表运行时不是 Python。
+> 真正有意义的区分是**代码谁写的**：`python - <<'PY'` 是模型现场写的，`pytest` 跑的是仓库里现成的测试。
+
+原始 11 类意图明细（饼图把读/搜的 4 类并成一格、patch 相关的 2 类并成一格，
+其余按 1:1 展开成 7 个扇区）：
 
 | 意图 | 次数 | 说明 |
 |---|---:|---|
 | `read_file` | 5 | `sed -n 'a,bp'`（3）、`cat patch.txt`（2） |
 | `make_patch` | 3 | `git diff -- <file>`，其中 1 次重定向到 patch.txt |
 | `run_tests` | 3 | 3 次 pytest |
-| `repro_script` | 2 | `python - <<'PY'` 只打印不写盘（#5 复现、#8 边界验证） |
+| `repro_script` | 1 | #5：`python - <<'PY'` 只打印不写盘，**改源码之前**跑，确认 bug 存在 |
+| `verify_script` | 1 | #8：同样形状的脚本，**改源码之后**跑，确认修复生效且没留坑 |
 | `list_dir` | 1 | `ls -la` |
 | `search_files` | 1 | `find . -maxdepth 3 -name 'separable.py' ...` |
 | `search_content` | 1 | `grep -R "separability_matrix" -n astropy/modeling` |
 | `edit_file` | 1 | **全程只有这一次真正改了源码**（#7 的 `python - <<'PY'` + `write_text`） |
 | `vcs` | 1 | `git status --short` |
 | `submit` | 1 | `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` |
+
+> **`repro_script` 和 `verify_script` 怎么分的**：分不了——两条命令的*形状完全一样*
+> （`python - <<'PY'` heredoc，只 print、不写盘），文本里没有任何信号能区分。
+> 唯一可靠的判据是**位置**：出现在全程唯一一次 `edit_file`（#7）之前的是复现，之后的是验证。
+> 所以 `analyze_traj.py` 不用正则判，而是在分类后按顺序做一遍后处理：
+> 找到第一个 `edit_file`，把它之后的 `repro_script` 改标成 `verify_script`。
+> 饼图里这两者已按要求拆成独立扇区（共 7 个）。
 
 **另计：`cd` 前缀 14 次，目标全部是 `/testbed`。** 不计入上表——它是子 shell 协议的开销，不是工作。
 
@@ -235,6 +250,9 @@ PY
 - 用 `python - <<'PY'` 而不是先 `cat > repro.py` 再 `python repro.py`：不落盘，
   也就不会污染最后的 `git diff`。prompt 明确禁止把复现脚本提交进 patch，这种写法天然规避。
 - 这次是全程最慢的一轮（LM 侧 17.6s，因为模型在这轮花了 1,119 个 reasoning token）。
+- **这是"复现"而不是"验证"**：它跑在改源码之前，要证明的是 bug 真的存在于这个环境
+  （而不是 issue 写错了或版本对不上）。输出的第三个矩阵右下角是 2×2 全 True，
+  正是 issue 描述的"嵌套之后不可分了"。执行耗时 1.954s，其中大头是冷启动的 `import astropy`。
 
 ### 阶段 C｜改代码（#7，核心动作）
 ```bash
@@ -275,7 +293,11 @@ cd /testbed && pytest -q astropy/modeling/tests/test_separable.py astropy/modeli
 # #11 收窄回来确认
 cd /testbed && pytest -q astropy/modeling/tests/test_separable.py --disable-warnings --maxfail=1   # rc=0
 ```
-- #8 是**自己扩展的边界测试**（`cm & Pix2Sky_TAN()` 左嵌套、`Linear1D & (Pix2Sky_TAN & cm)` 双层嵌套），
+- #8 是**"验证"而不是"复现"**：同一形状的 heredoc，但跑在改源码之后。
+  同样三个 case 重跑，`nested` 的输出从 `[…,[F,F,T,T],[F,F,T,T]]` 变成
+  `[…,[F,F,T,F],[F,F,F,T]]`——右下角回到对角，与 `flat` 一致，说明修好了。
+  它还加了 `is_separable()` 交叉验证。执行只要 1.023s（`.pyc` 已被 #5 预热）。
+- #8 同时是**自己扩展的边界测试**（`cm & Pix2Sky_TAN()` 左嵌套、`Linear1D & (Pix2Sky_TAN & cm)` 双层嵌套），
   prompt 的 "Test edge cases" 那一步确实被执行了。
 - #10 的 `rc=1` 是 `test_core.py::test_prepare_outputs_single_entry_vector` 失败，
   原因是浮点最后一位不等（`Max absolute difference: 1.11e-16`），**与本次改动无关**（预先存在的环境噪声）。

@@ -282,6 +282,18 @@ def analyze(path: Path, harness_probe: bool = True) -> dict:
                 entry["ops"].append({"cmd": real, "intent": intent, "binaries": bins})
             calls.append(entry)
 
+    # A repro script and a verification script are the same command shape -- a
+    # python heredoc that only prints. What separates them is position: before the
+    # first edit it establishes the bug, after it it checks the fix. Nothing in the
+    # text says which, so it is decided here, in order.
+    flat = [op for c in calls for op in c["ops"]]
+    first_edit = next((i for i, op in enumerate(flat) if op["intent"] == "edit_file"), None)
+    if first_edit is not None:
+        for op in flat[first_edit + 1:]:
+            if op["intent"] == "repro_script":
+                op["intent"] = "verify_script"
+    intents = Counter(op["intent"] for op in flat)
+
     lm = [s["lm_window"] for s in steps if s["lm_window"] is not None]
     ex = [s["exec_window"] for s in steps if s["exec_window"] is not None]
     hs = [s["harness_s"] for s in steps if s["harness_s"] is not None]

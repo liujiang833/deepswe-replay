@@ -24,7 +24,9 @@
 | `analyze_traj.py` | 轨迹分析脚本（拆 shell 命令、分类意图、统计程序/返回码/延迟） |
 | `reproduce.sh` | 一键复现 |
 | `traj_analysis.json` | 分析结果结构化输出 |
-| `make_pie.py` / `op_mix_{light,dark}.png` | 操作构成饼图（配色经 dataviz 验证器双模式校验） |
+| `make_pie.py` / `op_mix_count.png` / `op_mix_time.png` | 操作构成饼图：按次数、按执行时间 |
+| `make_sequence.py` / `agent_sequence.png` | 时序图：task 如何交给 agent，agent 如何与模型和 bash 交互 |
+| `measure_exec.py` / `exec_timing.json` | 把 14 条命令在同镜像重放、逐条计时 |
 | `logs/inference/ds-v4pro/` | preds.json + 完整 trajectory |
 | `logs/evaluation/{gold-smoke,ds-v4pro}/` | eval.sh / patch.diff / test_output.txt / report.json |
 | `gold.ds-v4pro.json` | **反例证据**：`swebench report ds-v4pro` 的输出，500 个实例全 error，见下文第六节第 1 条 |
@@ -50,6 +52,10 @@
                              │ swebench report       │  从日志重新判分（不起容器）
                              └───────────────────────┘
 ```
+
+更细的调用时序（每条箭头都对得上源码）：
+
+![时序图](agent_sequence.png)
 
 关键认知：**SWE-bench 仓库里没有 agent**。`swebench/inference/mini_swe_agent.py` 只有一个
 `build_command()` 负责拼出 `python -m minisweagent.run.benchmarks.swebench ...`，然后 `subprocess.call`。
@@ -157,7 +163,7 @@ git checkout <base> astropy/modeling/tests/test_separable.py
 12 步 → 14 次 bash 调用 → 拆开是 33 个 shell 操作 = **14 次 `cd` 前缀 + 19 个真实操作**。
 `cd` 是子 shell 协议开销（每条 `docker exec bash -c` 都是新进程，`cd` 不保留），不算工作；剥掉后：
 
-![操作构成](op_mix_light.png)
+![操作构成](op_mix_count.png)
 
 ```
 读代码/搜索 8 (42%)   生成/检查patch 4 (21%)   跑测试 3 (16%)
@@ -171,6 +177,24 @@ git checkout <base> astropy/modeling/tests/test_separable.py
 累计输入 102,926 token 是末轮上下文（12,699）的 **8.1 倍**——成本随步数近似平方增长，
 靠 prompt 缓存（整体命中 **90.7%**）压住。单步耗时由 reasoning token 决定：
 最贵的 step 4 花了 1,119 个 reasoning token、耗时 19.3s，而 exec 最慢的一步也才 2.7s。
+
+**只看执行时间**（14 条命令在同镜像按原顺序重放、取 3 遍最小值，合计 13.78s）结论翻转：
+
+![按执行时间](op_mix_time.png)
+
+| 阶段 | 按次数 | 按执行时间 |
+|---|---:|---:|
+| 跑测试 | 3 次 · 16% | **8.31 s · 60%** |
+| 复现 / 验证脚本 | 2 次 · 11% | 2.98 s · 22% |
+| 读代码 / 搜索 | **8 次 · 42%** | 1.27 s · **9%** |
+| 生成 / 检查 patch | 4 次 · 21% | 0.72 s · 5% |
+| 改源码 | 1 次 · 5% | 0.26 s · 2% |
+| 提交 | 1 次 · 5% | 0.25 s · 2% |
+
+次数最多的读和搜几乎不花时间（每条 0.22–0.29s，大半还是 `docker exec` 的固定开销）；
+时间全被 pytest 吃掉。同样是 `python - <<'PY'`，复现脚本 1.95s（要 `import astropy`）、
+改源码只要 0.26s（只用 `pathlib` 读写）——慢的从来不是编辑，是导入和跑测试。
+放回整个 loop：执行时间只占 17%，独占执行时间 60% 的 pytest 摊到 loop 也才 12%。
 
 五个阶段：定位（ls/find/grep/sed 分段读）→ 复现（`python - <<'PY'` 照抄 issue 代码）→
 修改（`python - <<'PY'` 带 `assert` 锚点校验，同一次调用里跟 `git diff` 自检）→

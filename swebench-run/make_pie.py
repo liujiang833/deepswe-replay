@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Pie of what the agent's shell operations actually were, `cd` prefixes excluded.
+"""Two pies of the same 19 shell operations: weighted by count, and by execution time.
+
+`cd` prefixes are excluded (每条 docker exec 都是新子 shell，cd 是协议开销不是工作).
 
 The raw analysis has 10 intents, six of them singletons -- a 10-slice pie with six
-identical slivers is unreadable, so the intents are folded into 6 work phases
-(<=6 segments is the limit for a readable part-to-whole). The full 10-way table
-stays in OPERATIONS_astropy-12907.md as the detail view.
+identical slivers is unreadable, so intents fold into 6 work phases (<=6 segments).
+The full 10-way table stays in OPERATIONS_astropy-12907.md as the detail view.
 
-Palette: the validated categorical slots 1-6, assigned in fixed order to wedges
-sorted large->small. Validated with the skill's validator for the ring's adjacent
-pairs INCLUDING the wrap pair (slot 6 <-> slot 1), light and dark.
-Light mode flags 3 slots under 3:1 contrast, so every wedge is directly labelled
+Both charts use ONE fixed wedge order and a fixed phase->color map, because color
+follows the entity and never its rank -- which also lets the reader compare the two
+pies wedge-for-wedge. Palette = validated categorical slots 1-6; the ring's adjacent
+pairs INCLUDING the wrap pair (slot 6 <-> slot 1) pass the skill's validator in light
+mode. Three slots sit under 3:1 contrast there, so every wedge is directly labelled
 (the relief rule) -- identity is carried by text, never by color alone.
 """
 import json
@@ -21,66 +23,76 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
+from analyze_traj import classify, split_commands, strip_cd
+
 font_manager.fontManager.addfont("/home/river/.local/share/fonts/WenQuanYiMicroHei.ttf")
 plt.rcParams["font.family"] = ["WenQuanYi Micro Hei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-# intent -> work phase
+SURFACE, INK, INK2, INK3 = "#fcfcfb", "#0b0b0b", "#52514e", "#8a8880"
+
+# fixed wedge order + fixed color per phase (validated as a ring, wrap included)
 PHASES = [
-    ("读代码 / 搜索", ["read_file", "list_dir", "search_files", "search_content"]),
-    ("生成 / 检查 patch", ["make_patch", "vcs"]),
-    ("跑测试", ["run_tests"]),
-    ("复现 / 验证脚本", ["repro_script"]),
-    ("改源码", ["edit_file"]),
-    ("提交", ["submit"]),
+    ("读代码 / 搜索",      "#2a78d6", ["read_file", "list_dir", "search_files", "search_content"]),
+    ("生成 / 检查 patch",  "#eb6834", ["make_patch", "vcs"]),
+    ("跑测试",             "#1baf7a", ["run_tests"]),
+    ("复现 / 验证脚本",    "#eda100", ["repro_script"]),
+    ("改源码",             "#e87ba4", ["edit_file"]),
+    ("提交",               "#008300", ["submit"]),
 ]
-
-THEME = {
-    "light": dict(surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e", ink3="#8a8880",
-                  series=["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]),
-    "dark":  dict(surface="#1a1a19", ink="#ffffff", ink2="#c3c2b7", ink3="#8a8880",
-                  series=["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"]),
-}
+# which phase a whole command belongs to, when it mixes intents
+PRIORITY = ["submit", "run_tests", "edit_file", "repro_script",
+            "make_patch", "vcs", "search_content", "search_files", "read_file", "list_dir"]
+INTENT2PHASE = {k: name for name, _, keys in PHASES for k in keys}
 
 
-def build(res):
+def by_count(res):
     counts = dict(res["intents"])
-    rows = []
-    for label, keys in PHASES:
-        n = sum(counts.get(k, 0) for k in keys)
-        if n:
-            rows.append((label, n, keys))
-    missing = set(counts) - {k for _, ks in PHASES for k in ks}
-    assert not missing, f"unmapped intents: {missing}"
-    assert sum(r[1] for r in rows) == res["n_real_ops"]
-    return sorted(rows, key=lambda r: -r[1])
+    unmapped = set(counts) - set(INTENT2PHASE)
+    assert not unmapped, f"unmapped intents: {unmapped}"
+    vals = {name: sum(counts.get(k, 0) for k in keys) for name, _, keys in PHASES}
+    assert sum(vals.values()) == res["n_real_ops"]
+    return vals, "次", lambda v: f"{v:.0f} 次"
 
 
-def draw(res, mode, out):
-    t = THEME[mode]
-    rows = build(res)
-    total = sum(r[1] for r in rows)
+def command_phase(cmd: str) -> str:
+    intents = set()
+    for op in split_commands(cmd):
+        _, real = strip_cd(op)
+        if real.strip():
+            intents.add(classify(real))
+    for p in PRIORITY:
+        if p in intents:
+            return INTENT2PHASE[p]
+    raise AssertionError(f"no phase for {cmd[:60]!r} ({intents})")
+
+
+def by_time(timing):
+    vals = {name: 0.0 for name, _, _ in PHASES}
+    for row in timing["commands"]:
+        vals[command_phase(row["command"])] += row["seconds"]
+    return vals, "秒", lambda v: f"{v:.2f} s"
+
+
+def draw(vals, unit_fmt, out, title, subtitle, takeaway):
+    rows = [(name, color, vals[name]) for name, color, _ in PHASES if vals[name] > 0]
+    total = sum(r[2] for r in rows)
     fig, ax = plt.subplots(figsize=(9.6, 6.9), dpi=200)
-    fig.patch.set_facecolor(t["surface"])
-    ax.set_facecolor(t["surface"])
+    fig.patch.set_facecolor(SURFACE)
+    ax.set_facecolor(SURFACE)
 
     wedges, _ = ax.pie(
-        [r[1] for r in rows],
-        colors=t["series"][: len(rows)],
-        startangle=90, counterclock=False,
-        radius=1.0,
-        wedgeprops=dict(edgecolor=t["surface"], linewidth=2.0),  # 2px surface gap
+        [r[2] for r in rows], colors=[r[1] for r in rows],
+        startangle=90, counterclock=False, radius=1.0,
+        wedgeprops=dict(edgecolor=SURFACE, linewidth=2.0),   # 2px surface gap
     )
 
-    # ---- direct labels outside, with leader lines and collision spreading ----
     placed = []
-    for i, (w, (label, n, _)) in enumerate(zip(wedges, rows)):
+    for w, (label, _, v) in zip(wedges, rows):
         ang = math.radians((w.theta1 + w.theta2) / 2)
         x, y = math.cos(ang), math.sin(ang)
-        placed.append({"i": i, "x": x, "y": y, "ly": y * 1.28,
-                       "side": 1 if x >= 0 else -1,
-                       "text": f"{label}\n{n} 次 · {n/total*100:.0f}%"})
-    # keep labels on the same side from overlapping
+        placed.append({"x": x, "y": y, "ly": y * 1.28, "side": 1 if x >= 0 else -1,
+                       "text": f"{label}\n{unit_fmt(v)} · {v/total*100:.0f}%"})
     for side in (1, -1):
         grp = sorted([p for p in placed if p["side"] == side], key=lambda p: p["ly"])
         for a, b in zip(grp, grp[1:]):
@@ -90,39 +102,39 @@ def draw(res, mode, out):
         for p in grp:
             p["ly"] -= shift
     for p in placed:
-        lx = p["side"] * 1.30
-        ax.annotate(
-            p["text"], xy=(p["x"] * 1.01, p["y"] * 1.01), xytext=(lx, p["ly"]),
-            ha="left" if p["side"] > 0 else "right", va="center",
-            fontsize=10.5, color=t["ink"], linespacing=1.45,
-            arrowprops=dict(arrowstyle="-", color=t["ink3"], linewidth=0.9,
-                            shrinkA=0, shrinkB=4,
-                            connectionstyle="arc3,rad=0"),
-        )
+        ax.annotate(p["text"], xy=(p["x"] * 1.01, p["y"] * 1.01),
+                    xytext=(p["side"] * 1.30, p["ly"]),
+                    ha="left" if p["side"] > 0 else "right", va="center",
+                    fontsize=10.5, color=INK, linespacing=1.45,
+                    arrowprops=dict(arrowstyle="-", color=INK3, linewidth=0.9,
+                                    shrinkA=0, shrinkB=4, connectionstyle="arc3,rad=0"))
 
-    ax.set_xlim(-2.30, 2.30)
-    ax.set_ylim(-1.95, 1.55)
-    ax.set_aspect("equal")
-    ax.axis("off")
-
-    fig.text(0.5, 0.975, f"{res['instance_id']}：agent 的 {total} 个 shell 操作构成",
-             ha="center", va="top", fontsize=14, color=t["ink"])
-    fig.text(0.5, 0.928,
-             f"已剥离 {res['n_cd_prefix']} 次 cd 前缀（每条 docker exec 都是新子 shell，必须重新 cd）"
-             f"　·　{res['model']}　·　{res['n_steps']} 步 / ${res['instance_cost']:.4f}",
-             ha="center", va="top", fontsize=9.5, color=t["ink2"])
-    fig.text(0.5, 0.885,
-             "读代码与搜索占 42%；真正修改源码的操作全程只有 1 次（5%）",
-             ha="center", va="top", fontsize=10.5, color=t["ink"])
-
-    fig.savefig(out, facecolor=t["surface"], bbox_inches="tight", pad_inches=0.28)
+    ax.set_xlim(-2.30, 2.30); ax.set_ylim(-1.95, 1.55)
+    ax.set_aspect("equal"); ax.axis("off")
+    fig.text(0.5, 0.975, title, ha="center", va="top", fontsize=14, color=INK)
+    fig.text(0.5, 0.928, subtitle, ha="center", va="top", fontsize=9.5, color=INK2)
+    fig.text(0.5, 0.885, takeaway, ha="center", va="top", fontsize=10.5, color=INK)
+    fig.savefig(out, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.28)
     plt.close(fig)
     print(f"wrote {out}")
-    for label, n, _ in rows:
-        print(f"   {label:18s} {n:>3}  {n/total*100:5.1f}%")
+    for name, _, v in rows:
+        print(f"   {name:18s} {unit_fmt(v):>8}  {v/total*100:5.1f}%")
 
 
 if __name__ == "__main__":
     res = json.loads(Path("traj_analysis.json").read_text())
-    draw(res, "light", "op_mix_light.png")
-    draw(res, "dark", "op_mix_dark.png")
+    timing = json.loads(Path("exec_timing.json").read_text())
+
+    vals, _, fmt = by_count(res)
+    draw(vals, fmt, "op_mix_count.png",
+         f"{res['instance_id']}：agent 的 {res['n_real_ops']} 个 shell 操作构成（按次数）",
+         f"已剥离 {res['n_cd_prefix']} 次 cd 前缀（每条 docker exec 都是新子 shell，必须重新 cd）"
+         f"　·　{res['model']}　·　{res['n_steps']} 步 / ${res['instance_cost']:.4f}",
+         "读代码与搜索占 42%；真正修改源码的操作全程只有 1 次（5%）")
+
+    vals, _, fmt = by_time(timing)
+    draw(vals, fmt, "op_mix_time.png",
+         f"{res['instance_id']}：同样 19 个操作，按容器内执行时间",
+         f"14 条命令在同镜像中按原顺序重跑、取 3 次最小值，合计 {timing['total_seconds']:.2f}s"
+         f"　·　{timing['image'].split('/')[-1]}",
+         "改成按时间看，结论翻转：跑测试独占 60%，读代码与搜索只剩 9%")

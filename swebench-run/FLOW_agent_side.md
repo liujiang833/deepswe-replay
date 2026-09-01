@@ -3,6 +3,8 @@
 > SWE-bench 仓库本身**不含 agent**。`swebench infer` 只是一个 argv 组装器，真正干活的是外部包
 > mini-SWE-agent（本机 v2.4.6）。本文件讲清楚「一个 task 怎么启动、agent 怎么被调用」。
 
+![时序图](agent_sequence.png)
+
 ## 1. `swebench infer` 做的唯一一件事：拼命令行
 
 `swebench/inference/mini_swe_agent.py:build_command()`（纯 argv builder，可单测，不 spawn 任何东西）：

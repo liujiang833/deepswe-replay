@@ -12,7 +12,7 @@
 | gold 冒烟 | resolved **1/1** |
 | DeepSeek 预测 | **resolved = true**，F2P 2/2，P2P 13/13 |
 | 产出 patch | 代码改动与 gold **完全相同**（同一个 hunk、同一行 `= 1` → `= right`）；文本上多出一行 `index a308e2729..45bea3608 100755` —— `git diff` 会带 blob 哈希行，数据集的 gold patch 剥掉了。470B vs 504B |
-| agent 用量 | 12 次 LM 调用 / 14 次 bash / 30 个 shell 操作 / $0.0318 / 65.7 s |
+| agent 用量 | 12 步 / 14 次 bash / 19 个真实 shell 操作（另 14 次 cd 前缀）/ $0.0318 / 67.9 s |
 
 ## 文件
 
@@ -24,6 +24,7 @@
 | `analyze_traj.py` | 轨迹分析脚本（拆 shell 命令、分类意图、统计程序/返回码/延迟） |
 | `reproduce.sh` | 一键复现 |
 | `traj_analysis.json` | 分析结果结构化输出 |
+| `make_pie.py` / `op_mix_{light,dark}.png` | 操作构成饼图（配色经 dataviz 验证器双模式校验） |
 | `logs/inference/ds-v4pro/` | preds.json + 完整 trajectory |
 | `logs/evaluation/{gold-smoke,ds-v4pro}/` | eval.sh / patch.diff / test_output.txt / report.json |
 | `gold.ds-v4pro.json` | **反例证据**：`swebench report ds-v4pro` 的输出，500 个实例全 error，见下文第六节第 1 条 |
@@ -153,12 +154,23 @@ git checkout <base> astropy/modeling/tests/test_separable.py
 
 ## 五、本次运行的 agent 操作统计（详见 OPERATIONS_astropy-12907.md）
 
-12 次 LM 调用 → 14 次 bash → 拆开是 30 个 shell 操作：
+12 步 → 14 次 bash 调用 → 拆开是 33 个 shell 操作 = **14 次 `cd` 前缀 + 19 个真实操作**。
+`cd` 是子 shell 协议开销（每条 `docker exec bash -c` 都是新进程，`cd` 不保留），不算工作；剥掉后：
+
+![操作构成](op_mix_light.png)
 
 ```
-navigate 12   read_file 5   edit_file 3   make_patch 3   run_tests 3
-search_files 1   search_content 1   vcs 1   submit 1
+读代码/搜索 8 (42%)   生成/检查patch 4 (21%)   跑测试 3 (16%)
+复现脚本 2 (11%)      改源码 1 (5%)            提交 1 (5%)
 ```
+
+实际调用的程序：`git`×4、`sed`×3、`python`×3、`pytest`×3、`head`×2、`cat`×2、`ls`/`find`/`grep`/`echo` 各 1。
+
+**agent loop 开销**：loop 墙钟 67.9s —— 等模型 56.3s（**83%**）、容器里跑命令 11.6s（17%）；
+框架自身每步 `save()` 落盘轨迹实测累计仅 0.02s，可忽略。启动阶段（不计入 loop）载数据集 11.3s、起容器 0.55s。
+累计输入 102,926 token 是末轮上下文（12,699）的 **8.1 倍**——成本随步数近似平方增长，
+靠 prompt 缓存（整体命中 **90.7%**）压住。单步耗时由 reasoning token 决定：
+最贵的 step 4 花了 1,119 个 reasoning token、耗时 19.3s，而 exec 最慢的一步也才 2.7s。
 
 五个阶段：定位（ls/find/grep/sed 分段读）→ 复现（`python - <<'PY'` 照抄 issue 代码）→
 修改（`python - <<'PY'` 带 `assert` 锚点校验，同一次调用里跟 `git diff` 自检）→

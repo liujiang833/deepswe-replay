@@ -47,4 +47,16 @@
 - `swebench-run/logs/` - 运行产物（preds.json、trajectory、eval.sh、test_output.txt、report.json）
 - `SWE-bench/` - **未改动**（git status 干净，仅 editable 安装）
 
-**Commit:** pending
+13. 修正统计口径（剥离 cd 前缀）、补 agent loop 与 per-step 开销、出饼图 — success
+
+**Key Findings（续）:**
+- 统计 bash 必须剥掉 `cd` 前缀：14/14 次调用都以 `cd /testbed &&` 开头（子 shell 不保留 cwd），
+  不剥离会让 `cd` 占掉 42% 的"操作量"，还会把 3 次 `python` heredoc 误记成 `cd`。
+  剥离后：33 个 shell 操作 = 14 次 cd 前缀 + 19 个真实操作。
+- agent loop 是 IO-bound on the LLM：67.9s 里 83% 在等模型，17% 在容器里跑命令，
+  框架自身每步 `save()` 落盘轨迹实测累计 0.02s，可忽略——没有隐藏的框架税。
+- 成本结构：累计输入 102,926 token 是末轮上下文 12,699 的 8.1 倍，随步数近似平方增长；
+  prompt 缓存整体命中 90.7% 是把账单压住的关键，而命中率回落恰好发生在上一步回灌大块观察之后。
+- step 时长由 reasoning token 决定而非命令执行：最贵的 step 4 花 1,119 reasoning token / 19.3s。
+
+**Commit:** 4ad57bc（首次）+ 本次

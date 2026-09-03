@@ -94,3 +94,39 @@
 - `deepswe/fetch_trial_artifacts.py` - 新增，按 trial_name 拉全部产物 + 可选全量索引
 
 **Commit:** pending
+
+---
+
+## 2026-09-03（续）: 设计容器侧负载重放流程
+
+**Goal:** 目标负载确定为**容器侧真实 CPU/IO，且必须包含 agent 的探索过程**（非仅"打补丁跑测试"）。
+为此设计 replay 流程并验证前提。
+
+**Steps:**
+1. 拉取最重的一条 trace `gql-incremental-graphql-delivery__nnFNKRL`（439 步）逐条剖析命令 — success
+2. 拉全 113 个 task 定义（31.9 MB），统计语言/规格/镜像分布 — success
+3. 验证 replay 的 5 条前提（自包含性、状态依赖、失败保留、非确定性、网络） — success
+4. 探镜像可获取性：`docker manifest inspect` 通过，`docker pull` 遭 ECR 匿名限流 — 部分成功
+5. 写 `deepswe/REPLAY_DESIGN.md`，含完整 trace 获取链路 + 五段流程 + 风险表 — success
+
+**Key Findings:**
+- **跨 step 有状态依赖**：49 个 /tmp 路径、59 次跨 step 引用（如 `git commit -F /tmp/commit_message.txt`），
+  所以重放必须**长驻容器串行 exec**，不能一条命令一个 `docker run`。这是最关键的设计约束。
+- **重放保真度可自动判定**：`pre_artifacts.sh` 定义提交物 = `git diff --binary <base_sha> HEAD`，
+  重放后做同样 diff 与 model.patch 逐字节比对即可。这是整条流程的地基。
+- 439 条命令里 15 条非 0 退出（rc=1×10, -1×3, 2×1, 128×1），rc=-1 是 `timeout` 打死；
+  重放不能 set -e，失败是负载的一部分。
+- trace 里命令输出被 harness 截断（`elided_chars` + "Output too long."，上限约 11 K 字符），
+  只能做前 11 K 的弱比对；但重放产生的是完整输出，对负载而言重放的才是真的。
+- 113 个 task = **113 个互不相同的镜像**，单个约 800 MB 压缩，全在 public.ecr.aws；
+  **ECR 匿名限流是当前最大瓶颈**：manifest 读取正常，`docker pull` 秒拒 `toomanyrequests: Rate exceeded`。
+- 113/113 规格统一：cpus=2, memory_mb=8192, allow_internet=false。重放须对齐，否则时间不可比。
+- 语言分布：typescript 35 / go 34 / python 34 / rust 5 / javascript 5，抽样要分层。
+- 该条 trace 的操作构成：读文件 38%、写文件 41%、搜索 21%、含 pytest 89 条（51 条 `timeout ... pytest`），
+  零构建/零装依赖（Python 环境已预装）。
+
+**Files Changed:**
+- `deepswe/REPLAY_DESIGN.md` - 新增，trace 获取链路 + 重放五段流程 + 风险表 + 推进顺序
+- `.gitignore` - 新增 `deepswe/data/`（34 MB 拉取产物，可由脚本复现）
+
+**Commit:** pending

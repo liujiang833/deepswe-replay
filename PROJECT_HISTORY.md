@@ -60,3 +60,37 @@
 - step 时长由 reasoning token 决定而非命令执行：最贵的 step 4 花 1,119 reasoning token / 19.3s。
 
 **Commit:** 4ad57bc（首次）+ 本次
+
+---
+
+## 2026-09-03: 确认 DeepSWE 榜单能否拿到 agent trace
+
+**Goal:** 确认 `https://deepswe.datacurve.ai/data/v1.1/trials/abs-module-cache-flags__4kU2tLe`
+这类 trial 页面能否拿到底层 agent trace，以及能否批量。
+
+**Steps:**
+1. curl trial 页面 — 拿到 33MB HTML，但里面只有 SSR 内嵌的 trial 元数据，无 trace
+2. 从 `modulepreload` 的 `use-artifact-*.js` / `trials_._trialName-*.js` 反查取数逻辑 — 发现
+   `release.artifact_base_url` + `release.artifact_patterns` 的模板拼接
+3. 从 SSR payload 尾部提取到 `release.json` 内容，命中 CloudFront base URL — success
+4. 实测下载 trajectory / model.patch / agent log / verifier 四类产物，均 HTTP 200 — success
+5. 下载全量索引 `artifacts/v1.1/trials.json`（29357 行）统计覆盖度 — success
+6. 写 `deepswe/fetch_trial_artifacts.py` 并端到端跑通复现 — success
+
+**Key Findings:**
+- trace 公开无鉴权：`https://d3ujjcmjq6o8v6.cloudfront.net/v1.1/trial-artifacts/{trial_name}/agent/trajectory.json`
+  纯 GET 即可，不需要 cookie/token/referer。
+- 覆盖度接近满：29357 个 trial 中 29356 个有 trajectory，29335 个有 agent log，28815 个有 model.patch。
+  harness 全部是 mini-swe-agent，和我们本地跑 SWE-bench 的形态可直接对照。
+- trajectory 粒度足够做分析：逐 step 的 reasoning 文本 + bash 命令 + 完整 stdout/returncode，
+  外加 system/instance prompt 原文和 final_metrics（token / cache / cost / peak context）。
+- 全量索引 `artifacts/v1.1/trials.json` 自带 cost_usd、n_agent_steps、peak_context_tokens、
+  agent_duration_seconds 等，很多横向统计不用下 trace 就能算。
+- 本例 `abs-module-cache-flags__4kU2tLe`：claude-fable-5 / vertex_ai / reasoning_effort=high，
+  49 steps，reward 1（f2p 20/20，p2p 3/3），$5.25，peak context 76969，agent 耗时 606s。
+
+**Files Changed:**
+- `deepswe/README.md` - 新增，链路、覆盖度、trajectory schema
+- `deepswe/fetch_trial_artifacts.py` - 新增，按 trial_name 拉全部产物 + 可选全量索引
+
+**Commit:** pending

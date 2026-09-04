@@ -130,3 +130,47 @@
 - `.gitignore` - 新增 `deepswe/data/`（34 MB 拉取产物，可由脚本复现）
 
 **Commit:** pending
+
+---
+
+## 2026-09-04: 打包 mars-base arm64 离线分发包
+
+**Goal:** 把本地 arm64 基座镜像打成可离线 `docker load` 的分发包，交给有 ARM 硬件的人验证可用性
+（本机是 amd64 且无 qemu binfmt，跑不了 arm64 容器）。
+
+**Steps:**
+1. 用 registry API + `docker manifest inspect -v` 复核三个 digest 的准确归属 — success
+2. `docker create`（不启动）+ `docker cp` 静态提取运行时清单与 shell 启动文件 — success
+3. `docker tag` 为无歧义的 `mars-base:arm64` 后 `docker save`，zstd 级别做实测取舍 — success
+4. 写 `load.sh` / `check_runtime.sh` / `README.md` / `SHA256SUMS` — success
+5. 自查：blob 逐个验签 + 彻底删除本地镜像后走完整 load 流程 — success
+
+**Key Findings:**
+- **三个 digest 归属已复核**（用户口述的两个均正确）：
+  `91db850d…` = 多架构索引 (manifest list)，RepoDigests 记的是它，**不区分架构**；
+  `8d4d973c…` = 索引中 linux/arm64 项的 manifest digest；
+  `12b4433e…` = arm64 的 config digest，即本地 IMAGE ID。
+  另记 amd64 项为 `9c024d5d…`，防拿错。
+- **不运行镜像也能验版本**：`docker create` 建容器但不启动，再 `docker cp` 捞文件，
+  即可从 `/usr/local/go/VERSION`、`/root/.rustup/toolchains/`、`/usr/include/node/node_version.h`
+  读出 Go 1.25.5 / Rust 1.92.0(aarch64) / Node 24.12.0 / Python 3.12.12。这套办法对无 qemu 的机器很有用。
+- **纠正两处既有假设**：`bun` 并非只在 `/root/.bun/bin`——`/usr/local/bin/bun` 有符号链接兜底；
+  真正无兜底的是 `cargo`/`rustc`（仅 `/root/.cargo/bin`，且是 rustup 代理符号链接）。
+  另外 `/root/.rye/shims` 在 ENV PATH 里但**目录是空的**。
+- **`bash -c` vs `bash -lc` 的 PATH 差异查清了**：`/etc/profile` 会硬重置 PATH 冲掉 Docker ENV 值，
+  但随后 `~/.profile` → `~/.bashrc` 经 `~/.cargo/env` 和 `BUN_INSTALL` 把 cargo/bun 补回，
+  净差异只是丢掉空目录 `/root/.rye/shims`。（静态推演，待实机确认。）
+- **zstd 取舍实测**：`-19 --long -T16` 157.5 s → 397.6 MiB (6.07x)；`-12` 18.8 s → 458.1 MiB (5.27x)。
+  -19 远未触及 15 min 上限，采用 -19；多花 139 s 省 63.4 MB。
+  `--long`(windowLog 27) 恰等于 zstd 默认解压窗口上限，接收方普通 `zstd -dc` 即可解压。
+- **`docker save` 的 tar 内 `index.json` digest (`6c1e345a…`) 与 registry manifest digest 不同**，
+  因为导出时重新序列化（层描述符换成未压缩 tar）。这是正常现象，README 已写明避免误判包损坏。
+- **`docker load` 对架构不匹配只给 WARNING 且 rc=0**，已在 load.sh 里显式核对 Architecture 而非依赖退出码。
+- 自查最强的一环：**先 `docker rmi` 彻底删除本地镜像**（层全部释放）再走完整 load，
+  两轮均成功，22 层 diff_id 与原镜像逐层一致；归档内 46 个 blob 逐个重算 SHA256 全部相符。
+
+**Files Changed:**
+- `deepswe/data/arm-bundle/` - 新增分发包（该目录被 .gitignore 忽略，不进版本库）
+- `EXEC_LOG_2026-09-04.md` - 新增，本次执行日志
+
+**Commit:** pending（按要求未提交）

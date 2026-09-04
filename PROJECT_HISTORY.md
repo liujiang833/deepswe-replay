@@ -174,3 +174,50 @@
 - `EXEC_LOG_2026-09-04.md` - 新增，本次执行日志
 
 **Commit:** pending（按要求未提交）
+
+## 2026-09-04: 为 113 个 task 选定并下载 pass 轨迹
+
+**Goal:** 给 `deepswe/data/tasks_extracted/` 下的 113 个 task，各选定唯一一条 **pass** 的 trial
+轨迹并落盘产物，作为后续轨迹分析 / 重放的统一输入基线。
+
+**选取规则：** 模型优先级 `claude-fable-5` → `gpt-5-6-sol` → `claude-sonnet-5`（逐级回退，
+只有本级零合格才降级，不许用这三个之外的模型）；硬条件 `outcome==pass` 且 `has_trajectory`；
+同级多条时 tie-break `n_agent_steps` ↑ → `cost_usd` ↑ → `trial_name` 字典序（确定性可复现）。
+产物取 `trajectory.json` + `model.patch` + 全部 `verifier_files`（不取 agent_log，与 trajectory 重叠）。
+
+**Steps:**
+1. 覆盖度预检 - 113/113 全覆盖，无缺口；确认单 task 的 pass 候选数达 1~20 条，故 tie-break 必需
+2. 写 `select_trajectories.py` 产出清单 - success，`unresolved` 为空
+3. 写 `download_trajectories.py` 并下载 - success，1095/1095 文件 / 274MB / 0 失败
+4. 独立验证 agent 复核（不复用被验证脚本的代码） - success，6 项全 PASS，不一致项 0
+
+**Key Findings:**
+- **分级命中：fable-5 110 / gpt-5-6-sol 2 / sonnet-5 1。** 3 个降级 task 的上级 tier 均 20/20 全 fail，
+  是真的没有合格轨迹而非取巧：`gql-incremental-graphql-delivery`（fable 0 / sol 0 → sonnet）、
+  `pwntools-tube-multiplexing`、`updo-policy-alerting`（均 fable 0 → sol）。
+- **pass 判定没有采信索引的 `outcome` 字段**，改用三路互独立证据复核 113/113：`reward.json`；
+  `ctrf.json` 不读 summary、直接从 `results.tests` 原始列表重算；`test-stdout.txt` 的 `===== grade =====` 行。
+  三者全判 pass 且互不矛盾。237229 条 graded 用例状态分布 `{passed: 237229}` 零 failed，
+  `[f2p]` 5877 / `[p2p]` 231352 与索引 `f2p_total`/`p2p_total` 求和精确相等。
+  再回连 `reports/` 下 base/new 原始报告 6429 条用例，"graded=passed 但原始=failed" 矛盾数为 0。
+- **82 个 verifier 文件是 0 字节，成因是上游对象本身为空，不是下载坏了。** 决定性证据是 ETag
+  `d41d8cd98f00b204e9800998ecf8427e` 即空字符串的 MD5（S3 的 ETag 就是内容 MD5）；
+  对照组显示不存在的 key 返回 403 而非 200，故"缺失"与"为空"可区分。
+  其中 78 个是 `verifier/run.log` —— **这 78 个 task 无运行日志证据可查**，但 pass 裁定所依赖的
+  三个文件均非空，裁定不受影响。
+- **两处表面异常经核实为非缺陷：**（a）2 个 tier-2 task 的 trajectory 内 `model_name` 写作
+  `openai/gpt-5.6-sol`（点分）而索引是 `gpt-5-6-sol`（连字符），仅命名风格差异 ——
+  用 cost/token/harness 精确相等 + 每个 task 内 `(steps, cost)` 组合唯一，已唯一锁定 trial 身份；
+  （b）`total_steps` 恒比 `n_agent_steps` 大 2，因 ATIF 把 system prompt 与初始 user 消息也计为 step，是口径差异。
+- 全部 1095 个产物逐个 HEAD 回源核对：状态码全 200、size 与本地全等、1086 个 MD5 与 ETag 一致
+  （另 9 个为分片上传 ETag，已比 size），**无一截断**。
+
+**Files Changed:**
+- `deepswe/select_trajectories.py` - 新增，选取逻辑，仅标准库，可重跑
+- `deepswe/download_trajectories.py` - 新增，下载，含重试 / 断点续传 / 失败非零退出
+- `deepswe/TRAJECTORY_SELECTION.json` - 新增，113 条选取清单（70KB）
+- `deepswe/TRAJECTORY_VERIFY.md` - 新增，独立验证报告
+- `EXEC_LOG_2026-09-04-trajectories.md` - 新增，本次执行日志
+- `deepswe/data/trajectories/` - 1095 个产物 / 274MB，被 .gitignore 忽略，不入库（可由上述两脚本复现）
+
+**Commit:** pending

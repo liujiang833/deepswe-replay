@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# 打一个自包含的 tarball，scp 到服务器解开就能跑。
+#
+# 默认精简：只带重放真正需要的输入（trajectory / model.patch / task.json / meta.json）
+# 加上基线判定（replay/verdict.json）用于跨机对比。agent 原始日志与 verifier 输出
+# 各约 1MB×5，重放用不到，默认不带；要完整归档用 --full。
+#
+# 用法：  bash make_bundle.sh              # → deepswe-replay-bundle-<日期>.tar.gz
+#         bash make_bundle.sh --full      # 连 agent 日志、per-command 指标一起带
+#         bash make_bundle.sh -o /tmp/x.tar.gz
+
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FULL=0; OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --full) FULL=1; shift ;;
+    -o) OUT="$2"; shift 2 ;;
+    *) echo "未知参数: $1"; exit 1 ;;
+  esac
+done
+[ -n "$OUT" ] || OUT="$HERE/deepswe-replay-bundle-$(date +%Y%m%d).tar.gz"
+
+REPLAY="$HERE/../replay.py"
+[ -f "$REPLAY" ] || { echo "找不到 $REPLAY"; exit 1; }
+
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+ROOT="$STAGE/deepswe-replay-bundle"
+mkdir -p "$ROOT"
+
+# 顶层：脚本与手册。replay.py 从上一层复制进来，bundle 从此自包含。
+cp "$REPLAY" "$ROOT/"
+for f in run_batch.py preflight.sh RUNBOOK.md INDEX.md release.json; do
+  [ -f "$HERE/$f" ] && cp "$HERE/$f" "$ROOT/"
+done
+
+N=0
+for d in "$HERE"/*/; do
+  name="$(basename "$d")"
+  [ -f "$d/meta.json" ] || continue          # 只收合规的 trial 目录
+  mkdir -p "$ROOT/$name/replay"
+  for f in meta.json trajectory.json model.patch task.json; do
+    cp "$d/$f" "$ROOT/$name/"
+  done
+  # 基线判定：run_batch.py 用它做跨机对比
+  [ -f "$d/replay/verdict.json" ] && cp "$d/replay/verdict.json" "$ROOT/$name/replay/"
+  if [ "$FULL" = 1 ]; then
+    for f in mini-swe-agent.txt test-stdout.txt; do
+      [ -f "$d/$f" ] && cp "$d/$f" "$ROOT/$name/"
+    done
+    for f in commands.jsonl replayed.patch; do
+      [ -f "$d/replay/$f" ] && cp "$d/replay/$f" "$ROOT/$name/replay/"
+    done
+  fi
+  N=$((N+1))
+done
+[ "$N" -gt 0 ] || { echo "没找到任何 trial 目录"; exit 1; }
+
+# 随包留一份指纹：解包后可核对传输完整性，也便于日后追溯跑的是哪一版
+( cd "$ROOT" && find . -type f ! -name SHA256SUMS -print0 \
+    | sort -z | xargs -0 sha256sum > SHA256SUMS )
+
+mkdir -p "$(dirname "$OUT")"
+tar -czf "$OUT" -C "$STAGE" deepswe-replay-bundle
+
+echo "打包完成"
+echo "  trial 数  $N$([ "$FULL" = 1 ] && echo '（--full：含 agent 日志与 per-command 指标）')"
+echo "  文件数    $(find "$ROOT" -type f | wc -l)"
+echo "  解包体积  $(du -sh "$ROOT" | cut -f1)"
+echo "  归档      $OUT  ($(du -h "$OUT" | cut -f1))"
+echo
+echo "拷到服务器："
+echo "  scp $OUT <server>:~/"
+echo "  ssh <server> 'tar xzf $(basename "$OUT") && cd deepswe-replay-bundle && bash preflight.sh'"

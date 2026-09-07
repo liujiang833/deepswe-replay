@@ -43,12 +43,34 @@
     sidecar 有独立 cgroup，其开销单独统计进 verdict 的 `sinkhole_*` 字段。
     `--net-mode=none` 可退回旧行为。
 
+可移植性（v4，为「拷到另一台机器上跑」而改，不改任何指标口径）：
+  - **cgroup 目录改为三级探测**，不再硬编码。原先写死 systemd driver 的
+    `/sys/fs/cgroup/system.slice/docker-<id>.scope`，换台机器就 raise 退出——
+    本机实测 driver 是 `cgroupfs`，实际落点是 `/sys/fs/cgroup/docker/<id>`，
+    旧路径 `is_dir()` 直接为 False。现在依次试：`/proc/<pid>/cgroup`（内核自报，
+    最准，但 dockerd 在别的 pid namespace 时不可用）→ 四条已知 driver 候选
+    （cgroupfs / systemd / rootless 两种）→ cgroup 树搜索。全失败时把
+    `/sys/fs/cgroup` 实际类型与试过的路径一并抛出，便于在服务器上定位。
+  - `io.stat` 缺失（io 控制器没启用）从「退出」降级为「rbytes/wbytes 记 0」——
+    它不影响 patch_identical 与 rc_match 这两个结论。
+  - **容器名带 PID**。原先只按 trial 名推导且启动前无条件 `docker rm -f`，
+    两个进程重放同一条 trial 会静默互删容器（crosslang/INDEX.md「已知风险」）。
+    现在同前缀存量容器会被检测出来并拒绝启动，`--force` 可越过。
+  - **镜像不在本地时默认拒绝启动**（`--allow-pull` 越过）：实测出口吞吐 0.27 MB/s，
+    误触一个 ~800MB 的镜像就是几十分钟。
+  - verdict 里增记 `host`（内核 / cgroup 目录与探测方式 / CPU 数 / 镜像），
+    跨机比性能数字时这些是前提。
+
 用法:
     python3 deepswe/replay.py <trial_dir> <task_json> -o <outdir>
+
+    批量跑 crosslang 那 5 条并与基线对比，用 crosslang/run_batch.py；
+    服务器上的完整流程见 crosslang/RUNBOOK.md。
 """
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -59,6 +81,7 @@ from datetime import datetime
 MEM_POLL_S = 0.02      # memory.current 轮询间隔
 OUTER_SLACK_S = 60     # 宿主侧兜底超时 = --cmd-timeout + 该值（正常绝不触发）
 SINK_PORT = 3128       # sinkhole 代理监听端口（容器 netns 内的 127.0.0.1）
+CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
 
 # 纯 stdlib 的 403 sinkhole 代理，作为 `python3 -c` 的实参丢进 sidecar 容器。
 # 对一切进来的连接：读完请求头就回 403，然后关闭。两类客户端都能覆到——
@@ -125,22 +148,119 @@ def strip_cd(c):
     return re.sub(r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*cd\s+\S+\s*&&\s*", "", c.strip())
 
 
+def cgroup_fstype():
+    """`/sys/fs/cgroup` 的文件系统类型。v2 统一层级是 `cgroup2fs`。"""
+    r = sh(["stat", "-fc", "%T", str(CGROUP_ROOT)])
+    return r.stdout.decode().strip() if r.returncode == 0 else ""
+
+
+def _cg_from_proc(pid):
+    """从 `/proc/<pid>/cgroup` 读 v2 相对路径 —— 内核自己报告的，对任何 driver 都准。
+
+    返回 None 表示这条路走不通，调用方要继续试候选路径。三种情况会走不通：
+      - dockerd 在别的 pid namespace（WSL2 / Docker Desktop：`.State.Pid` 在宿主 /proc 里
+        根本不存在，本机实测如此），
+      - 容器已退出（pid=0），
+      - 挂的是 cgroup v1（行首是 `N:subsys:` 而非 `0::`）。
+    """
+    if not pid or pid == "0":
+        return None
+    try:
+        txt = pathlib.Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return None
+    for line in txt.splitlines():
+        if line.startswith("0::"):          # v2 统一层级固定这一行
+            rel = line[3:].strip()
+            if rel.startswith("/"):
+                return CGROUP_ROOT / rel.lstrip("/")
+    return None
+
+
+def _cg_candidates(cid):
+    """各 docker cgroup driver 的已知落点，按常见度排序。
+
+    driver 与 rootless 与否会让路径完全不同，这是换机器时最先炸的一环：
+    本机 driver=cgroupfs，实际在 `/sys/fs/cgroup/docker/<id>`，而旧版本硬编码的是
+    systemd driver 的 `system.slice/docker-<id>.scope` —— 直接 raise 退出。
+    """
+    uid = os.getuid()
+    user_svc = CGROUP_ROOT / "user.slice" / f"user-{uid}.slice" / f"user@{uid}.service"
+    return [
+        CGROUP_ROOT / "docker" / cid,                             # cgroupfs driver
+        CGROUP_ROOT / "system.slice" / f"docker-{cid}.scope",     # systemd driver
+        user_svc / "user.slice" / f"docker-{cid}.scope",          # rootless + systemd
+        user_svc / "docker.service" / cid,                        # rootless + cgroupfs
+    ]
+
+
+def _cg_search(cid):
+    """兜底：在 cgroup 树里按容器 ID 搜一次。driver 是自定义 cgroup-parent 时只剩这条路。"""
+    r = sh(["find", str(CGROUP_ROOT), "-maxdepth", "6", "-type", "d",
+            "-name", f"*{cid}*", "-print", "-quit"])
+    out = r.stdout.decode().strip().splitlines()
+    return pathlib.Path(out[0]) if out else None
+
+
+def discover_cgroup_dir(container):
+    """定位容器的 cgroup v2 目录，返回 (路径, 探测方式, 试过的路径列表)。
+
+    三级探测，每级都可能因环境而失效，所以都要试；全失败时把试过的路径原样抛出去，
+    让服务器上能直接看出是 driver 问题还是权限问题。
+    """
+    tried = []
+    cid = sh(["docker", "inspect", "-f", "{{.Id}}", container])
+    if cid.returncode != 0:
+        raise RuntimeError(f"docker inspect 取容器 ID 失败: {cid.stderr.decode()[:300]}")
+    cid = cid.stdout.decode().strip()
+
+    pid = sh(["docker", "inspect", "-f", "{{.State.Pid}}", container])
+    pid = pid.stdout.decode().strip() if pid.returncode == 0 else ""
+
+    p = _cg_from_proc(pid)
+    if p:
+        tried.append(str(p))
+        if (p / "cpu.stat").exists():
+            return p, f"/proc/{pid}/cgroup", tried
+
+    for c in _cg_candidates(cid):
+        tried.append(str(c))
+        if (c / "cpu.stat").exists():
+            return c, "已知 driver 候选路径", tried
+
+    p = _cg_search(cid)
+    if p:
+        tried.append(str(p) + "  (find)")
+        if (p / "cpu.stat").exists():
+            return p, "cgroup 树搜索", tried
+
+    fs = cgroup_fstype()
+    hint = ("挂的不是 cgroup v2（本脚本的 cpu.stat/io.stat/memory.current 口径只适用 v2）"
+            if fs != "cgroup2fs" else
+            "cgroup v2 正常，但容器目录没找到——可能是 rootless、自定义 cgroup-parent，"
+            "或 /sys/fs/cgroup 未以可读方式挂进当前 namespace")
+    raise RuntimeError(
+        f"找不到容器 {container} 的 cgroup 目录。\n"
+        f"  /sys/fs/cgroup 类型: {fs or '未知'}\n"
+        f"  容器 ID: {cid}\n"
+        f"  State.Pid: {pid or '不可用'}\n"
+        f"  {hint}\n"
+        f"  已试过:\n    " + "\n    ".join(tried or ["（无）"]))
+
+
 class Cgroup:
     """从宿主侧读容器 cgroup v2 累计值，前后做差归因到单条命令（容器内串行，差值即该命令）。"""
 
     def __init__(self, container):
-        cid = sh(["docker", "inspect", "-f", "{{.Id}}", container])
-        if cid.returncode != 0:
-            raise RuntimeError(f"docker inspect 取容器 ID 失败: {cid.stderr.decode()[:300]}")
-        self.cid = cid.stdout.decode().strip()
-        self.path = pathlib.Path(f"/sys/fs/cgroup/system.slice/docker-{self.cid}.scope")
-        # 不静默降级：路径缺失直接报错退出，否则会像 v1 一样悄悄写出一堆 0
-        if not self.path.is_dir():
-            raise RuntimeError(f"宿主侧 cgroup 目录不存在: {self.path}\n"
-                               f"（cgroup driver 可能不是 systemd，或不是 cgroup v2）")
-        for f in ("cpu.stat", "io.stat", "memory.current"):
+        self.path, self.how, self.tried = discover_cgroup_dir(container)
+        self.cid = sh(["docker", "inspect", "-f", "{{.Id}}", container]).stdout.decode().strip()
+        # 不静默降级：缺文件直接报错退出，否则会像 v1 一样悄悄写出一堆 0
+        for f in ("cpu.stat", "memory.current"):
             if not (self.path / f).exists():
                 raise RuntimeError(f"缺少 cgroup 文件: {self.path / f}")
+        # io.stat 在部分内核/驱动下可能缺失（如 io 控制器没启用）。它只影响 rbytes/wbytes
+        # 两个字段，不影响 patch_identical 与 rc_match 这两个结论，所以降级而不是退出。
+        self.has_io = (self.path / "io.stat").exists()
 
     def _read(self, name):
         try:
@@ -156,7 +276,7 @@ class Cgroup:
                 d[p[0]] = int(p[1])
         rb = wb = 0
         # io.stat 每行一个块设备，容器没产生块层 IO 时该文件为空（合法，不是错误）
-        for line in self._read("io.stat").splitlines():
+        for line in (self._read("io.stat").splitlines() if self.has_io else []):
             for k, v in re.findall(r"(rbytes|wbytes)=(\d+)", line):
                 if k == "rbytes":
                     rb += int(v)
@@ -270,6 +390,11 @@ def main():
                     help="sinkhole=容器仍 --network=none，另起 sidecar 在 127.0.0.1 提供"
                          "「一切请求立即 403」的代理并注入 HTTP(S)_PROXY（默认，对齐原 harness）；"
                          "none=旧口径，纯无网卡（连接会挂着等到超时）")
+    ap.add_argument("--allow-pull", action="store_true",
+                    help="镜像不在本地时允许 docker run 触发拉取。默认禁止：实测出口吞吐只有"
+                         "0.27 MB/s，误触一个 ~800MB 的镜像就是几十分钟")
+    ap.add_argument("--force", action="store_true",
+                    help="发现同 trial 的存量重放容器时照样启动（默认拒绝，防止两个进程互删容器）")
     args = ap.parse_args()
     interp = args.interpreter.split()
     if not interp:
@@ -296,7 +421,10 @@ def main():
 
     out = pathlib.Path(args.outdir) / tdir.name
     out.mkdir(parents=True, exist_ok=True)
-    name = f"replay_{tdir.name}"[:60].replace(".", "_")
+    # 容器名带上 PID：旧版本只按 trial 名推导，两个进程重放同一条 trial 会静默互删容器
+    # （crosslang/INDEX.md「已知风险」记的就是这个）。加 PID 后各进程互不干扰。
+    prefix = "replay_" + re.sub(r"[^A-Za-z0-9_.-]", "_", tdir.name)[:44]
+    name = f"{prefix}_{os.getpid()}"
     sink = name + "-sink"
 
     # allow_internet=true 的 task 本来就该真联网，sinkhole 只在断网口径下生效
@@ -310,9 +438,32 @@ def main():
     print(f"exec      {' '.join(interp)}")
     print(f"commands  {n_all} 条，跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
     print(f"timeout   容器内 timeout -k 5 {args.cmd_timeout}（宿主兜底 {args.cmd_timeout + OUTER_SLACK_S}s）")
+    print(f"container {name}")
 
-    sh(["docker", "rm", "-f", name])
-    sh(["docker", "rm", "-f", sink])
+    # 镜像必须已在本地：默认不允许 docker run 顺手去 pull
+    if sh(["docker", "image", "inspect", image]).returncode != 0:
+        if not args.allow_pull:
+            print(f"\n镜像不在本地: {image}\n"
+                  f"  先 `docker pull {image}`，或加 --allow-pull 允许现拉。\n"
+                  f"  默认拒绝是因为实测出口吞吐约 0.27 MB/s，一个 ~800MB 镜像要几十分钟。")
+            return 1
+        print("镜像不在本地，--allow-pull 已开，docker run 将触发拉取（可能很慢）")
+
+    # 同一条 trial 的存量重放容器 → 说明可能有另一个进程在跑，撞上就是互相删容器
+    ex = sh(["docker", "ps", "-aq", "--filter", f"name=^{prefix}"])
+    stale = [c for c in ex.stdout.decode().split() if c]
+    if stale:
+        names = sh(["docker", "ps", "-a", "--filter", f"name=^{prefix}",
+                    "--format", "{{.Names}} ({{.Status}})"]).stdout.decode().strip()
+        if not args.force:
+            print(f"\n发现同 trial 的存量重放容器 {len(stale)} 个：\n  "
+                  + names.replace("\n", "\n  ")
+                  + "\n  可能有另一个重放进程正在跑。确认无人在用后清理：\n"
+                    f"    docker rm -f $(docker ps -aq --filter name=^{prefix})\n"
+                    f"  或加 --force 忽略本检查。")
+            return 1
+        print(f"--force：忽略 {len(stale)} 个存量容器 {names.splitlines()}")
+
     run = ["docker", "run", "-d", "--name", name,
            f"--cpus={cpus}", f"--memory={mem_mb}m", f"--memory-swap={mem_mb}m"]
     if not allow_net:
@@ -367,6 +518,9 @@ def main():
         teardown()
         return 1
     print(f"cgroup    {cg.path}")
+    print(f"          （探测方式：{cg.how}"
+          + ("" if cg.has_io else "；io.stat 缺失 → rbytes/wbytes 记 0，不影响保真度结论")
+          + "）")
 
     mem = MemSampler(cg)
     mem.start()
@@ -428,7 +582,14 @@ def main():
                    "net_mode": "internet" if allow_net else ("sinkhole403" if use_sink else "none"),
                    "n_cmds_trace": n_all, "n_skipped_sentinel": n_skipped,
                    "n_replayed": len(recs),
-                   "replayed_patch_bytes": len(replayed)}
+                   "replayed_patch_bytes": len(replayed),
+                   # 跨机对比时这些是解释性能差异的前提，必须随判定一起落盘
+                   "host": {"kernel": os.uname().release,
+                            "cgroup_dir": str(cg.path),
+                            "cgroup_discovery": cg.how,
+                            "cgroup_has_io": cg.has_io,
+                            "nproc": os.cpu_count(),
+                            "image": image}}
         if sink_cg:
             # 代理自身开销：独立 cgroup，未计入被测容器
             sk = sink_cg.sample()

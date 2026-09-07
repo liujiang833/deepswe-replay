@@ -118,10 +118,17 @@ PATH(-lc) = /root/.bun/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/
 
 ## 已知风险
 
-- `replay.py` 启动时会 `docker rm -f <容器名>`，容器名由 trial 目录名推导
+- ~~`replay.py` 启动时会 `docker rm -f <容器名>`，容器名由 trial 目录名推导
   （`replay_<trial_name>`，截断到 60 字符）。**两个进程同时重放同一条 trial 会静默互杀**——
   后启动的那个会把先启动的容器删掉，先启动的那条从此每条命令都失败。
-  批量化时必须保证同一 trial 只有一个重放进程。
+  批量化时必须保证同一 trial 只有一个重放进程。~~
+  **2026-09-07 已修**：容器名改为 `replay_<trial>_<pid>`，且启动前会检测同前缀的存量容器
+  并拒绝启动（`--force` 可越过）。同时不再无条件 `docker rm -f` 别的进程的容器。
+
+- **本目录的汇总表是修正前口径**（`bash -lc` + `--network=none`），
+  而各 trial 的 `replay/verdict.json` 是修正后的最终口径（`/bin/sh -c` + sinkhole403）。
+  两者的 `rc_match` 对不上是正常的（rust 72/76 vs 74/76、ts 58/59 vs 59/59、go 67/69 vs 66/69）。
+  **跨机对比一律以 `verdict.json` 为准**，`run_batch.py` 读的也是它。
 
 ## 命令构成差异（工具链关键词命中次数）
 

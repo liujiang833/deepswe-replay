@@ -59,6 +59,57 @@ deepswe-replay-bundle/
 **0.27 MB/s**，误触一个 ~800 MB 的镜像就是几十分钟。`preflight.sh` 和
 `run_batch.py --dry-run` 都会把缺失的镜像连同 `docker pull` 命令一起列出来。
 
+## 2b. 拉不到 registry 时(ECR / DockerHub 不通)
+
+重放执行本身**零网络**,所以 registry 不通不影响跑,只影响"怎么把镜像弄到本地"。
+三条路:
+
+| 路 | 前提 | 代价 |
+|---|---|---|
+| A. `docker pull` | 能连 ECR | — |
+| B. `docker save` \| zstd → 搬文件 → `docker load` | 能物理搬文件 | 5 个镜像共享基座,一次性打包约 690 MB(zstd);**分 5 次打会重复传 4 遍基座,涨到约 2.4 GB** |
+| C. 从本地 mars-base 重建 | 能连各包源(npm/pypi/goproxy/crates) | 见 `build_arm.sh` |
+
+### 路 C:重建(`check_sources.sh` + `build_arm.sh`)
+
+```bash
+bash check_sources.sh          # 先探源:几秒,决定哪几条建得成
+bash build_arm.sh --list       # 看会做什么改写,不构建
+bash build_arm.sh python       # 从依赖最少的开始
+bash build_arm.sh all          # 全建(自动按 python→go→js→ts→rust 排序)
+```
+
+可行的前提(都已核实):`task.json` 里就带着 `environment/Dockerfile`;113 个 Dockerfile
+**零 COPY / 零 ADD**,构建上下文可以是空目录;建完打上 `task.toml` 里原本的
+`docker_image` tag,所以 `replay.py` 零改动。
+
+各条需要的源:
+
+| task | 需要 |
+|---|---|
+| python (returns) | github + pypi ← 依赖最少,且**唯一不需要装报告器**的 |
+| go (actionlint) | github + proxy.golang.org + sum.golang.org |
+| js (yjs) | github + npmjs(`npm ci`,锁定) |
+| ts (true-myth) | github + npmjs(`pnpm install`,**未锁定**) |
+| rust (fd) | github + crates.io + get.nexte.st + npmjs ← 最难,最后建 |
+
+**ARM 上的一处硬改写**:`fd` 的 Dockerfile 写死 `get.nexte.st/${VER}/linux`,
+那是 x86_64 产物。`build_arm.sh` 在基座是 arm64 时自动改成 `/linux-arm`。
+(实测确认:`/linux` 8.2 MB、`/linux-arm` 6.7 MB 都存在,`/linux-arm64` 是 404。)
+
+### ⚠️ 路 C 的保真度代价
+
+**重建镜像 ≠ 原 amd64 镜像**,即使改写为零:
+
+- 依赖版本会漂移:`pnpm install` 未加 `--frozen-lockfile`、`pip install` 未钉版本、
+  `npm install -g` 只钉直接依赖。(例外:`cargo fetch --locked` 和 `npm ci` 是锁定的)
+- 换架构后工具链、native 扩展、编译产物全部不同
+- 基座本身是 `:latest`,不可复现
+
+→ **`patch_identical` 在重建镜像上是待验证的开放问题**,不能因为它在原 amd64 镜像上
+5/5 通过就假定这里也成立。它失败时,先分清是重放流程坏了,还是镜像本身就不一样——
+`build/<lang>/REWRITES.md` 记着每条改写,是排查的起点。
+
 ## 3. 预检
 
 ```bash

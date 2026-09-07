@@ -444,8 +444,14 @@ def main():
     if sh(["docker", "image", "inspect", image]).returncode != 0:
         if not args.allow_pull:
             print(f"\n镜像不在本地: {image}\n"
-                  f"  先 `docker pull {image}`，或加 --allow-pull 允许现拉。\n"
-                  f"  默认拒绝是因为实测出口吞吐约 0.27 MB/s，一个 ~800MB 镜像要几十分钟。")
+                  f"  三条路，按环境选：\n"
+                  f"    1. 能连 registry：docker pull {image}\n"
+                  f"    2. 连不上但能搬文件：在有网机器上 docker save | zstd，"
+                  f"目标机 docker load\n"
+                  f"    3. 连不上 registry 但能连各包源：crosslang/build_arm.sh "
+                  f"从本地 mars-base 重建\n"
+                  f"  （--allow-pull 可让 docker run 自己去拉；默认拒绝是因为实测出口"
+                  f"吞吐约 0.27 MB/s，一个 ~800MB 镜像要几十分钟）")
             return 1
         print("镜像不在本地，--allow-pull 已开，docker run 将触发拉取（可能很慢）")
 

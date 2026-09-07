@@ -57,6 +57,23 @@ for d in "$HERE"/*/; do
 done
 [ "$N" -gt 0 ] || { echo "没找到任何 trial 目录"; exit 1; }
 
+# 版本标识：文件名只带日期，同一天重打会同名覆盖、跨天又会多出一个包，
+# 光看文件名分不清手上这份是哪一版。服务器上 `cat BUILD_INFO` 一眼可辨。
+GITSHA=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
+GITDIRTY=$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)
+{
+  echo "built_utc   $(date -u +%FT%TZ)"
+  echo "git_commit  $GITSHA${GITDIRTY:+ (工作区有未提交改动)}"
+  echo "host        $(uname -srm)"
+  echo "trials      $N"
+  echo "mode        $([ "$FULL" = 1 ] && echo full || echo slim)"
+  echo
+  echo "scripts:"
+  for f in replay.py run_batch.py preflight.sh check_sources.sh build_arm.sh; do
+    [ -f "$ROOT/$f" ] && printf '  %-18s %s\n' "$f" "$(sha256sum "$ROOT/$f" | cut -c1-12)"
+  done
+} > "$ROOT/BUILD_INFO"
+
 # 随包留一份指纹：解包后可核对传输完整性，也便于日后追溯跑的是哪一版
 ( cd "$ROOT" && find . -type f ! -name SHA256SUMS -print0 \
     | sort -z | xargs -0 sha256sum > SHA256SUMS )

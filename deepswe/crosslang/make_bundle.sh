@@ -60,7 +60,8 @@ done
 # 版本标识：文件名只带日期，同一天重打会同名覆盖、跨天又会多出一个包，
 # 光看文件名分不清手上这份是哪一版。服务器上 `cat BUILD_INFO` 一眼可辨。
 GITSHA=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
-GITDIRTY=$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)
+# 只看进了包的那些路径：仓库里别处的未提交改动与本包无关，算进来会让标识长期显示"脏"而失去意义
+GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null | grep -v '\.tar\.gz$' | head -1)
 {
   echo "built_utc   $(date -u +%FT%TZ)"
   echo "git_commit  $GITSHA${GITDIRTY:+ (工作区有未提交改动)}"

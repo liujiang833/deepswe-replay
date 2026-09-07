@@ -107,3 +107,69 @@
 - **唯一硬标准**：5 条全部 `patch_identical=true`
 - `rc_match` 与基线差几条属正常（四类不可消除来源，RUNBOOK §5.2）
 - 基线合计 862s / 367 条命令（python 222.6 / go 104.0 / rust 295.6 / ts 68.6 / js 171.3）
+
+
+---
+
+## 第二阶段：目标环境是 ARM + 拉不到 registry + 要代理
+
+**起因**：用户澄清目标环境 —— ECR/DockerHub 不通、能访问 git、传文件极慢
+（实测 400MB/2h ≈ 55 KB/s）、docker 可用、已传好 `mars-base:arm64`、访问外网要代理。
+
+### 路线变更：从「搬 amd64 镜像」改为「在 ARM 上重建」
+
+搬运不可行：5 个 task 镜像是 amd64，per-task 层是依赖缓存、全部架构相关，
+ARM 上不能复用。而重建的下载走目标机自己的出口，**避开了 55 KB/s 那条链路**。
+
+可行前提（均已核实）：`task.json` 里就带着 `environment/Dockerfile`；113 个 Dockerfile
+零 COPY / 零 ADD，构建上下文可为空目录；建完打上 `task.toml` 里原本的 tag，
+`replay.py` 零改动。
+
+### 新增
+
+| 文件 | 作用 |
+|---|---|
+| `check_sources.sh` | 探测构建期 12 个上游端点。打真实端点看 HTTP 码而非 ping（原环境的 403 就是 TCP 通、HTTP 拒） |
+| `build_arm.sh` | 从本地 mars-base 重建。两处自动改写 + 代理支持 + 构建后自检 |
+
+### 端到端实测（本机，用分发包里那份真 `mars-base:arm64`）
+
+```
+docker load → mars-base:arm64 (arm64 / 22 层 / 2.53 GB)
+build_arm.sh python → 144s / 2427 MB
+preflight → 15 项活体测试全过
+完整重放 98 条命令 → patch_identical ✅ 63,009B 逐字节一致
+```
+
+**回答了原先标注的开放问题**：ARM 重建镜像上保真度成立。rc 91/98（基线 95/98），
+少的 4 条全是超时类（7 条不匹配里 6 条是 pytest 撞 30s 墙，1 条 hypothesis 随机性）。
+且这是在 qemu 模拟（比原生 ARM 更慢、超时更多）的不利条件下拿到的。
+
+### 本阶段揪出的 5 个 bug
+
+1. **cgroup 探测假阳性**（最危险）：探到 `/sys/fs/cgroup/init.scope` 却报"成功"。
+   WSL 下 `.State.Pid` 撞上宿主另一个真实进程 → 静默采错数据。
+   修：`/proc` 那级必须能在路径里认出容器 ID。
+2. **`check_sources.sh` 假阴性**：状态码拼成 `200000`，6 个源被误报不通。
+   根因是几 MB 的二进制端点撞 `--max-time`。修：`--range 0-0` 只取首字节。修后 12/12 全通。
+3. **`replay.py` 漏了 `NO_PROXY`**：`~/.docker/config.json` 的 proxies 会被自动注入
+   每个 `docker run`，其 NO_PROXY 会让部分域名绕过 403 sinkhole，报错文本与 trace 不符。
+4. **`make_bundle.sh` 漏打新脚本**：`check_sources.sh` / `build_arm.sh` 没进包。
+5. **`make_bundle.sh` 被 pipefail 打断**：`grep -v` 无匹配返回 1（正是"干净"的情况）。
+
+### 代理（实测两条事实）
+
+- **`docker build` 不继承 shell 的 `http_proxy`/`https_proxy`** —— 构建容器内是"未设置"，
+  `git clone` 直接失败。必须显式 `--build-arg`。
+- **预定义 build-arg 传的代理不会写进 image config 的 Env** —— 所以构建期用代理
+  不污染运行期（原始 mars-base 的 Env 里本来也是零个 `*_proxy`）。构建后脚本再自检一次。
+
+`build_arm.sh` 四个场景实测通过：环境变量继承 / loopback 自动 `--network=host` /
+`user:pass@` 脱敏 / 未配代理时给提示。
+
+### 交付
+
+`deepswe/crosslang/deepswe-replay-bundle-20260907.tar.gz` — 628 KB / 35 文件。
+随包 `BUILD_INFO`（打包时间、git commit、脚本 sha256 前 12 位）解决"手上这份是哪一版"。
+
+**注意**：`mars-base:arm64` 与 task 镜像都不用传 —— 前者用户已传好，后者在服务器上重建。

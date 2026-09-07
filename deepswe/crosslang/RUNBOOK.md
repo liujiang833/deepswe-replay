@@ -16,6 +16,10 @@ python3 run_batch.py               # 正式跑，约 15 分钟
 
 **唯一的通过标准是 5 条全部 `patch_identical=true`。** 其余数字都是参考。
 
+默认**不采 cgroup 性能指标**（打通阶段用不上，采集另有专门脚本负责 flame graph /
+topdown）。这也顺带去掉了「必须 cgroup v2 且宿主侧目录可读」这条硬约束——
+rootless docker、受限容器、cgroup v1 的机器都能跑。要采时加 `--metrics`。
+
 ---
 
 ## 1. 这个 bundle 里有什么
@@ -50,7 +54,7 @@ deepswe-replay-bundle/
 | 项 | 要求 | 不满足会怎样 |
 |---|---|---|
 | docker | 能起容器，当前用户有权限 | 直接跑不了 |
-| **cgroup v2** | `stat -fc %T /sys/fs/cgroup` = `cgroup2fs` | 性能指标采不到（`replay.py` 明确报错退出，不会静默写 0） |
+| cgroup v2 | 仅 `--metrics` 时需要 | 不采指标就完全不碰 cgroup；采时缺它 `replay.py` 明确报错退出，不会静默写 0 |
 | python3 | ≥3.8，标准库即可 | 跑不了 |
 | 5 个镜像 | 已 `docker pull` 到本地 | `replay.py` 拒绝启动（默认不允许现拉，见下） |
 | 磁盘 | ≥20 GB | 重放中途写满 |
@@ -216,6 +220,16 @@ cgroup 目录的位置**取决于 docker 的 cgroup driver 和是否 rootless**�
 
 三级全失败时报错会告诉你 `/sys/fs/cgroup` 的实际类型。若不是 `cgroup2fs`，
 本流程的指标口径（`cpu.stat`/`memory.current`）不适用 cgroup v1，需要换机器或切 v2。
+
+### 6.1b cgroup 探测出的路径看着不对（只在 `--metrics` 下相关）
+
+若日志里 cgroup 目录是 `/sys/fs/cgroup/init.scope` 之类**不含容器 ID**的路径，
+那是采错对象了——读的是别的进程的指标。
+
+WSL 上实测过这个假阳性：`docker inspect .State.Pid` 给的是 dockerd 所在 namespace
+里的编号，拿到宿主 `/proc` 下恰好对上了另一个真实进程，于是「读成功」却读的是
+`init.scope`。**静默采错比报错危险**，所以三级探测的第一级现在会用容器 ID 复核路径，
+认不出就当没读到、继续试候选路径。
 
 ### 6.2 `镜像不在本地`
 

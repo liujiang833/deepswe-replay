@@ -125,9 +125,15 @@ else
     PID=$(docker inspect -f '{{.State.Pid}}' "$C")
     # 与 replay.py 同一套三级探测
     CGDIR=""
+    # 与 replay.py 同一套三级探测，含同一条防假阳性的复核：
+    # /proc 读到的路径必须能认出容器 ID，否则就是别人的 cgroup。
+    # （WSL 实测过：.State.Pid 在宿主 /proc 里对上了另一个进程，读出 init.scope）
     if [ -n "$PID" ] && [ -r "/proc/$PID/cgroup" ]; then
       REL=$(sed -n 's/^0:://p' "/proc/$PID/cgroup" | head -1)
-      [ -n "$REL" ] && [ -e "/sys/fs/cgroup${REL}/cpu.stat" ] && CGDIR="/sys/fs/cgroup${REL}" && HOW="/proc/<pid>/cgroup"
+      case "$REL" in
+        *"${CID:0:12}"*) [ -e "/sys/fs/cgroup${REL}/cpu.stat" ] \
+            && CGDIR="/sys/fs/cgroup${REL}" && HOW="/proc/<pid>/cgroup" ;;
+      esac
     fi
     if [ -z "$CGDIR" ]; then
       for c in "/sys/fs/cgroup/docker/$CID" \

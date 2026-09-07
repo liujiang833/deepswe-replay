@@ -154,14 +154,18 @@ def cgroup_fstype():
     return r.stdout.decode().strip() if r.returncode == 0 else ""
 
 
-def _cg_from_proc(pid):
+def _cg_from_proc(pid, cid):
     """从 `/proc/<pid>/cgroup` 读 v2 相对路径 —— 内核自己报告的，对任何 driver 都准。
 
-    返回 None 表示这条路走不通，调用方要继续试候选路径。三种情况会走不通：
-      - dockerd 在别的 pid namespace（WSL2 / Docker Desktop：`.State.Pid` 在宿主 /proc 里
-        根本不存在，本机实测如此），
+    返回 None 表示这条路走不通，调用方要继续试候选路径。会走不通的情况：
+      - dockerd 在别的 pid namespace（WSL2 / Docker Desktop），
       - 容器已退出（pid=0），
       - 挂的是 cgroup v1（行首是 `N:subsys:` 而非 `0::`）。
+
+    **必须用容器 ID 复核读到的路径**：WSL 实测过一次假阳性——`.State.Pid` 是
+    dockerd 所在 namespace 里的编号，拿到宿主 /proc 下恰好对上了另一个真实进程，
+    于是"读成功"了，但读出来的是 `/sys/fs/cgroup/init.scope`，即**别人的 cgroup**。
+    那种情况下指标会被静默采错，比读不到危险得多。所以路径里认不出容器 ID 就当没读到。
     """
     if not pid or pid == "0":
         return None
@@ -172,7 +176,7 @@ def _cg_from_proc(pid):
     for line in txt.splitlines():
         if line.startswith("0::"):          # v2 统一层级固定这一行
             rel = line[3:].strip()
-            if rel.startswith("/"):
+            if rel.startswith("/") and cid[:12] in rel:
                 return CGROUP_ROOT / rel.lstrip("/")
     return None
 
@@ -217,7 +221,7 @@ def discover_cgroup_dir(container):
     pid = sh(["docker", "inspect", "-f", "{{.State.Pid}}", container])
     pid = pid.stdout.decode().strip() if pid.returncode == 0 else ""
 
-    p = _cg_from_proc(pid)
+    p = _cg_from_proc(pid, cid)
     if p:
         tried.append(str(p))
         if (p / "cpu.stat").exists():
@@ -246,6 +250,39 @@ def discover_cgroup_dir(container):
         f"  State.Pid: {pid or '不可用'}\n"
         f"  {hint}\n"
         f"  已试过:\n    " + "\n    ".join(tried or ["（无）"]))
+
+
+class NullCgroup:
+    """`--no-metrics` 模式下的占位：不碰 cgroup，指标字段一律记 null。
+
+    这条路把「必须 cgroup v2 + 宿主侧 cgroup 目录可读」从硬约束里去掉了 ——
+    rootless docker、受限容器、cgroup v1 的机器都能跑。
+    代价只有性能指标；**保真度校验（patch_identical）与 rc 序列比对完全不依赖 cgroup**，
+    所以只要目的是「打通」，用这个就够。
+    """
+
+    path = None
+    how = "禁用（--no-metrics）"
+    has_io = False
+
+    def sample(self):
+        return {}
+
+
+class NullMemSampler:
+    """与 MemSampler 同接口的空实现，让主循环不必分支。"""
+
+    def start(self):
+        pass
+
+    def reset(self):
+        pass
+
+    def take(self):
+        return None, 0
+
+    def stop(self):
+        pass
 
 
 class Cgroup:
@@ -395,6 +432,10 @@ def main():
                          "0.27 MB/s，误触一个 ~800MB 的镜像就是几十分钟")
     ap.add_argument("--force", action="store_true",
                     help="发现同 trial 的存量重放容器时照样启动（默认拒绝，防止两个进程互删容器）")
+    ap.add_argument("--no-metrics", action="store_true",
+                    help="不采 cgroup 性能指标，只跑命令 + 保真校验。"
+                         "去掉「必须 cgroup v2 且宿主侧目录可读」这条硬约束，"
+                         "rootless / 受限环境也能跑。patch_identical 与 rc 比对不受影响")
     args = ap.parse_args()
     interp = args.interpreter.split()
     if not interp:
@@ -509,28 +550,36 @@ def main():
             print(sh(["docker", "logs", sink]).stderr.decode()[:400])
             teardown()
             return 1
+        if not args.no_metrics:
+            try:
+                sink_cg = Cgroup(sink)
+            except RuntimeError as e:
+                print(f"sinkhole cgroup 初始化失败：{e}")
+                teardown()
+                return 1
+        print(f"sinkhole  {proxy_url}（sidecar 容器 {sink}"
+              + ("，独立 cgroup）" if sink_cg else "）"))
+
+    if args.no_metrics:
+        cg, mem = NullCgroup(), NullMemSampler()
+        print("cgroup    不采集（--no-metrics）—— 只跑命令 + 保真校验")
+    else:
         try:
-            sink_cg = Cgroup(sink)
+            cg = Cgroup(name)
         except RuntimeError as e:
-            print(f"sinkhole cgroup 初始化失败：{e}")
+            print(f"cgroup 初始化失败：{e}\n"
+                  f"\n只想打通、不要性能数据的话，加 --no-metrics 可绕过整个 cgroup 依赖。")
             teardown()
             return 1
-        print(f"sinkhole  {proxy_url}（sidecar 容器 {sink}，独立 cgroup）")
-
-    try:
-        cg = Cgroup(name)
-    except RuntimeError as e:
-        print(f"cgroup 初始化失败：{e}")
-        teardown()
-        return 1
-    print(f"cgroup    {cg.path}")
-    print(f"          （探测方式：{cg.how}"
-          + ("" if cg.has_io else "；io.stat 缺失 → rbytes/wbytes 记 0，不影响保真度结论")
-          + "）")
-
-    mem = MemSampler(cg)
+        print(f"cgroup    {cg.path}")
+        print(f"          （探测方式：{cg.how}"
+              + ("" if cg.has_io else "；io.stat 缺失 → rbytes/wbytes 记 0，不影响保真度结论")
+              + "）")
+        mem = MemSampler(cg)
     mem.start()
-    print(f"mem       后台轮询 memory.current @ {int(MEM_POLL_S * 1000)}ms\n")
+    if not args.no_metrics:
+        print(f"mem       后台轮询 memory.current @ {int(MEM_POLL_S * 1000)}ms")
+    print()
 
     recs = []
     sink_cpu0 = sink_cg.sample()["usage_usec"] if sink_cg else 0
@@ -554,6 +603,10 @@ def main():
             after = cg.sample()
 
             def d(k):
+                # --no-metrics 下两边都是空 dict，记 None 而不是 0，
+                # 免得下游把"没采"读成"真的是 0"
+                if not before and not after:
+                    return None
                 return after.get(k, 0) - before.get(k, 0)
 
             # timeout 命令：TERM 超时退 124；-k 之后被 KILL 退 137
@@ -589,9 +642,10 @@ def main():
                    "n_cmds_trace": n_all, "n_skipped_sentinel": n_skipped,
                    "n_replayed": len(recs),
                    "replayed_patch_bytes": len(replayed),
+                   "metrics_collected": not args.no_metrics,
                    # 跨机对比时这些是解释性能差异的前提，必须随判定一起落盘
                    "host": {"kernel": os.uname().release,
-                            "cgroup_dir": str(cg.path),
+                            "cgroup_dir": str(cg.path) if cg.path else None,
                             "cgroup_discovery": cg.how,
                             "cgroup_has_io": cg.has_io,
                             "nproc": os.cpu_count(),

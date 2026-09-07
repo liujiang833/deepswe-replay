@@ -69,15 +69,17 @@ def load_trials():
     return out
 
 
-def preflight(trials):
+def preflight(trials, need_cgroup):
     """跑之前把「一定会失败」的情况先查出来，避免跑到一半才炸。"""
     problems = []
     if sh(["docker", "version"]).returncode != 0:
         problems.append("docker 不可用（未安装 / daemon 没起 / 当前用户无权限）")
     fs = sh(["stat", "-fc", "%T", "/sys/fs/cgroup"])
     fstype = fs.stdout.decode().strip() if fs.returncode == 0 else "未知"
-    if fstype != "cgroup2fs":
-        problems.append(f"/sys/fs/cgroup 是 {fstype}，不是 cgroup2fs —— 本流程的指标口径只适用 cgroup v2")
+    # 只有采指标时 cgroup v2 才是硬要求；只跑重放 + 保真校验的话完全不碰 cgroup
+    if fstype != "cgroup2fs" and need_cgroup:
+        problems.append(f"/sys/fs/cgroup 是 {fstype}，不是 cgroup2fs —— 指标口径只适用 cgroup v2"
+                        f"（不加 --metrics 就不需要它）")
     missing = [t for t in trials if t["image"] and sh(["docker", "image", "inspect", t["image"]]).returncode != 0]
     for t in missing:
         problems.append(f"镜像不在本地: [{t['lang']}] {t['image']}")
@@ -118,6 +120,9 @@ def main():
                          "只用来确认容器能起、cgroup 能读、命令能执行")
     ap.add_argument("--cmd-timeout", type=int, default=30,
                     help="单条命令超时秒数，默认 30（对齐原 harness，改了就无法与基线对比）")
+    ap.add_argument("--metrics", action="store_true",
+                    help="额外采 cgroup 性能指标。默认不采——打通阶段用不上，"
+                         "而且它会引入「必须 cgroup v2 且宿主侧目录可读」这条硬约束")
     ap.add_argument("--dry-run", action="store_true", help="只做预检和排程，不真跑")
     ap.add_argument("--keep-going", action="store_true",
                     help="某条失败后继续跑剩下的（默认遇错即停）")
@@ -137,7 +142,7 @@ def main():
         print("没有可跑的 trial（--only 过滤掉了全部，或目录里没有合规的 trial）")
         return 1
 
-    problems, fstype, missing = preflight(trials)
+    problems, fstype, missing = preflight(trials, args.metrics)
 
     print("=" * 78)
     print(f"bundle    {HERE}")
@@ -145,6 +150,7 @@ def main():
     print(f"cgroup    {fstype}")
     print(f"内核      {os.uname().release}   CPU {os.cpu_count()}")
     print(f"待跑      {len(trials)} 条（串行）")
+    print(f"指标      {'采集 cgroup 性能数据' if args.metrics else '不采（--metrics 可开）'}")
     print("=" * 78)
     for t in trials:
         b = t["baseline"]
@@ -183,6 +189,8 @@ def main():
                "-o", str(out), "--cmd-timeout", str(args.cmd_timeout)]
         if args.smoke:
             cmd += ["--limit", str(args.smoke)]
+        if not args.metrics:
+            cmd += ["--no-metrics"]
 
         log = out / "logs" / f"{t['name']}.log"
         t0 = time.monotonic()

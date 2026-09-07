@@ -15,12 +15,21 @@ declare -a MISSING
 
 probe() {  # probe <标签> <URL> <谁需要它>
   local label="$1" url="$2" who="$3" code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -L "$url" 2>/dev/null || echo 000)
-  if [ "$code" = "200" ] || [ "$code" = "206" ]; then
-    printf '  ✅ %-26s %s   (%s)\n' "$label" "$code" "$who"; OK=$((OK+1))
-  else
-    printf '  ❌ %-26s %s   (%s)\n' "$label" "$code" "$who"; NO=$((NO+1)); MISSING+=("$label → $who")
-  fi
+  # --range 0-0 只要首字节：这些端点里有几个是几 MB 的二进制（.crate、nextest tar），
+  # 整包拉会撞 --max-time 变成假阴性（表现为状态码拼成 "200000" 这种）。
+  # tail -c 3 再兜一层：跟随重定向时 curl 可能对多个 hop 各写一次 %{http_code}。
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -L --range 0-0 "$url" 2>/dev/null | tail -c 3)
+  case "$code" in
+    200|206) printf '  ✅ %-26s %s   (%s)\n' "$label" "$code" "$who"; OK=$((OK+1)) ;;
+    # 部分 CDN 不认 Range，退回整包但只等 8 秒，够判断"通不通"
+    *) code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 -L "$url" 2>/dev/null | tail -c 3)
+       if [ "$code" = "200" ] || [ "$code" = "206" ]; then
+         printf '  ✅ %-26s %s   (%s)\n' "$label" "$code" "$who"; OK=$((OK+1))
+       else
+         printf '  ❌ %-26s %-6s (%s)\n' "$label" "${code:-000}" "$who"
+         NO=$((NO+1)); MISSING+=("$label → $who")
+       fi ;;
+  esac
 }
 
 echo "=============================================================="
@@ -37,12 +46,14 @@ else
   echo "  docker      ❌ 不可用"
 fi
 # 基座必须已在本地：它是 5 个 task 镜像的 FROM
+# 候选顺序与 build_arm.sh 保持一致，命中即停——否则两个脚本可能选到不同的基座
 for tag in mars-base:arm64 mars-base:latest public.ecr.aws/x8v8d7g8/mars-base:latest; do
   if docker image inspect "$tag" >/dev/null 2>&1; then
     a=$(docker image inspect "$tag" -f '{{.Architecture}}')
     s=$(docker image inspect "$tag" -f '{{.Size}}')
     echo "  基座        ✅ $tag  ($a, $((s/1024/1024)) MB)"
     BASE_TAG="$tag"; BASE_ARCH="$a"
+    break
   fi
 done
 [ -n "${BASE_TAG:-}" ] || echo "  基座        ❌ 本地没有 mars-base（重建 task 镜像的 FROM）"

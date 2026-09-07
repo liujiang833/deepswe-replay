@@ -131,6 +131,61 @@ bash build_arm.sh python
 sinkhole 压住它;`preflight.sh` 也会检查并提示。若重放时外连报错不是 403 而是
 连接失败,先查这里。
 
+### 证书:公司内网做 TLS 中间人时
+
+症状是 `git clone` 报 `server certificate verification failed`。公司代理用内网 CA
+重签了所有 HTTPS,宿主机通常已被 IT 装好这张 CA(所以宿主上 curl 是通的),
+**但容器里没有**。
+
+**第一步:把 CA 抠出来**
+
+```bash
+bash get_ca_cert.sh          # → ./corp-ca.crt
+```
+
+两条路都试:从宿主系统信任库里挑本地额外添加的 CA(最可靠,就是 IT 装的那张);
+拿不到就从一次真实 TLS 握手抓证书链。产出后会**用它重试一次 HTTPS 验证是否真的可用**。
+
+**第二步:装进镜像**
+
+```bash
+bash build_arm.sh --ca-cert corp-ca.crt python
+```
+
+装 CA 的逻辑分三块,**缺一不可**——各工具的信任源并不一致(实测):
+
+| 工具 | 信任源 | 靠什么生效 |
+|---|---|---|
+| git / curl / go / cargo | `/etc/ssl/certs/ca-certificates.crt` | `update-ca-certificates` |
+| **node / npm / pnpm** | 内置 146 张根证书,**不读系统 bundle** | `NODE_EXTRA_CA_CERTS` |
+| **python / pip** | certifi 自带 `cacert.pem`,**不读系统 bundle** | `PIP_CERT` / `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` |
+
+所以只跑 `update-ca-certificates` 的话,**git clone 会过,npm 和 pip 照样失败**。
+`build_arm.sh` 生成的 Dockerfile 三块都插:
+
+```dockerfile
+COPY corp-ca.crt /usr/local/share/ca-certificates/corp-ca.crt
+RUN update-ca-certificates                      # 1 added, 0 removed
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=... PIP_CERT=... REQUESTS_CA_BUNDLE=... CARGO_HTTP_CAINFO=...
+```
+
+那几个 ENV 会留在镜像里,但值指向系统 bundle——是「信任库更全」,不是「不再校验」,
+与下面 `--insecure` 的残留性质完全不同。
+
+**退路:`--insecure`**
+
+```bash
+bash build_arm.sh --insecure python
+```
+
+关掉 git/curl/pip/npm/go 的证书校验,并在构建末尾**还原**(用文件配置而非 ENV,
+就是为了能还原;ENV 进了 image config 就删不掉)。构建后脚本会真起一个容器复核
+是否还原干净。
+
+**但 cargo 没有 insecure 开关**,只认 `CARGO_HTTP_CAINFO` 指向的 CA 文件——
+所以 rust 那条无论如何都得走 `--ca-cert`。
+
 ### ⚠️ 路 C 的保真度代价
 
 **重建镜像 ≠ 原 amd64 镜像**,即使改写为零:

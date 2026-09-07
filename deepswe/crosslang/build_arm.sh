@@ -25,6 +25,9 @@ BASE=""; LIST=0; TARGETS=()
 PROXY="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
 NOPROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"
 BUILD_NET=""
+# 公司内网做 TLS 中间人时用：装内网 CA（推荐）或干脆关掉校验（有残留代价，见下）
+CA_CERT="${DEEPSWE_CA_CERT:-}"
+INSECURE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -33,6 +36,8 @@ while [ $# -gt 0 ]; do
     --proxy) PROXY="$2"; shift 2 ;;
     --no-proxy) NOPROXY="$2"; shift 2 ;;
     --build-network) BUILD_NET="$2"; shift 2 ;;
+    --ca-cert) CA_CERT="$2"; shift 2 ;;
+    --insecure) INSECURE=1; shift ;;
     -o) OUT="$2"; shift 2 ;;
     -*) echo "未知参数: $1"; exit 1 ;;
     *) TARGETS+=("$1"); shift ;;
@@ -126,20 +131,46 @@ else
   echo "              或先 export HTTPS_PROXY=... 再跑本脚本"
 fi
 [ -n "$BUILD_NET" ] && echo "  构建网络    --network=$BUILD_NET"
+
+# ---- 证书 ----------------------------------------------------------------
+if [ -n "$CA_CERT" ]; then
+  if [ ! -f "$CA_CERT" ]; then
+    echo "  ❌ --ca-cert 指向的文件不存在: $CA_CERT"; exit 1
+  fi
+  if ! grep -q 'BEGIN CERTIFICATE' "$CA_CERT" 2>/dev/null; then
+    echo "  ❌ $CA_CERT 里没有 'BEGIN CERTIFICATE' —— 需要 PEM 格式；"
+    echo "     DER 格式可转： openssl x509 -inform der -in x.cer -out x.crt"
+    exit 1
+  fi
+  echo "  内网 CA     $CA_CERT（$(grep -c 'BEGIN CERTIFICATE' "$CA_CERT") 张证书）"
+fi
+if [ "$INSECURE" = 1 ]; then
+  echo "  ⚠️  --insecure 关闭证书校验（构建末尾会还原，不留进运行期）"
+  echo "      cargo 没有 insecure 开关，只认 CA 文件 —— rust 那条仍需 --ca-cert"
+fi
+if [ -z "$CA_CERT" ] && [ "$INSECURE" = 0 ]; then
+  echo "  证书        默认（如报 server certificate verification failed，"
+  echo "              说明内网做了 TLS 中间人：用 --ca-cert <内网CA.crt>，或 --insecure）"
+fi
 echo
 
 mkdir -p "$OUT"
-CTX="$OUT/.emptyctx"; mkdir -p "$CTX"      # 零 COPY/ADD，空上下文即可
+CTX="$OUT/.emptyctx"; mkdir -p "$CTX"      # 原 Dockerfile 零 COPY/ADD，空上下文即可
+# 唯一会进上下文的东西：内网 CA 证书（要 COPY 进镜像的信任库）
+rm -f "$CTX"/*.crt
+[ -n "$CA_CERT" ] && cp "$CA_CERT" "$CTX/$(basename "$CA_CERT")"
 
 N_OK=0; N_FAIL=0
 for lang in "${SELECTED[@]}"; do
   dir="${DIR_OF[$lang]}"
   work="$OUT/$lang"; mkdir -p "$work"
 
-  # 从 task.json 里取出 Dockerfile 与目标 tag，并做架构改写
-  python3 - "$HERE/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" <<'PY'
+  # 从 task.json 里取出 Dockerfile 与目标 tag，并做架构 / 证书改写
+  python3 - "$HERE/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" \
+           "$([ -n "$CA_CERT" ] && basename "$CA_CERT" || echo '')" "$INSECURE" <<'PY'
 import json, pathlib, re, sys
-task_json, work, base, base_arch = sys.argv[1:5]
+task_json, work, base, base_arch, ca_name, insecure = sys.argv[1:7]
+insecure = insecure == "1"
 work = pathlib.Path(work)
 files = {f["path"]: f["content"] for f in json.loads(pathlib.Path(task_json).read_text())["files"]}
 df = files["environment/Dockerfile"]
@@ -160,6 +191,71 @@ if base_arch in ("arm64", "aarch64") and "get.nexte.st" in df:
         rewrites.append(("get.nexte.st/<ver>/linux", "get.nexte.st/<ver>/linux-arm",
                          "原文写死 x86_64；ARM 上要换成 aarch64 那个产物"))
         df = new
+
+# 3) 公司内网 TLS 中间人：装内网 CA，或（退而求其次）关掉校验
+#    插入点：第一条 RUN 之前 —— git clone 是第一个联网动作，必须在它之前生效
+def insert_before_first_run(text, block):
+    lines = text.splitlines(keepends=True)
+    for i, ln in enumerate(lines):
+        if ln.lstrip().upper().startswith("RUN "):
+            return "".join(lines[:i]) + block + "".join(lines[i:])
+    return text + block
+
+def insert_before_cmd(text, block):
+    lines = text.splitlines(keepends=True)
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip().upper().startswith("CMD"):
+            return "".join(lines[:i]) + block + "".join(lines[i:])
+    return text + block
+
+prelude = ""
+if ca_name:
+    # 装 CA 是**首选**：不像关校验那样改变工具行为，而且 cargo 只认这条路。
+    #
+    # 三步缺一不可 —— 实测过各工具的信任源，它们并不一致：
+    #   git / curl / go / cargo → 读 /etc/ssl/certs/ca-certificates.crt，update-ca-certificates 就够
+    #   node / npm / pnpm       → 只认内置的 146 张根证书，**不读系统 bundle**
+    #   python / pip            → 用 certifi 自带的 cacert.pem，**也不读系统 bundle**
+    # 所以只跑 update-ca-certificates 的话，git clone 会过，npm/pip 照样失败。
+    #
+    # 那几个 ENV 会留在镜像里，但值指向系统 bundle —— 是「信任库更全」，
+    # 不是「不再校验」，与 --insecure 的残留性质完全不同。
+    prelude += (
+        "\n# [build_arm.sh] 公司内网 CA：TLS 被中间人重签，不装则所有 HTTPS 取包都验不过\n"
+        f"COPY {ca_name} /usr/local/share/ca-certificates/{ca_name}\n"
+        "RUN update-ca-certificates\n"
+        "# node 与 python 各自带内置证书库、不读系统 bundle，必须显式指过去\n"
+        "ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \\\n"
+        "    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \\\n"
+        "    PIP_CERT=/etc/ssl/certs/ca-certificates.crt \\\n"
+        "    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \\\n"
+        "    CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt\n\n")
+    rewrites.append(("（无）", f"COPY {ca_name} + update-ca-certificates + 4 个 CA 环境变量",
+                     "内网 CA；node/pip 不读系统 bundle，必须显式指过去"))
+
+if insecure:
+    # 关校验只能作为退路，且**必须还原**：这些设置若留在镜像里会改变运行期行为。
+    # 一律写文件而不用 ENV —— ENV 进 image config 就删不掉了。
+    prelude += (
+        "\n# [build_arm.sh] --insecure：临时关掉证书校验（构建末尾会还原，不留进运行期）\n"
+        "RUN git config --system http.sslVerify false \\\n"
+        " && printf 'insecure\\n' >> /root/.curlrc \\\n"
+        " && printf '[global]\\ntrusted-host = pypi.org files.pythonhosted.org pypi.python.org\\n'"
+        " > /etc/pip.conf \\\n"
+        " && (npm config set strict-ssl false --global || true) \\\n"
+        " && (go env -w GOFLAGS=-insecure GOSUMDB=off GOINSECURE='*' || true)\n\n")
+    df = insert_before_cmd(df, (
+        "\n# [build_arm.sh] 还原上面关掉的证书校验：留着会污染运行期行为\n"
+        "RUN (git config --system --unset-all http.sslVerify || true) \\\n"
+        " ; (sed -i '/^insecure$/d' /root/.curlrc || true) \\\n"
+        " ; rm -f /etc/pip.conf \\\n"
+        " ; (npm config delete strict-ssl --global || true) \\\n"
+        " ; (go env -u GOFLAGS GOSUMDB GOINSECURE || true)\n\n"))
+    rewrites.append(("（无）", "构建期关闭证书校验 + 末尾还原",
+                     "--insecure；cargo 无此开关，rust 那条仍需 --ca-cert"))
+
+if prelude:
+    df = insert_before_first_run(df, prelude)
 
 (work / "Dockerfile").write_text(df)
 (work / "TAG").write_text(tag)
@@ -211,6 +307,21 @@ PY
       echo "  ❌ 镜像 Env 里残留了代理变量 —— 会污染运行期行为，必须排查后重建"
       docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -i proxy | sed 's/^/       /'
       N_FAIL=$((N_FAIL+1)); echo; continue
+    fi
+    # --insecure 的配置必须已被末尾那步还原，否则运行期工具行为就变了
+    if [ "$INSECURE" = 1 ]; then
+      LEFT=$(docker run --rm "$TAG" sh -c '
+        r=""
+        git config --system --get http.sslVerify >/dev/null 2>&1 && r="$r git"
+        [ -f /etc/pip.conf ] && r="$r pip"
+        grep -q "^insecure$" /root/.curlrc 2>/dev/null && r="$r curl"
+        go env GOFLAGS 2>/dev/null | grep -q insecure && r="$r go"
+        printf "%s" "$r"' 2>/dev/null)
+      if [ -n "$LEFT" ]; then
+        echo "  ⚠️  这些工具的证书校验没还原干净:$LEFT —— 会带进运行期，建议改用 --ca-cert"
+      else
+        echo "     （--insecure 的配置已还原干净，镜像未被污染）"
+      fi
     fi
     docker tag "$TAG" "deepswe-local/$lang:${BASE_ARCH:-local}" 2>/dev/null
     N_OK=$((N_OK+1))

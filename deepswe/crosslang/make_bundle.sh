@@ -61,7 +61,9 @@ done
 # 光看文件名分不清手上这份是哪一版。服务器上 `cat BUILD_INFO` 一眼可辨。
 GITSHA=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # 只看进了包的那些路径：仓库里别处的未提交改动与本包无关，算进来会让标识长期显示"脏"而失去意义
-GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null | grep -v '\.tar\.gz$' | head -1)
+# 末尾 || true 不能省：set -euo pipefail 下，grep -v 无匹配时返回 1（正是"干净"的情况），
+# 会把整个脚本打断
+GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null | grep -v '\.tar\.gz$' | head -1 || true)
 {
   echo "built_utc   $(date -u +%FT%TZ)"
   echo "git_commit  $GITSHA${GITDIRTY:+ (工作区有未提交改动)}"

@@ -101,6 +101,36 @@ bash build_arm.sh all          # 全建(自动按 python→go→js→ts→rust �
 那是 x86_64 产物。`build_arm.sh` 在基座是 arm64 时自动改成 `/linux-arm`。
 (实测确认:`/linux` 8.2 MB、`/linux-arm` 6.7 MB 都存在,`/linux-arm64` 是 404。)
 
+### 代理:构建期要,运行期绝不能有
+
+**`docker build` 不继承 shell 里 export 的 `http_proxy`/`https_proxy`。** 实测过:
+shell 里设了,构建容器内仍是"未设置",`git clone` 直接失败。必须显式 `--build-arg`。
+
+`build_arm.sh` 会自动从环境变量读并显式传:
+
+```bash
+export HTTPS_PROXY=http://proxy:port NO_PROXY=localhost,127.0.0.1
+bash build_arm.sh python
+# 或者： bash build_arm.sh --proxy http://proxy:port python
+```
+
+三个细节:
+
+1. **用的是 docker 预定义 build-arg**(`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 及小写),
+   无需在 Dockerfile 里声明 `ARG` 就能注入,而且**不会写进 image config 的 Env**——
+   实测确认过。所以重建镜像依旧干净,运行期不受污染
+   (原始 mars-base 的 Env 里本来也是零个 `*_proxy`)。构建完脚本还会再自检一次,
+   有残留就判失败。
+2. **代理挂在 loopback 上时自动加 `--network=host`**:构建容器内的 `127.0.0.1`
+   是它自己,连不到宿主的代理。`--build-network` 可覆盖。
+3. 日志里代理的 `user:pass@` 会被抹成 `***@`。
+
+**运行期不需要代理**,也不该有:重放容器是 `--network=none` + 403 sinkhole。
+唯一的隐患是 `~/.docker/config.json` 里的 `proxies` 段——docker 会把它**自动注入
+每个 `docker run`**。`replay.py` 已显式覆盖 `HTTP(S)_PROXY` 和 `NO_PROXY` 指向
+sinkhole 压住它;`preflight.sh` 也会检查并提示。若重放时外连报错不是 403 而是
+连接失败,先查这里。
+
 ### ⚠️ 路 C 的保真度代价
 
 **重建镜像 ≠ 原 amd64 镜像**,即使改写为零:

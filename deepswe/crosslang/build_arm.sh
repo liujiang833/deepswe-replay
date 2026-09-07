@@ -21,16 +21,26 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$HERE/build"
 BASE=""; LIST=0; TARGETS=()
+# 代理默认继承环境变量；--proxy 可显式覆盖
+PROXY="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+NOPROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"
+BUILD_NET=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) LIST=1; shift ;;
     --base) BASE="$2"; shift 2 ;;
+    --proxy) PROXY="$2"; shift 2 ;;
+    --no-proxy) NOPROXY="$2"; shift 2 ;;
+    --build-network) BUILD_NET="$2"; shift 2 ;;
     -o) OUT="$2"; shift 2 ;;
     -*) echo "未知参数: $1"; exit 1 ;;
     *) TARGETS+=("$1"); shift ;;
   esac
 done
+
+# 打印时把 user:pass@ 抹掉——日志会被贴来贴去
+redact() { printf '%s' "$1" | sed -E 's#(//)[^/@]*@#\1***@#'; }
 
 # 自动挑本地基座
 if [ -z "$BASE" ]; then
@@ -84,6 +94,38 @@ echo "  基座        ${BASE:-（未找到）}  ${BASE_ARCH:+($BASE_ARCH)}"
 echo "  本机架构    $(uname -m)"
 echo "  待建        ${SELECTED[*]}"
 echo "  输出        $OUT"
+
+# ---- 代理 ----------------------------------------------------------------
+# 构建期要联网（git clone / pip / npm / go / cargo），运行期不要（--network=none）。
+# 用 docker 的**预定义 build-arg** 传：它们无需在 Dockerfile 里声明 ARG 就能注入
+# 构建环境，而且**不会写进 image config 的 Env**（实测确认过），所以运行期镜像
+# 依旧干净——原始 mars-base 的 Env 里本来也是零个 *_proxy。
+BUILD_ARGS=()
+if [ -n "$PROXY" ]; then
+  echo "  代理        $(redact "$PROXY")"
+  echo "  NO_PROXY    $NOPROXY"
+  for v in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+    BUILD_ARGS+=(--build-arg "$v=$PROXY")
+  done
+  for v in NO_PROXY no_proxy; do
+    BUILD_ARGS+=(--build-arg "$v=$NOPROXY")
+  done
+  # 代理挂在宿主 loopback 上时，构建容器内的 127.0.0.1 是它自己，连不到宿主。
+  # --network=host 让构建容器共用宿主网络栈，这是最省事的解法。
+  case "$PROXY" in
+    *//127.0.0.1*|*//localhost*|*//[::1]*|*//0.0.0.0*)
+      if [ -z "$BUILD_NET" ]; then
+        BUILD_NET="host"
+        echo "  ⚠️  代理指向 loopback —— 构建容器内的 127.0.0.1 不是宿主的，"
+        echo "      已自动加 --network=host（用 --build-network 可覆盖）"
+      fi ;;
+  esac
+else
+  echo "  代理        未设置"
+  echo "              若目标机需要代理才能访问 github/pypi/npm，用 --proxy http://host:port"
+  echo "              或先 export HTTPS_PROXY=... 再跑本脚本"
+fi
+[ -n "$BUILD_NET" ] && echo "  构建网络    --network=$BUILD_NET"
 echo
 
 mkdir -p "$OUT"
@@ -155,12 +197,22 @@ PY
   fi
 
   echo "  构建中…（日志 $work/build.log）"
+  NET_ARG=(); [ -n "$BUILD_NET" ] && NET_ARG=(--network "$BUILD_NET")
   t0=$(date +%s)
-  if docker build -f "$work/Dockerfile" -t "$TAG" "$CTX" >"$work/build.log" 2>&1; then
+  if docker build "${NET_ARG[@]}" "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" \
+       -f "$work/Dockerfile" -t "$TAG" "$CTX" >"$work/build.log" 2>&1; then
     dt=$(( $(date +%s) - t0 ))
     sz=$(docker image inspect "$TAG" -f '{{.Size}}')
     echo "  ✅ 成功  ${dt}s，$((sz/1024/1024)) MB"
-    docker tag "$TAG" "deepswe-local/$lang:$(basename "${BASE_ARCH:-local}")" 2>/dev/null
+    # 保真度自检：代理绝不能留在镜像里。运行期是 --network=none + 403 sinkhole，
+    # 镜像 Env 里多一个 *_proxy 就会改变 agent 命令的联网报错文本。
+    if docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' \
+         | grep -qiE '(^|[^A-Za-z_])(https?_proxy|no_proxy)='; then
+      echo "  ❌ 镜像 Env 里残留了代理变量 —— 会污染运行期行为，必须排查后重建"
+      docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -i proxy | sed 's/^/       /'
+      N_FAIL=$((N_FAIL+1)); echo; continue
+    fi
+    docker tag "$TAG" "deepswe-local/$lang:${BASE_ARCH:-local}" 2>/dev/null
     N_OK=$((N_OK+1))
   else
     dt=$(( $(date +%s) - t0 ))

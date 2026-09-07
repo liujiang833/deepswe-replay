@@ -519,6 +519,13 @@ def main():
         # 镜像 config 的 Env 里本来没有代理变量——原 harness 也是运行时注入的
         for v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             run += ["-e", f"{v}={proxy_url}"]
+        # NO_PROXY 必须显式钉死，两个理由：
+        #   1. `~/.docker/config.json` 里配了 proxies 的话，docker run 会自动把宿主的
+        #      代理设置注入容器——包括它的 NO_PROXY。那会让部分域名绕过 sinkhole，
+        #      报错文本从「403 Forbidden」变成连接失败，与原始 trace 不符。
+        #   2. trace 里有打 localhost 的 curl（prometheus 那条 18 次），回环不能走代理。
+        for v in ("NO_PROXY", "no_proxy"):
+            run += ["-e", f"{v}=localhost,127.0.0.1,::1"]
     run += [image, "sleep", "infinity"]
     r = sh(run)
     if r.returncode != 0:

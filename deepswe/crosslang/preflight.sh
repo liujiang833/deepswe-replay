@@ -77,6 +77,21 @@ if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
   warn "rootless docker —— cgroup 落在 user.slice 下，replay.py 有对应候选路径，但请留意活体测试结果"
 fi
 
+# 代理：构建期需要、运行期绝不能有。两者来源不同，要分开看。
+if [ -n "${HTTPS_PROXY:-${https_proxy:-}}" ]; then
+  echo "  shell 代理      $(printf '%s' "${HTTPS_PROXY:-$https_proxy}" | sed -E 's#(//)[^/@]*@#\1***@#')"
+  echo "                  （仅 build_arm.sh 会读它并显式 --build-arg 传给构建；"
+  echo "                    docker build/run 都不会自动继承 shell 变量）"
+fi
+# 这个才是隐患：config.json 里的 proxies 会被 docker **自动注入到每个 docker run**，
+# 包括 replay.py 起的重放容器，从而和 403 sinkhole 抢同一批环境变量。
+DOCKER_CFG="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+if [ -f "$DOCKER_CFG" ] && grep -q '"proxies"' "$DOCKER_CFG" 2>/dev/null; then
+  warn "$DOCKER_CFG 里配了 proxies —— docker run 会自动把它注入**运行期**容器。
+       replay.py 已显式覆盖 HTTP(S)_PROXY 与 NO_PROXY 指向 sinkhole，正常能压住；
+       但若重放时看到外连报错不是 403 而是连接失败/超时，先来查这里。"
+fi
+
 # ── 4. 镜像清单 ────────────────────────────────────────────────
 hdr "4. bundle 里的 trial 与镜像"
 IMAGES=$(python3 - "$HERE" <<'PY' 2>/dev/null

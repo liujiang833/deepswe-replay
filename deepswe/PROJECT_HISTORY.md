@@ -81,3 +81,51 @@
 - `data/tool_inventory.json` - 生成物，被 .gitignore 忽略，不入库
 
 **Commit:** pending（按要求未提交）
+
+## 2026-09-08: 全量 replay 用例集（118 条）+ 内网 CA 提取
+
+**Goal:** 把服务器重放从 5 条样例扩到全量，目标跑通 go / python / javascript；
+顺带把公司内网 TLS 中间人环境下的证书获取做成可复用工具。
+
+**Steps:**
+1. 摸清 `data/` 布局与语言归属，确认装配所需的最小字段集 - success
+2. 发现 `TRAJECTORY_SELECTION.json` 选中的 113 条与 crosslang 那 5 条**不是同一批 trial** - success
+3. 写 `make_full_trials.py` 装配 118 条（113 选中 + 5 已验证对照组）- success
+4. 修 `build_arm.sh` 的「一语言一目录」覆盖 bug，改为按 trial 构建 - success
+5. 给 `run_batch.py` 加 `--skip-missing`，支持边建边跑 - success
+6. 新增 `detect_mitm.sh`：判定内网是否做 TLS 中间人 - success
+7. 端到端验证：打包 → 解包 → 用新装配的 trial 实跑 replay - 见 EXEC_LOG
+
+**Key Findings:**
+- **replay.py 完全不读 meta.json**，只读 trial 目录 + task.json；task.json 里也只用
+  `task.toml`（build_arm.sh 只用 `environment/Dockerfile`）。据此把 task.json 从
+  30.4 MB 裁到 0.4 MB，顺带把参考解 `solution/solution.patch` 挡在包外
+- **两批 trial 不同**：selection 取 claude-fable-5 优先，crosslang 那 5 条是更早一轮的跨模型取样。
+  trial_name / 模型 / patch 字节全不同 → **113 条里一条已验证基线都没有**。
+  对策是把 5 条带上当回归对照组（同 task 同镜像，零额外构建成本）→ 118 条
+- `build_arm.sh` 的 `DIR_OF[$lang]="$dir"` 是覆盖式赋值，35 条 go 只留最后一条**且不报错**——
+  这个 bug 在 5 条样例集上完全暴露不出来
+- **镜像增量实测**：python task 镜像相对 `mars-base:arm64` 只 **+30 MB**，
+  typescript **+560 MB**（`pnpm install` 把 devDeps 全装进去）。go/js/rust 未实测
+- **构建耗时实测**（qemu 模拟 ARM）：python 144s；typescript ~280s
+  （pnpm install 132s + 装报告器 59s + clone/gc 45s）。rust 是唯一有真·编译步骤的
+  （`cargo nextest run --no-run`）
+- **各工具的 CA 信任源不一致**：git/curl/go/cargo 读系统 bundle，
+  **node/npm 只认内置 146 张根、python/pip 用 certifi**，两者都不读系统 bundle ——
+  只跑 `update-ca-certificates` 会让 git clone 过而 npm/pip 照样失败
+- **TLS 里证书在校验之前就明文送达客户端**，所以 `server certificate verification failed`
+  的时候证书就在手上；`openssl s_client -showcerts` 照样拿得到（已用无关 CA 实测）
+- 判定中间人最强的判据是**跨站点比较叶子证书的签发者**：中间人只有一张签名证书，
+  它得给所有站点签，所以多站点签发者相同即是铁证（正常网络下应该五花八门）
+- `CA:TRUE`（basicConstraints）才是「这张是不是 CA」的权威判据，不是靠链上的下标位置
+
+**Files Changed:**
+- `crosslang/make_full_trials.py` - 新增，data/ → trial 目录的装配器
+- `crosslang/detect_mitm.sh` - 新增，TLS 中间人判定
+- `crosslang/build_arm.sh` - 按 trial 构建；失败清单与单条重试
+- `crosslang/run_batch.py` - `--skip-missing`；全量集下的输出裁剪
+- `crosslang/make_bundle.sh` - `--trials-dir`
+- `crosslang/RUNBOOK.md` - §7 重写为全量集操作说明 + 实测成本
+- `EXEC_LOG_2026-09-08-full-replay-set.md` - 新增
+
+**Commit:** 见下方 git log

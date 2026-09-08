@@ -8,17 +8,20 @@
 # 用法：  bash make_bundle.sh              # → deepswe-replay-bundle-<日期>.tar.gz
 #         bash make_bundle.sh --full      # 连 agent 日志、per-command 指标一起带
 #         bash make_bundle.sh -o /tmp/x.tar.gz
+#         bash make_bundle.sh --trials-dir full_trials   # 打全量 118 条（见 make_full_trials.py）
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FULL=0; OUT=""
+FULL=0; OUT=""; TRIALS="$HERE"
 while [ $# -gt 0 ]; do
   case "$1" in
     --full) FULL=1; shift ;;
+    --trials-dir) TRIALS="$(cd "$2" && pwd)"; shift 2 ;;
     -o) OUT="$2"; shift 2 ;;
     *) echo "未知参数: $1"; exit 1 ;;
   esac
 done
+[ -d "$TRIALS" ] || { echo "trial 目录不存在: $TRIALS"; exit 1; }
 [ -n "$OUT" ] || OUT="$HERE/deepswe-replay-bundle-$(date +%Y%m%d).tar.gz"
 
 REPLAY="$HERE/../replay.py"
@@ -36,7 +39,7 @@ for f in run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh 
 done
 
 N=0
-for d in "$HERE"/*/; do
+for d in "$TRIALS"/*/; do
   name="$(basename "$d")"
   [ -f "$d/meta.json" ] || continue          # 只收合规的 trial 目录
   mkdir -p "$ROOT/$name/replay"
@@ -69,10 +72,11 @@ GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null | 
   echo "git_commit  $GITSHA${GITDIRTY:+ (工作区有未提交改动)}"
   echo "host        $(uname -srm)"
   echo "trials      $N"
+  echo "trials_src  $([ "$TRIALS" = "$HERE" ] && echo "crosslang/（已验证 5 条）" || echo "$TRIALS")"
   echo "mode        $([ "$FULL" = 1 ] && echo full || echo slim)"
   echo
   echo "scripts:"
-  for f in replay.py run_batch.py preflight.sh check_sources.sh build_arm.sh; do
+  for f in replay.py run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh; do
     [ -f "$ROOT/$f" ] && printf '  %-18s %s\n' "$f" "$(sha256sum "$ROOT/$f" | cut -c1-12)"
   done
 } > "$ROOT/BUILD_INFO"

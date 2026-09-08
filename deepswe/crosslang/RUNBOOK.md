@@ -359,16 +359,101 @@ docker rm -f $(docker ps -aq --filter name=^replay_)
 宿主侧还有 90s 兜底，正常不会真卡死。rust 那条基线里 agent 自己有大量 `sleep 25~29`
 在等后台编译，看着像卡住但是正常的。
 
-## 7. 扩到全量 113 条
+## 7. 全量集（118 条）
 
-本 bundle 只带了 5 条。扩量时：
+### 7.1 它是什么
 
-- **镜像是主要成本**：113 个镜像完整下载 111 GB、层去重后 24.3 GB，按 0.27 MB/s
-  实测吞吐串行拉取约 **25 小时**。提前预拉或换更快的出口。
-- **重放本身**：5 条 367 条命令 862s，平均 2.63 s/cmd；113 条按每条 60~100 命令估，
-  串行约 **5~7 小时**。
-- 输入数据在 `deepswe/data/{trajectories,tasks}/`（被 gitignore，需另行同步）。
-  `run_batch.py` 认的是「目录里有 meta.json + trajectory.json + model.patch + task.json」，
-  按同样布局摆好即可复用。
-- 时间预算的主导项不是语言，而是 **trace 里有没有 `sleep` 轮询模式**——
-  rust 那条墙钟最长但 CPU 只有 0.30 核，容器大部分时间在空转。
+`make_full_trials.py` 把 `deepswe/data/` 里的下载态数据装配成 replay 能直接吃的布局：
+
+```bash
+python3 make_full_trials.py                      # → ./full_trials/，118 条
+python3 make_full_trials.py --only go,python,javascript
+bash make_bundle.sh --trials-dir full_trials     # → 4.8 MB 的 tar.gz
+```
+
+**118 = 113 + 5**：113 条来自 `TRAJECTORY_SELECTION.json`（每个 task 取 claude-fable-5
+优先的那次 pass），另外 5 条是更早一轮按跨模型取样挑的、**本地已跑通且 patch 逐字节
+核对过**的对照组。
+
+这 5 条对照组必须留着。两批的 trial 不是同一次运行（模型不同、`model.patch` 大小
+也不同），所以**那 113 条里一条已验证基线都没有**——没有对照组的话，某条失败时无法
+区分「这个 task 有问题」和「整套流程有问题」。而同一个 task 用同一个镜像，带上它们
+**不增加任何构建成本**。
+
+| 语言 | trial 数 | 命令数 | 其中对照组 |
+|---|---|---|---|
+| typescript | 36 | 1680 | 1 |
+| python | 35 | 1486 | 1 |
+| go | 35 | 1109 | 1 |
+| javascript | 6 | 223 | 1 |
+| rust | 6 | 393 | 1 |
+| **合计** | **118** | **4891** | **5** |
+
+对应 **113 个不同镜像**（对照组与选中条目共享镜像）。
+
+### 7.2 边建边跑
+
+113 个镜像不可能一次建齐，所以流程是分段的：
+
+```bash
+# 建一批（语言名会展开成该语言的全部 trial）
+bash build_arm.sh --ca-cert corp-ca.crt python
+
+# 跑已经建好的那些，镜像没建好的自动跳过而不是拒绝启动
+python3 run_batch.py --skip-missing --keep-going
+```
+
+`--skip-missing` 是全量集的关键开关。不加它，只要有一个镜像缺失整批就拒绝启动。
+
+`build_arm.sh` 失败的条目会在结尾列出来，可以按 trial 目录名前缀单独重试：
+
+```bash
+bash build_arm.sh --ca-cert corp-ca.crt abs-module-cache-flags
+```
+
+### 7.3 成本（实测 + 外推，标注了哪些是估的）
+
+**镜像磁盘**——每个 task 镜像只在共享基座上加几层，实测：
+
+| | 体积 | 相对 mars-base 的增量 |
+|---|---|---|
+| `mars-base:arm64` | 5.28 GB | — （只占一份） |
+| python task 镜像 | 5.31 GB | **+30 MB**（实测） |
+| typescript task 镜像 | 5.84 GB | **+560 MB**（实测） |
+| go / javascript / rust | — | 未实测 |
+
+python 那种纯下载的增量极小，typescript 因为 `pnpm install` 把 devDeps 整个装进去所以
+大得多。**go/js/rust 的增量我没实测过，别拿 python 的数去推**。粗估全量 113 个约
+25~35 GB，其中 typescript 那 35 条是大头。
+
+**构建时间**——两个实测点（qemu 模拟 ARM，网络无代理）：
+
+| | 耗时 | 大头 |
+|---|---|---|
+| python | 144s | `pip install -e` |
+| typescript | ~280s | `pnpm install` 132s + 装报告器 59s + clone/gc 45s |
+
+按每条 3~8 分钟估，**73 个镜像（go+python+javascript）约 5~8 小时**，全量 113 个
+约 8~12 小时。rust 那 5 条要单独留时间：它的 Dockerfile 里有
+`cargo nextest run --no-run`，是把测试二进制整个编译一遍，是唯一的真·编译步骤。
+
+**重放时间**——5 条对照组实测 367 条命令 862.1s，即 **2.35 s/命令**。按 ARM ×1.4 折算
+约 3.3 s/命令：
+
+- go + python + javascript（2818 条命令）≈ **2.5~3 小时**
+- 全量 118 条（4891 条命令）≈ **4.5~5 小时**
+
+注意主导项不是语言而是 **trace 里有没有 `sleep` 轮询**——rust 那条墙钟最长但 CPU 只有
+0.30 核，容器大部分时间在空转。
+
+### 7.4 包里带了什么、没带什么
+
+`task.json` 被裁剪到只剩 `task.toml` 与 `environment/Dockerfile` 两个文件——replay.py
+只读前者（取 `docker_image` / `base_commit_hash` / `cpus` / `memory_mb` /
+`allow_internet`），build_arm.sh 只读后者。完整包 30.4 MB → 裁剪后 0.4 MB，顺带把参考解
+`solution/solution.patch` 挡在包外：它对重放毫无用处，不该出现在服务器上。
+
+整包 27 MB 解包体积 / **4.8 MB 压缩**。按 55 KB/s 的传输速率约 25 分钟。
+
+输入数据在 `deepswe/data/{trajectories,tasks}/` 与 `deepswe/data/build_env.json`
+（被 gitignore，需另行同步）。`make_full_trials.py` 需要这三者才能装配。

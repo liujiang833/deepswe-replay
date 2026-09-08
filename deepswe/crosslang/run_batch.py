@@ -21,6 +21,7 @@
     python3 run_batch.py --dry-run                # 只做预检和排程，不真跑
 """
 
+import collections
 import argparse
 import datetime
 import json
@@ -69,8 +70,12 @@ def load_trials():
     return out
 
 
-def preflight(trials, need_cgroup):
-    """跑之前把「一定会失败」的情况先查出来，避免跑到一半才炸。"""
+def preflight(trials, need_cgroup, skip_missing=False):
+    """跑之前把「一定会失败」的情况先查出来，避免跑到一半才炸。
+
+    skip_missing：全量 118 条对应 113 个镜像，不可能一次全建好。开了它之后
+    缺镜像的 trial 被剔除而不是让整批拒绝启动，这样可以边建边跑。
+    """
     problems = []
     if sh(["docker", "version"]).returncode != 0:
         problems.append("docker 不可用（未安装 / daemon 没起 / 当前用户无权限）")
@@ -81,8 +86,9 @@ def preflight(trials, need_cgroup):
         problems.append(f"/sys/fs/cgroup 是 {fstype}，不是 cgroup2fs —— 指标口径只适用 cgroup v2"
                         f"（不加 --metrics 就不需要它）")
     missing = [t for t in trials if t["image"] and sh(["docker", "image", "inspect", t["image"]]).returncode != 0]
-    for t in missing:
-        problems.append(f"镜像不在本地: [{t['lang']}] {t['image']}")
+    if not skip_missing:
+        for t in missing:
+            problems.append(f"镜像不在本地: [{t['lang']}] {t['image']}")
     return problems, fstype, missing
 
 
@@ -124,6 +130,8 @@ def main():
                     help="额外采 cgroup 性能指标。默认不采——打通阶段用不上，"
                          "而且它会引入「必须 cgroup v2 且宿主侧目录可读」这条硬约束")
     ap.add_argument("--dry-run", action="store_true", help="只做预检和排程，不真跑")
+    ap.add_argument("--skip-missing", action="store_true",
+                    help="镜像还没建好的 trial 直接跳过而不是拒绝启动（全量集边建边跑用）")
     ap.add_argument("--keep-going", action="store_true",
                     help="某条失败后继续跑剩下的（默认遇错即停）")
     ap.add_argument("--replay", default="", help="replay.py 路径（默认自动定位）")
@@ -142,7 +150,14 @@ def main():
         print("没有可跑的 trial（--only 过滤掉了全部，或目录里没有合规的 trial）")
         return 1
 
-    problems, fstype, missing = preflight(trials, args.metrics)
+    problems, fstype, missing = preflight(trials, args.metrics, args.skip_missing)
+    if args.skip_missing and missing:
+        miss_set = {id(t) for t in missing}
+        trials = [t for t in trials if id(t) not in miss_set]
+        print(f"--skip-missing：{len(missing)} 条因镜像未建好被跳过，实跑 {len(trials)} 条\n")
+        if not trials:
+            print("没有任何一条的镜像已就绪 —— 先跑 build_arm.sh")
+            return 1
 
     print("=" * 78)
     print(f"bundle    {HERE}")
@@ -152,7 +167,14 @@ def main():
     print(f"待跑      {len(trials)} 条（串行）")
     print(f"指标      {'采集 cgroup 性能数据' if args.metrics else '不采（--metrics 可开）'}")
     print("=" * 78)
-    for t in trials:
+    # 全量集下逐条列出会刷几百行；只在小批量时详列
+    listing = trials if len(trials) <= 12 else []
+    if not listing:
+        cnt = collections.Counter(t["lang"] for t in trials)
+        print("  " + "  ".join(f"{k}×{v}" for k, v in sorted(cnt.items())))
+        nb = sum(1 for t in trials if t["baseline"])
+        print(f"  其中 {nb} 条有本地基线可对比")
+    for t in listing:
         b = t["baseline"]
         bs = (f"基线 patch={'✅' if b.get('patch_identical') else '❌'} "
               f"rc={b.get('rc_match')} {b.get('elapsed_s')}s") if b else "无基线"
@@ -161,12 +183,16 @@ def main():
 
     if problems:
         print("\n预检未通过：")
-        for p in problems:
+        # 全量集下缺镜像会有上百条，全打出来把真正的问题（docker 不可用等）冲没了
+        for p in problems[:8]:
             print(f"  ✗ {p}")
+        if len(problems) > 8:
+            print(f"  …… 另有 {len(problems) - 8} 条同类问题")
         if missing:
-            print("\n拉取缺失的镜像：")
-            for t in missing:
-                print(f"  docker pull {t['image']}")
+            langs = ",".join(sorted({t["lang"] for t in missing}))
+            print(f"\n缺 {len(missing)} 个镜像。目标环境通常拉不到 registry，用本地基座重建：")
+            print(f"  bash build_arm.sh --ca-cert <内网CA.crt> {langs}")
+            print(f"或先跑已建好的部分：  python3 run_batch.py --skip-missing")
         return 1
     print("\n预检通过 ✅")
 

@@ -64,10 +64,12 @@ BASE_ARCH=""
 # 依赖从少到多——先建最可能一次成功的，把最贵最脆的 rust 放最后
 ORDER="python go javascript typescript rust"
 
-# 语言 → trial 目录
-declare -A DIR_OF LANG_OF
+# 语言 → trial 目录。**一种语言可能对应几十条**（全量 118 条里 go/python/typescript
+# 各三十多条），所以这里存的是空格分隔的列表；早先版本用的是「一语言一目录」，
+# 在全量集上会静默只保留最后一条。
+declare -A DIRS_OF LANG_OF
 while IFS=$'\t' read -r lang dir; do
-  DIR_OF[$lang]="$dir"; LANG_OF[$dir]="$lang"
+  DIRS_OF[$lang]="${DIRS_OF[$lang]:-} $dir"; LANG_OF[$dir]="$lang"
 done < <(python3 - "$HERE" <<'PY'
 import json, pathlib, sys
 for d in sorted(pathlib.Path(sys.argv[1]).iterdir()):
@@ -77,27 +79,35 @@ for d in sorted(pathlib.Path(sys.argv[1]).iterdir()):
 PY
 )
 
-# 目标解析：语言名、task_id 前缀、或 all
+# 目标解析：语言名（展开成该语言全部 trial）、trial 目录名前缀、或 all
 SELECTED=()
 if [ ${#TARGETS[@]} -eq 0 ] || [ "${TARGETS[0]:-}" = "all" ]; then
-  for l in $ORDER; do [ -n "${DIR_OF[$l]:-}" ] && SELECTED+=("$l"); done
+  for l in $ORDER; do for d in ${DIRS_OF[$l]:-}; do SELECTED+=("$d"); done; done
 else
   for t in "${TARGETS[@]}"; do
-    if [ -n "${DIR_OF[$t]:-}" ]; then SELECTED+=("$t"); continue; fi
-    hit=""
-    for l in $ORDER; do
-      [ -n "${DIR_OF[$l]:-}" ] && case "${DIR_OF[$l]}" in "$t"*) hit="$l" ;; esac
+    if [ -n "${DIRS_OF[$t]:-}" ]; then
+      for d in ${DIRS_OF[$t]}; do SELECTED+=("$d"); done; continue
+    fi
+    hit=0
+    for d in $(printf '%s\n' "${!LANG_OF[@]}" | sort); do
+      case "$d" in "$t"*) SELECTED+=("$d"); hit=1 ;; esac
     done
-    [ -n "$hit" ] && SELECTED+=("$hit") || { echo "❌ 认不出目标: $t（用语言名 python/go/rust/typescript/javascript，或 task 目录名前缀）"; exit 1; }
+    [ "$hit" = 1 ] || { echo "❌ 认不出目标: $t（用语言名 python/go/rust/typescript/javascript，或 trial 目录名前缀）"; exit 1; }
   done
 fi
+[ ${#SELECTED[@]} -gt 0 ] || { echo "❌ 没有匹配到任何 trial"; exit 1; }
 
 echo "=============================================================="
 echo " 从本地基座重建 task 镜像"
 echo "=============================================================="
 echo "  基座        ${BASE:-（未找到）}  ${BASE_ARCH:+($BASE_ARCH)}"
 echo "  本机架构    $(uname -m)"
-echo "  待建        ${SELECTED[*]}"
+if [ ${#SELECTED[@]} -le 6 ]; then
+  echo "  待建        ${SELECTED[*]}"
+else
+  echo "  待建        ${#SELECTED[@]} 条：$(for d in "${SELECTED[@]}"; do echo "${LANG_OF[$d]}"; done \
+                        | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')"
+fi
 echo "  输出        $OUT"
 
 # ---- 代理 ----------------------------------------------------------------
@@ -160,10 +170,13 @@ CTX="$OUT/.emptyctx"; mkdir -p "$CTX"      # 原 Dockerfile 零 COPY/ADD，空�
 rm -f "$CTX"/*.crt
 [ -n "$CA_CERT" ] && cp "$CA_CERT" "$CTX/$(basename "$CA_CERT")"
 
-N_OK=0; N_FAIL=0
-for lang in "${SELECTED[@]}"; do
-  dir="${DIR_OF[$lang]}"
-  work="$OUT/$lang"; mkdir -p "$work"
+N_OK=0; N_FAIL=0; N_SKIP=0; I=0; T_ALL=$(date +%s)
+FAILED=()
+for dir in "${SELECTED[@]}"; do
+  lang="${LANG_OF[$dir]}"
+  I=$((I+1))
+  work="$OUT/$dir"; mkdir -p "$work"
+  [ ${#SELECTED[@]} -gt 6 ] && printf '[%d/%d] ' "$I" "${#SELECTED[@]}"
 
   # 从 task.json 里取出 Dockerfile 与目标 tag，并做架构 / 证书改写
   python3 - "$HERE/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" \
@@ -289,7 +302,8 @@ PY
   if [ "$LIST" = 1 ]; then echo; continue; fi
 
   if docker image inspect "$TAG" >/dev/null 2>&1; then
-    echo "  跳过  镜像已存在（要重建先 docker rmi $TAG）"; echo; N_OK=$((N_OK+1)); continue
+    echo "  跳过  镜像已存在（要重建先 docker rmi $TAG）"; echo
+    N_OK=$((N_OK+1)); N_SKIP=$((N_SKIP+1)); continue
   fi
 
   echo "  构建中…（日志 $work/build.log）"
@@ -323,13 +337,16 @@ PY
         echo "     （--insecure 的配置已还原干净，镜像未被污染）"
       fi
     fi
-    docker tag "$TAG" "deepswe-local/$lang:${BASE_ARCH:-local}" 2>/dev/null
+      # 便捷别名。用 trial 名而非语言名 —— 全量集下同语言有几十条，用语言名会互相覆盖。
+    # docker 仓库名只允许小写与 . _ -，先规整一遍。
+    alias_repo=$(printf '%s' "$dir" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9._-]/-/g')
+    docker tag "$TAG" "deepswe-local/$alias_repo:${BASE_ARCH:-local}" 2>/dev/null
     N_OK=$((N_OK+1))
   else
     dt=$(( $(date +%s) - t0 ))
     echo "  ❌ 失败  ${dt}s —— 最后 15 行："
     tail -15 "$work/build.log" | sed 's/^/       /'
-    N_FAIL=$((N_FAIL+1))
+    N_FAIL=$((N_FAIL+1)); FAILED+=("$dir")
   fi
   echo
 done
@@ -340,14 +357,21 @@ if [ "$LIST" = 1 ]; then
 fi
 
 echo "=============================================================="
-echo " 成功 $N_OK / 失败 $N_FAIL"
+echo " 成功 $N_OK（其中已存在跳过 $N_SKIP） / 失败 $N_FAIL   总耗时 $(( $(date +%s) - T_ALL ))s"
 echo "=============================================================="
+if [ "$N_FAIL" -gt 0 ]; then
+  echo
+  echo " 失败的 $N_FAIL 条（日志在 $OUT/<trial>/build.log）："
+  for d in "${FAILED[@]}"; do echo "   $d"; done
+  echo
+  echo " 重试其中某一条：  bash build_arm.sh [同样的 --ca-cert/--proxy 参数] <trial 目录名前缀>"
+fi
 if [ "$N_OK" -gt 0 ]; then
   echo
-  echo " ⚠️  重建镜像 ≠ 原 amd64 镜像。跑之前先读 $OUT/<lang>/REWRITES.md。"
+  echo " ⚠️  重建镜像 ≠ 原 amd64 镜像。跑之前先读 $OUT/<trial>/REWRITES.md。"
   echo "     patch_identical 在重建镜像上是否成立，本身就是这轮要测的东西——"
   echo "     它失败不一定是重放流程坏了，也可能是依赖漂移或架构差异。"
   echo
   echo " 下一步：  bash preflight.sh"
-  echo "           python3 run_batch.py --only $(IFS=,; echo "${SELECTED[*]}")"
+  echo "           python3 run_batch.py --only $(for d in "${SELECTED[@]}"; do echo "${LANG_OF[$d]}"; done | sort -u | paste -sd,) --skip-missing"
 fi

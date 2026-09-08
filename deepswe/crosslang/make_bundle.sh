@@ -31,7 +31,7 @@ mkdir -p "$ROOT"
 
 # 顶层：脚本与手册。replay.py 从上一层复制进来，bundle 从此自包含。
 cp "$REPLAY" "$ROOT/"
-for f in run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh RUNBOOK.md INDEX.md release.json; do
+for f in run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh RUNBOOK.md INDEX.md release.json; do
   [ -f "$HERE/$f" ] && cp "$HERE/$f" "$ROOT/"
 done
 

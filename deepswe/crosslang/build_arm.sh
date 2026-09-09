@@ -19,6 +19,9 @@
 #   bash build_arm.sh --registry https://registry.npmmirror.com typescript
 #   bash build_arm.sh --godebug http2client=0 go
 #   bash build_arm.sh --goproxy https://goproxy.cn,direct go
+#   bash build_arm.sh --gomaxprocs 4 go      # 压低 go 取模块并发（代价见下方提示语）
+#   bash build_arm.sh --build-env NPM_CONFIG_NETWORK_CONCURRENCY=4 typescript
+#   （--build-env KEY=VALUE 可重复；是上面几个命名开关的通用形式，只注入构建期）
 #   bash build_arm.sh -j 4 all              # 4 条并发；默认 1 = 逐条串行
 #   bash build_arm.sh --stall-timeout 900 rust      # 放宽「日志多久不动就放弃」
 #   bash build_arm.sh --stall-timeout 0 --build-timeout 3600 all  # 关停滞检测，只留总耗时上限
@@ -57,38 +60,150 @@ GOPROXY="${DEEPSWE_GOPROXY:-}"
 # 与 GOPROXY 独立：换源多数不必关校验和，go 会走 <GOPROXY>/sumdb/… 把它一并代理掉
 GOSUMDB="${DEEPSWE_GOSUMDB:-}"
 GODEBUG="${DEEPSWE_GODEBUG:-}"
+# 与上面三个同构的第四个 go 开关。它是**间接**杠杆：cmd/go 用 runtime.GOMAXPROCS(0)
+# 给模块下载队列定容量，所以调小它就等于压低取模块的并发（内网中间设备拦高并发时
+# 有用）。代价见「Go 取模块」一节的提示语——它同时把 go install 的编译压成单线程。
+GOMAXPROCS="${DEEPSWE_GOMAXPROCS:-}"
+# 通用逃生口。上面五个命名开关（registry/goproxy/gosumdb/godebug/gomaxprocs）做的
+# 是同一件事：在生成的 Dockerfile 里插一行 ARG KEY，再 --build-arg KEY=值。再冒出
+# 新变量（如 pnpm 的 NPM_CONFIG_NETWORK_CONCURRENCY）就不该再改脚本了。
+# 命名开关一个都不删：它们自带针对性提示语与残留自检，那部分价值 --build-env 没有。
+BUILD_ENV=()
+
+# ---- 取值参数的两道关 ----------------------------------------------------
+# 两个坑都是真踩过的：
+#   `… -j`（取值参数落在末尾）—— set -u 下 "$2" 直接 unbound variable，用户看到的
+#     是 bash 的行号，完全看不出是谁少给了值；
+#   `-j true-myth`（值漏写、后面跟的其实是构建目标）—— 旧写法把目标当值吃掉，再
+#     抱怨「不是数字」。抱怨的是格式，真问题是**构建目标没了**，报错必须点破。
+# 「这个值其实是个构建目标」的判断不靠猜：语言名是固定的几个，trial 则直接拿 $HERE
+# 下的目录核对（目标本来就按前缀匹配，所以这里也用前缀）。
+looks_like_target() {
+  case "$1" in python|go|javascript|typescript|rust|all) return 0 ;; esac
+  compgen -G "$HERE/$1*/meta.json" >/dev/null 2>&1
+}
+need_val() {                        # 用法：need_val <参数名> "$@"
+  local opt="$1"; shift
+  if [ $# -lt 2 ]; then
+    echo "❌ $opt 需要一个值，但它已经是命令行的最后一个参数了"
+    echo "   写法： $opt <值> [构建目标]"
+    exit 1
+  fi
+  case "$2" in
+    -[0-9]*) echo "❌ $opt 的值不能是负数：「$2」"; exit 1 ;;
+    -*)      echo "❌ $opt 需要一个值，但后面跟的是另一个参数「$2」"
+             echo "   是不是 $opt 的值漏写了？"; exit 1 ;;
+  esac
+  # 值本身就是个能解析的构建目标 —— 几乎必然是「值漏写了，目标被参数吃掉」。
+  # 不点破的话，用户丢了目标还会以为只是格式问题；更坏的是没报错的那些参数，
+  # 目标被吃掉后 TARGETS 为空，脚本会当成 all 把 113 条全建一遍。
+  # -o 例外：输出目录叫什么都合法，不该拿目标名去卡它。
+  if [ "$opt" != "-o" ] && looks_like_target "$2"; then
+    echo "❌ $opt 需要一个值，但后面跟的「$2」是一个构建目标"
+    echo "   它被 $opt 当成值吃掉了 —— 目标一空，这一轮就会变成「全建」。"
+    echo "   是不是 $opt 的值漏写了？ 例如： $opt <值> $2"
+    exit 1
+  fi
+}
+# 数值参数专用。min = 允许的最小值；note 用来解释「为什么不能更小」
+need_num() {                        # 用法：need_num <参数名> <值> <最小值> [说明]
+  local opt="$1" val="$2" min="$3" note="${4:-}"
+  case "$val" in
+    ''|*[!0-9]*)
+      echo "❌ $opt 需要一个整数，收到「$val」"
+      # 这类错九成是「数字漏写了，后面的构建目标被当成值吃掉」。只说「不是数字」会
+      # 把人往格式问题上引，而真正丢掉的是构建目标，所以认出来就直说。
+      if looks_like_target "$val"; then
+        echo "   「$val」是一个构建目标，被 $opt 当成值吃掉了"
+        echo "   是不是漏写了数字？应该是： $opt <数字> $val"
+      fi
+      exit 1 ;;
+  esac
+  if [ "$val" -lt "$min" ]; then
+    echo "❌ $opt 需要 ≥$min 的整数，收到 $val"
+    [ -n "$note" ] && echo "   $note"
+    exit 1
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) LIST=1; shift ;;
-    --base) BASE="$2"; shift 2 ;;
-    --proxy) PROXY="$2"; shift 2 ;;
-    --no-proxy) NOPROXY="$2"; shift 2 ;;
-    --build-network) BUILD_NET="$2"; shift 2 ;;
-    --ca-cert) CA_CERT="$2"; shift 2 ;;
+    --base) need_val --base "$@"; BASE="$2"; shift 2 ;;
+    --proxy) need_val --proxy "$@"; PROXY="$2"; shift 2 ;;
+    --no-proxy) need_val --no-proxy "$@"; NOPROXY="$2"; shift 2 ;;
+    --build-network) need_val --build-network "$@"; BUILD_NET="$2"; shift 2 ;;
+    --ca-cert) need_val --ca-cert "$@"; CA_CERT="$2"; shift 2 ;;
     --insecure) INSECURE=1; shift ;;
-    --registry) REGISTRY="$2"; shift 2 ;;
-    --goproxy) GOPROXY="$2"; shift 2 ;;
-    --gosumdb) GOSUMDB="$2"; shift 2 ;;
-    --godebug) GODEBUG="$2"; shift 2 ;;
-    -j|--jobs) JOBS="$2"; shift 2 ;;
+    --registry) need_val --registry "$@"; REGISTRY="$2"; shift 2 ;;
+    --goproxy) need_val --goproxy "$@"; GOPROXY="$2"; shift 2 ;;
+    --gosumdb) need_val --gosumdb "$@"; GOSUMDB="$2"; shift 2 ;;
+    --godebug) need_val --godebug "$@"; GODEBUG="$2"; shift 2 ;;
+    --gomaxprocs) need_val --gomaxprocs "$@"; GOMAXPROCS="$2"; shift 2 ;;
+    --build-env) need_val --build-env "$@"; BUILD_ENV+=("$2"); shift 2 ;;
+    -j|--jobs) need_val "$1" "$@"; JOBS="$2"; shift 2 ;;
     -j[0-9]*) JOBS="${1#-j}"; shift ;;
-    --stall-timeout) STALL_TIMEOUT="$2"; shift 2 ;;
-    --build-timeout) BUILD_TIMEOUT="$2"; shift 2 ;;
-    --heartbeat) HEARTBEAT="$2"; shift 2 ;;
-    -o) OUT="$2"; shift 2 ;;
+    --stall-timeout) need_val --stall-timeout "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
+    --build-timeout) need_val --build-timeout "$@"; BUILD_TIMEOUT="$2"; shift 2 ;;
+    --heartbeat) need_val --heartbeat "$@"; HEARTBEAT="$2"; shift 2 ;;
+    -o) need_val -o "$@"; OUT="$2"; shift 2 ;;
     -*) echo "未知参数: $1"; exit 1 ;;
     *) TARGETS+=("$1"); shift ;;
   esac
 done
 
-for v in JOBS STALL_TIMEOUT BUILD_TIMEOUT HEARTBEAT; do
-  case "${!v}" in
-    ''|*[!0-9]*) opt="${v,,}"; echo "❌ --${opt//_/-} 需要非负整数，收到: ${!v}"; exit 1 ;;
+# 下限逐个不同，因为 0 的语义逐个不同：
+#   -j 0 没有意义（工作池要么空转、要么永不启动），所以下限是 1、不是 0；
+#   两个 timeout 的 0 就是「关掉这项检查」，是合法取值（回显里会写明已关闭）；
+#   心跳没有「关掉」的语义 —— 并发时它是唯一的进度来源，要少打就把间隔调大。
+need_num --jobs "$JOBS" 1 "-j 0 等于不启动任何构建；串行请用 -j 1（默认值）"
+need_num --stall-timeout "$STALL_TIMEOUT" 0
+need_num --build-timeout "$BUILD_TIMEOUT" 0
+need_num --heartbeat "$HEARTBEAT" 1 "心跳不提供关闭：并发模式下它是唯一的进度反馈；想少打就调大，如 --heartbeat 300"
+# GOMAXPROCS=0 在 go 里是「按 CPU 数」的意思，即等于没设；用户写 0 多半是笔误
+[ -n "$GOMAXPROCS" ] && need_num --gomaxprocs "$GOMAXPROCS" 1 "0 等于不限制，那就干脆别给这个参数"
+
+# ---- --build-env 的校验 --------------------------------------------------
+# KEY 会被**原样写进生成的 Dockerfile 的 ARG 行**，所以必须严格限成标识符 ——
+# 放宽一点就是 Dockerfile 注入（`--build-env "X=1 && RUN evil"` 之类）。
+# VALUE 不进 Dockerfile，只作为 --build-arg 的一个 argv 元素交给 docker：全程在
+# 带引号的数组里传递、不经过 eval，所以不会被 shell 二次解析，无需再转义。
+conflict_env() {
+  echo "❌ --build-env $1=… 与 $2 冲突：两条路都会注入 $1，docker 取最后一个，"
+  echo "   等于一个静默覆盖另一个。二选一 —— 优先用命名开关（它自带提示语和残留自检）"
+  exit 1
+}
+BUILD_ENV_KEYS=()
+for kv in ${BUILD_ENV[@]+"${BUILD_ENV[@]}"}; do
+  case "$kv" in
+    *=*) : ;;
+    *) echo "❌ --build-env 要求 KEY=VALUE 形式，收到「$kv」"; exit 1 ;;
   esac
+  k="${kv%%=*}"
+  case "$k" in
+    ''|[0-9]*|*[!A-Za-z0-9_]*)
+      echo "❌ --build-env 的 KEY 只接受 [A-Za-z_][A-Za-z0-9_]*，收到「$k」"
+      echo "   （KEY 会原样写进生成的 Dockerfile 的 ARG 行，放宽就是 Dockerfile 注入）"
+      exit 1 ;;
+  esac
+  case "$k" in
+    GOPROXY)    [ -n "$GOPROXY" ]    && conflict_env "$k" --goproxy ;;
+    GOSUMDB)    [ -n "$GOSUMDB" ]    && conflict_env "$k" --gosumdb ;;
+    GODEBUG)    [ -n "$GODEBUG" ]    && conflict_env "$k" --godebug ;;
+    GOMAXPROCS) [ -n "$GOMAXPROCS" ] && conflict_env "$k" --gomaxprocs ;;
+    NPM_CONFIG_REGISTRY|COREPACK_NPM_REGISTRY)
+                [ -n "$REGISTRY" ]   && conflict_env "$k" --registry ;;
+    HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy|NO_PROXY|no_proxy)
+                [ -n "$PROXY" ]      && conflict_env "$k" --proxy ;;
+  esac
+  for prev in ${BUILD_ENV_KEYS[@]+"${BUILD_ENV_KEYS[@]}"}; do
+    [ "$prev" = "$k" ] && { echo "❌ --build-env 里 KEY 重复给了两次：$k"; exit 1; }
+  done
+  BUILD_ENV_KEYS+=("$k")
 done
-[ "$JOBS" -lt 1 ] && JOBS=1
-[ "$HEARTBEAT" -lt 1 ] && HEARTBEAT=60
+# 残留自检要用的正则；KEY 已限成标识符，拼进正则是安全的
+BUILD_ENV_RE=""
+[ ${#BUILD_ENV_KEYS[@]} -gt 0 ] && BUILD_ENV_RE=$(IFS='|'; printf '%s' "${BUILD_ENV_KEYS[*]}")
 # --list 只打印改写，并发反而会把输出藏进各自的 .out 文件里，强制回到串行
 [ "$LIST" = 1 ] && JOBS=1
 # wait -n（工作池的核心）是 bash 4.3 才有的
@@ -274,6 +389,10 @@ if [ -n "$GODEBUG" ]; then
   echo "  Go GODEBUG  $GODEBUG（仅构建期）"
   BUILD_ARGS+=(--build-arg "GODEBUG=$GODEBUG"); GO_OPTS=1
 fi
+if [ -n "$GOMAXPROCS" ]; then
+  echo "  Go 并发度   GOMAXPROCS=$GOMAXPROCS（仅构建期，同时压低下载并发与编译并行）"
+  BUILD_ARGS+=(--build-arg "GOMAXPROCS=$GOMAXPROCS"); GO_OPTS=1
+fi
 if [ -n "$GOPROXY" ] && [ -z "$GOSUMDB" ]; then
   echo "              （未动 GOSUMDB：go 一般会走 <GOPROXY>/sumdb/… 把校验和一起代理掉，"
   echo "                该端点也不通时才需要 --gosumdb off）"
@@ -284,6 +403,23 @@ if [ "$GO_OPTS" = 0 ]; then
   echo "              被掐的，多半是中间设备掐 HTTP/2，先试 --godebug http2client=0"
   echo "              若是源本身不通（连不上 / 超时），才换源：--goproxy https://goproxy.cn,direct"
   echo "              也可先 export DEEPSWE_GODEBUG=... / DEEPSWE_GOPROXY=... 再跑本脚本"
+  echo "              还有一条**间接**杠杆：--gomaxprocs N —— cmd/go 用 runtime.GOMAXPROCS(0)"
+  echo "              给下载队列定容量，调小它就等于压低取模块并发（中间设备拦高并发时有用）。"
+  echo "              实测确实管用，但代价很大：同一仓库同一依赖树，不设是 35.1s / 22.6s（复测），"
+  echo "              GOMAXPROCS=1 变成 95.7s / 129.1s，慢 3~6 倍且两组完全不重叠。"
+  echo "              而且 34 个 go Dockerfile 全都有 go install —— 它把编译也压成单线程，双重损失。"
+  echo "              所以**从 --gomaxprocs 4 开始试**，能过就往上加、不过再往下降；1 是最后手段"
+fi
+# ---- 额外构建期变量 ------------------------------------------------------
+# 与命名开关同一套机制（ARG + --build-arg，不进 image config 的 Env），只是不预设
+# 名字。典型用途：pnpm 的 NPM_CONFIG_NETWORK_CONCURRENCY（默认 16）—— 它只管网络
+# 并发、不碰任何计算，比 GOMAXPROCS 精准得多。
+if [ ${#BUILD_ENV[@]} -gt 0 ]; then
+  echo "  额外变量    ${#BUILD_ENV[@]} 个（--build-env，仅构建期）"
+  for kv in "${BUILD_ENV[@]}"; do
+    echo "              $(redact "$kv")"       # 值可能含凭据，与代理/包源同样处理
+    BUILD_ARGS+=(--build-arg "$kv")
+  done
 fi
 echo
 
@@ -378,10 +514,11 @@ build_one() {
   # 从 task.json 里取出 Dockerfile 与目标 tag，并做架构 / 证书改写
   python3 - "$HERE/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" \
            "$([ -n "$CA_CERT" ] && basename "$CA_CERT" || echo '')" "$INSECURE" \
-           "$REGISTRY" "$GOPROXY" "$GOSUMDB" "$GODEBUG" <<'PY'
+           "$REGISTRY" "$GOPROXY" "$GOSUMDB" "$GODEBUG" "$GOMAXPROCS" \
+           "${BUILD_ENV_KEYS[*]+${BUILD_ENV_KEYS[*]}}" <<'PY'
 import json, pathlib, re, sys
 (task_json, work, base, base_arch, ca_name, insecure, registry,
- goproxy, gosumdb, godebug) = sys.argv[1:11]
+ goproxy, gosumdb, godebug, gomaxprocs, build_env_keys) = sys.argv[1:13]
 insecure = insecure == "1"
 work = pathlib.Path(work)
 files = {f["path"]: f["content"] for f in json.loads(pathlib.Path(task_json).read_text())["files"]}
@@ -451,15 +588,31 @@ if registry:
 # 还会让 --list / REWRITES.md 看起来像做了并不存在的改写。同样必须排在 CA /
 # insecure 之前，那两段自带 RUN。
 go_args = [(n, v) for n, v in
-           (("GOPROXY", goproxy), ("GOSUMDB", gosumdb), ("GODEBUG", godebug)) if v]
+           (("GOPROXY", goproxy), ("GOSUMDB", gosumdb), ("GODEBUG", godebug),
+            ("GOMAXPROCS", gomaxprocs)) if v]
 if go_args:
     prelude += (
-        "\n# [build_arm.sh] --goproxy/--gosumdb/--godebug：构建期改 go 的取模块方式。\n"
+        "\n# [build_arm.sh] --goproxy/--gosumdb/--godebug/--gomaxprocs：构建期改 go 的\n"
+        "# 取模块方式与并发度。\n"
         "# 写 ARG 不写 ENV —— ARG 不进 image config 的 Env，运行期 go 仍是基座默认配置\n"
         + "".join(f"ARG {n}\n" for n, _ in go_args) + "\n")
     rewrites.append(("（无）", " + ".join(f"ARG {n}" for n, _ in go_args),
                      "；".join(f"--{n.lower()}={v}" for n, v in go_args)
                      + "；这些变量不在预定义 build-arg 白名单里，不声明就传不进去"))
+
+# --build-env 的逃生口。KEY 在 bash 侧已按 [A-Za-z_][A-Za-z0-9_]* 严格校验过 ——
+# 它是唯一会被原样写进 Dockerfile 文本的部分，不校验就是 Dockerfile 注入。
+# 值不写进这里：同样只经 --build-arg 注入，构建期可见、构建完即消失。
+# 位置与上面两组一样必须在 CA / insecure 之前，那两段自带 RUN。
+be_keys = build_env_keys.split()
+if be_keys:
+    prelude += (
+        "\n# [build_arm.sh] --build-env：构建期额外注入的变量。写 ARG 不写 ENV —— ARG 不进\n"
+        "# image config 的 Env，运行期镜像不受影响\n"
+        + "".join(f"ARG {k}\n" for k in be_keys) + "\n")
+    rewrites.append(("（无）", " + ".join(f"ARG {k}" for k in be_keys),
+                     "--build-env；不在 docker 预定义 build-arg 白名单里的变量，"
+                     "不声明 ARG 就传不进去"))
 
 if ca_name:
     # 装 CA 是**首选**：不像关校验那样改变工具行为，而且 cargo 只认这条路。
@@ -596,11 +749,21 @@ PY
     fi
     # go 那三个同理，只能活在构建期。这里只查 Config.Env，不做 docker run 实测 ——
     # go 的默认值本来就可能由基座 / go 自身给出，实测值容易误判成「残留」。
-    if [ -n "$GOPROXY" ] || [ -n "$GOSUMDB" ] || [ -n "$GODEBUG" ]; then
+    if [ -n "$GOPROXY" ] || [ -n "$GOSUMDB" ] || [ -n "$GODEBUG" ] || [ -n "$GOMAXPROCS" ]; then
       if docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' \
-           | grep -qiE '(^|[^A-Za-z_])(goproxy|gosumdb|godebug)='; then
+           | grep -qiE '(^|[^A-Za-z_])(goproxy|gosumdb|godebug|gomaxprocs)='; then
         echo "  ❌ 镜像 Env 里残留了 go 变量 —— 该用 ARG 而非 ENV，必须排查后重建"
-        docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -iE 'goproxy|gosumdb|godebug' | sed 's/^/       /'
+        docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -iE 'goproxy|gosumdb|godebug|gomaxprocs' | sed 's/^/       /'
+        echo "fail $dt 0" >"$work/.status"; echo; return 0
+      fi
+    fi
+    # --build-env 注入的键同理：只能活在构建期，写成 ENV 就带进运行期了。
+    # 正则由已校验过的标识符拼成，不会被值里的字符搞坏。
+    if [ -n "$BUILD_ENV_RE" ]; then
+      if docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' \
+           | grep -qE "(^|[^A-Za-z_])($BUILD_ENV_RE)="; then
+        echo "  ❌ 镜像 Env 里残留了 --build-env 注入的变量 —— 该用 ARG 而非 ENV，必须排查后重建"
+        docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -E "($BUILD_ENV_RE)=" | sed 's/^/       /'
         echo "fail $dt 0" >"$work/.status"; echo; return 0
       fi
     fi

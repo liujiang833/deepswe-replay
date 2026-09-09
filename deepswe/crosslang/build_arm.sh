@@ -16,6 +16,7 @@
 #   bash build_arm.sh python                 # 建一条（语言名或 task_id 前缀）
 #   bash build_arm.sh all                    # 全建，按依赖从少到多排序
 #   bash build_arm.sh --base mars-base:arm64 python
+#   bash build_arm.sh --registry https://registry.npmmirror.com typescript
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +29,8 @@ BUILD_NET=""
 # 公司内网做 TLS 中间人时用：装内网 CA（推荐）或干脆关掉校验（有残留代价，见下）
 CA_CERT="${DEEPSWE_CA_CERT:-}"
 INSECURE=0
+# 内网取包极慢时用：构建期把 npm 系的源换到镜像站（只在构建期生效，见「包源」一节）
+REGISTRY="${DEEPSWE_NPM_REGISTRY:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,6 +41,7 @@ while [ $# -gt 0 ]; do
     --build-network) BUILD_NET="$2"; shift 2 ;;
     --ca-cert) CA_CERT="$2"; shift 2 ;;
     --insecure) INSECURE=1; shift ;;
+    --registry) REGISTRY="$2"; shift 2 ;;
     -o) OUT="$2"; shift 2 ;;
     -*) echo "未知参数: $1"; exit 1 ;;
     *) TARGETS+=("$1"); shift ;;
@@ -162,6 +166,25 @@ if [ -z "$CA_CERT" ] && [ "$INSECURE" = 0 ]; then
   echo "  证书        默认（如报 server certificate verification failed，"
   echo "              说明内网做了 TLS 中间人：用 --ca-cert <内网CA.crt>，或 --insecure）"
 fi
+
+# ---- 包源 ----------------------------------------------------------------
+# 内网从 registry.npmjs.org 取包极慢时换镜像站。两点实测约束决定了这里的写法：
+#   - npm / pnpm 读 NPM_CONFIG_REGISTRY，corepack 只读 COREPACK_NPM_REGISTRY
+#     （它**不读** .npmrc），所以两个变量都得给；
+#   - 这两个都不在 docker 的预定义 build-arg 白名单里（白名单只有 *_proxy），
+#     所以还必须在生成的 Dockerfile 里显式写 ARG，否则 --build-arg 传进去是空值。
+# 用 ARG 而不是 ENV / .npmrc：ARG 不进 image config 的 Env（与代理同理），运行期
+# 的 npm 仍指向官方源——运行期是 --network=none + 403 sinkhole，源被改写会让
+# agent 命令的联网报错文本变样。
+if [ -n "$REGISTRY" ]; then
+  echo "  包源        $(redact "$REGISTRY")（npm/pnpm/corepack，仅构建期）"
+  BUILD_ARGS+=(--build-arg "NPM_CONFIG_REGISTRY=$REGISTRY")
+  BUILD_ARGS+=(--build-arg "COREPACK_NPM_REGISTRY=$REGISTRY")
+else
+  echo "  包源        未设置（默认 registry.npmjs.org）"
+  echo "              若目标机取 npm 包极慢，用 --registry https://registry.npmmirror.com"
+  echo "              或先 export DEEPSWE_NPM_REGISTRY=... 再跑本脚本"
+fi
 echo
 
 mkdir -p "$OUT"
@@ -180,9 +203,10 @@ for dir in "${SELECTED[@]}"; do
 
   # 从 task.json 里取出 Dockerfile 与目标 tag，并做架构 / 证书改写
   python3 - "$HERE/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" \
-           "$([ -n "$CA_CERT" ] && basename "$CA_CERT" || echo '')" "$INSECURE" <<'PY'
+           "$([ -n "$CA_CERT" ] && basename "$CA_CERT" || echo '')" "$INSECURE" \
+           "$REGISTRY" <<'PY'
 import json, pathlib, re, sys
-task_json, work, base, base_arch, ca_name, insecure = sys.argv[1:7]
+task_json, work, base, base_arch, ca_name, insecure, registry = sys.argv[1:8]
 insecure = insecure == "1"
 work = pathlib.Path(work)
 files = {f["path"]: f["content"] for f in json.loads(pathlib.Path(task_json).read_text())["files"]}
@@ -222,6 +246,18 @@ def insert_before_cmd(text, block):
     return text + block
 
 prelude = ""
+if registry:
+    # 只声明、不给默认值：值由 --build-arg 注入，构建期对 RUN 可见，构建完即消失。
+    # 必须排在 prelude 最前 —— 后面 CA / insecure 那两段自带 RUN，ARG 得在其之前。
+    prelude += (
+        "\n# [build_arm.sh] --registry：构建期改用镜像源。写 ARG 不写 ENV —— ARG 不进\n"
+        "# image config 的 Env，运行期 npm 仍是官方源，联网报错文本不受影响\n"
+        "ARG NPM_CONFIG_REGISTRY\n"
+        "ARG COREPACK_NPM_REGISTRY\n\n")
+    rewrites.append(("（无）", "ARG NPM_CONFIG_REGISTRY + ARG COREPACK_NPM_REGISTRY",
+                     f"--registry={registry}；这两个变量不在预定义 build-arg 白名单里，"
+                     "不声明就传不进去；corepack 只认后者、不读 .npmrc"))
+
 if ca_name:
     # 装 CA 是**首选**：不像关校验那样改变工具行为，而且 cargo 只认这条路。
     #
@@ -285,6 +321,15 @@ lines += ["", "## 无法通过改写消除的漂移", "",
           "- 依赖版本会漂移：`pnpm install` 未加 `--frozen-lockfile`、",
           "  `pip install` 未钉版本、`npm install -g` 只钉了直接依赖。",
           "  （例外：`cargo fetch --locked` 与 `npm ci` 是锁定的）",
+          "- 用镜像源（`--registry`）时，那些没有 `--frozen-lockfile` 又没有匹配",
+          "  lockfile 的 task（`pnpm install` 会做全量 resolution）可能因镜像同步",
+          "  延迟解析到不同版本；有 lockfile 的按 sha512 integrity 校验，",
+          "  tarball 内容不会漂",
+          "- 用镜像源时 `node_modules/.modules.yaml` 里会记下镜像站 URL（实测：",
+          "  `default: https://registry.npmmirror.com/` vs 官方源的 `.../registry.npmjs.org/`），",
+          "  所以镜像内容与官方源建出来的**字节不同**。上面两条自检查不到这里。",
+          "  实测后果是良性的：pnpm 解析新包读自己的配置而非该文件，运行期离线报错",
+          "  文本与官方源镜像**逐字节一致**。即「行为不受污染」成立，「字节完全相同」不成立",
           "- 工具链是 arm64 构建，native 扩展与编译产物全部不同",
           "- 基座本身是 `:latest` tag，不可复现",
           "",
@@ -321,6 +366,26 @@ PY
       echo "  ❌ 镜像 Env 里残留了代理变量 —— 会污染运行期行为，必须排查后重建"
       docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -i proxy | sed 's/^/       /'
       N_FAIL=$((N_FAIL+1)); echo; continue
+    fi
+    # 同理，registry 也只能活在构建期：写成 ENV 就会进 Config.Env 带到运行期
+    if [ -n "$REGISTRY" ]; then
+      if docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' \
+           | grep -qiE '(^|[^A-Za-z_])(npm_config_registry|corepack_npm_registry)='; then
+        echo "  ❌ 镜像 Env 里残留了 registry 变量 —— 该用 ARG 而非 ENV，必须排查后重建"
+        docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -i registry | sed 's/^/       /'
+        N_FAIL=$((N_FAIL+1)); echo; continue
+      fi
+      # Env 干净还不够：.npmrc 之类的文件配置照样会改运行期取值，实测一遍最直接
+      if REG_LEFT=$(docker run --rm "$TAG" npm config get registry 2>/dev/null); then
+        case "$REG_LEFT" in
+          *registry.npmjs.org*) echo "     （运行期 npm registry 已回到 $REG_LEFT）" ;;
+          *) echo "  ❌ 运行期 npm registry = ${REG_LEFT:-（空）} —— 没回到官方源，"
+             echo "     会改变运行期 agent 命令的联网报错文本，必须排查后重建"
+             N_FAIL=$((N_FAIL+1)); echo; continue ;;
+        esac
+      else
+        echo "     （镜像里没有 npm，跳过 registry 还原实测）"
+      fi
     fi
     # --insecure 的配置必须已被末尾那步还原，否则运行期工具行为就变了
     if [ "$INSECURE" = 1 ]; then

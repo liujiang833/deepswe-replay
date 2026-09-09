@@ -129,3 +129,52 @@
 - `EXEC_LOG_2026-09-08-full-replay-set.md` - 新增
 
 **Commit:** 见下方 git log
+
+## 2026-09-09: 换源开关 `--registry` + 全量集缩到 113 条
+
+**Goal:** 服务器上 typescript 镜像卡在 `pnpm install`（`resolved 548, downloaded 508`），
+定位原因并给 `build_arm.sh` 加一个保真度安全的换源开关；同时把打包范围改成只要 113 条。
+
+**Steps:**
+1. 定位卡点 - success：`548` 是指纹，本机 9/8 那次成功日志里 `Packages: +548`、
+   TAG 也与 `true-myth-iterable-collection-combinators` 逐字相同。**同一 Dockerfile 本机 132s 建完过**
+2. 判定瓶颈 - success：从 29 条低速 WARN 反推耗时，与 size 无关 → 延迟受限而非带宽受限
+3. 实测换源的三条注入途径 - success：只有 `ARG` + `--build-arg` 既生效又零残留
+4. 执行 agent 改 `build_arm.sh` - success
+5. 独立 agent 验证（含真实端到端构建）- success，但推翻了立项假设（见下）
+6. 按要求去掉 5 条对照组，全量集 118 → 113 - success
+7. 连带修正所有按 118 写的文档与脚本注释 - success
+
+**Key Findings:**
+- **瓶颈是每请求固定开销，不是带宽**：`@nodelib/fs.stat` 4 KiB 用了 8.0 s，
+  `oniguruma-to-es` 269 KiB 只用 5.6 s；29 条整体均值 5.4 s，与 size 不相关。
+  推论：`network-concurrency` 该**调高**而非调低（早先的相反建议已更正）
+- **❗换源实测更慢**：同仓库同 548 包，官方源 132.4s / 镜像源 156.6s（+18%），
+  低速 WARN 29 → 38。与延迟受限分析自洽——瓶颈不在目标主机，换主机没用。
+  → RUNBOOK 该节已从「解法」改写成「测过确实有用才开的开关」，并附了 A/B 测法
+- **三个工具三个配置源**：npm/pnpm 读 `NPM_CONFIG_REGISTRY`，
+  **corepack 只读 `COREPACK_NPM_REGISTRY`、完全不读 `.npmrc`**（ofetch/query/valibot 三条会踩）
+- **注入途径只有一条是干净的**：宿主 `export` 不传递；`ENV` 永久进 `Config.Env`；
+  只有 `ARG` + `--build-arg` 构建期生效且零残留。且 `NPM_CONFIG_REGISTRY`
+  **不在** docker 预定义 build-arg 白名单里（白名单只有 `*_PROXY`），必须显式写 `ARG`
+- **❗`build_arm.sh` 在 Docker Desktop + WSL2 上按现状跑不通**（先于本次改动存在）：
+  代理在 loopback 时脚本自动加 `--network host`，但这套 BuildKit **不兑现**该参数，
+  `git clone` 直接失败。原生 Linux Docker 未复现
+- **`node_modules/.modules.yaml` 会留下镜像站 URL**：镜像内容与官方源建出来的字节不同，
+  两条自检都查不到。实测后果良性（离线报错文本逐字节一致）→
+  结论修正为「**行为**不受污染」成立、「字节完全相同」不成立
+- **全量集 113 条 / 113 个镜像 / 4519 条命令**，一 task 一 trial 一镜像。
+  去掉的 5 条对照组是**唯一已验证基线**，去掉后 `run_batch.py` 全部显示「无基线」
+  （优雅降级，不报错），某条失败时无法区分是 task 的问题还是流程的问题
+
+**Files Changed:**
+- `crosslang/build_arm.sh` - 新增 `--registry` / `DEEPSWE_NPM_REGISTRY`；插 `ARG` 两行；
+  两条构建后自检（Env 残留 + 运行期 `npm config get registry` 实测）；REWRITES.md 漂移两条
+- `crosslang/RUNBOOK.md` - 新增 §2b「取包慢:换镜像源」（含 A/B 实测数据与测法）；
+  §2b 代理一节加 `--network host` 已知问题；§5.3 加「包里已无 verdict.json」提示；
+  §6.5/§7.2 交叉引用；§7 全章按 113 重写
+- `crosslang/run_batch.py`、`crosslang/make_bundle.sh` - 118 → 113 的注释修正
+- `.gitignore` - 补 `deepswe/crosslang/full_trials/`（原规则只匹配一层深）
+- `EXEC_LOG_2026-09-09-npm-registry.md` - 新增
+
+**Commit:** 见 git log

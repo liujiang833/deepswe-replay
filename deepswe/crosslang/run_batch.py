@@ -73,7 +73,8 @@ def load_trials():
 def preflight(trials, need_cgroup, skip_missing=False):
     """跑之前把「一定会失败」的情况先查出来，避免跑到一半才炸。
 
-    skip_missing：全量 118 条对应 113 个镜像，不可能一次全建好。开了它之后
+    skip_missing：全量 113 条各对应一个镜像（若带上 5 条对照组则 118 条、仍 113 个
+    镜像），不可能一次全建好。开了它之后
     缺镜像的 trial 被剔除而不是让整批拒绝启动，这样可以边建边跑。
     """
     problems = []

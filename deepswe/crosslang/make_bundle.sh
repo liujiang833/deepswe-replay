@@ -8,7 +8,7 @@
 # 用法：  bash make_bundle.sh              # → deepswe-replay-bundle-<日期>.tar.gz
 #         bash make_bundle.sh --full      # 连 agent 日志、per-command 指标一起带
 #         bash make_bundle.sh -o /tmp/x.tar.gz
-#         bash make_bundle.sh --trials-dir full_trials   # 打全量 118 条（见 make_full_trials.py）
+#         bash make_bundle.sh --trials-dir full_trials   # 打全量 113 条（见 make_full_trials.py）
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

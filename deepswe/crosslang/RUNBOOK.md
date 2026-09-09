@@ -123,6 +123,14 @@ bash build_arm.sh python
    有残留就判失败。
 2. **代理挂在 loopback 上时自动加 `--network=host`**:构建容器内的 `127.0.0.1`
    是它自己,连不到宿主的代理。`--build-network` 可覆盖。
+
+   ⚠️ **已知问题(2026-09-09 实测)**:在 Docker Desktop + WSL2 这套 BuildKit 上
+   **`--network host` 不被兑现**,构建容器仍然连不到宿主 loopback,表现为
+   `fatal: unable to access …: Failed to connect to 127.0.0.1 port 7887`,
+   `git clone` 那一步直接失败——也就是说**这种环境下 `build_arm.sh` 按现状是跑不通的**。
+   绕法:若构建容器本来就能直连外网,把代理相关参数全去掉再跑;
+   否则把代理换成一个非 loopback 地址(宿主在 docker 网桥上的 IP,或局域网地址)。
+   原生 Linux Docker 上未复现此问题。
 3. 日志里代理的 `user:pass@` 会被抹成 `***@`。
 
 **运行期不需要代理**,也不该有:重放容器是 `--network=none` + 403 sinkhole。
@@ -185,6 +193,124 @@ bash build_arm.sh --insecure python
 
 **但 cargo 没有 insecure 开关**,只认 `CARGO_HTTP_CAINFO` 指向的 CA 文件——
 所以 rust 那条无论如何都得走 `--ca-cert`。
+
+### 取包慢:换镜像源 `--registry`
+
+症状是 `pnpm install` / `npm install` 挂在那里不动,日志停在
+`Progress: resolved 548, downloaded 508` 这种行上。
+
+> 🚨 **先读这段再决定要不要换源。2026-09-09 在开发机上做过一次对照实验,
+> 结论是换源更慢:**
+>
+> | | `pnpm install` 耗时 | 低速 WARN 条数 | 速度区间 |
+> |---|---|---|---|
+> | 官方源 `registry.npmjs.org` | **132.4 s** | 29 | 0~48 KiB/s |
+> | 镜像源 `registry.npmmirror.com` | **156.6 s**（+18%） | 38 | 3~47 KiB/s |
+>
+> 同一个仓库(true-myth)、同样 548 个包。两边撞的是同一堵墙。
+> 这与下面「第二步」的延迟受限分析一致——**瓶颈不在目标主机,换主机自然没用**。
+>
+> ⚠️ 这不是完美对照:官方源那次走公司代理,镜像源那次因为代理故障(见 §2b 代理一节
+> 的已知问题)走的直连。直连都还更慢,说明镜像源在这台机器上确实没优势。
+>
+> **所以 `--registry` 是一个「测过确实有用才开」的开关,不是默认解法。**
+> 换机器、换网络结论可能不同——务必按下面第三步先测。
+
+**第一步:先判「慢」还是「死」,别急着改东西**
+
+pnpm 的 `Progress:` 行**只在计数器变化时才打**(实测:时间戳 18.47/27.70/32.19/33.56
+明显不等间隔)。所以:
+
+```bash
+tail -f build/<trial>/build.log      # 超过 5~8 分钟一行不动,才是真挂了
+cat /proc/net/dev; sleep 60; cat /proc/net/dev   # 更硬:RX 还涨不涨
+```
+
+RX 还在涨(哪怕几十 KB/min)就是在爬,等着就行。
+
+**第二步:判瓶颈是带宽还是延迟**
+
+从 `Tarball download average speed` 的 WARN 行反推每个包的耗时(`size ÷ speed`)。
+2026-09-09 从 true-myth 那份成功日志的 29 条 WARN 里算出来:
+
+| 包 | size | 耗时 |
+|---|---|---|
+| `@nodelib/fs.stat` | 4 KiB | 8.0 s |
+| `oniguruma-to-es` | 269 KiB | 5.6 s |
+
+体积差 67 倍、耗时反而小的那个更久;29 条整体落在 1~11 s,均值 5.4 s,**与 size 无关**。
+带宽受限会呈现「小文件快、大文件慢」,这里没有。→ **延迟受限**(RTT + TLS 握手)。
+
+推论:这种情况下 `network-concurrency` 应当**调高**而不是调低——调低是带宽争抢的对策。
+
+**第三步:换源之前先测它值不值**
+
+```bash
+for h in registry.npmjs.org registry.npmmirror.com; do
+  echo "--- $h ---"
+  for i in 1 2 3; do
+    curl -sS -o /dev/null \
+      -w "  connect=%{time_connect}  tls=%{time_appconnect}  ttfb=%{time_starttransfer}  total=%{time_total}  %{speed_download}B/s\n" \
+      "https://$h/minimatch/-/minimatch-9.0.5.tgz"
+  done
+done
+```
+
+**必须带着构建用的同一套代理环境变量跑。** 两个 host 的 `total` 差不多 → 瓶颈是
+公司代理自身(TLS 重签 + 内容扫描),换目标域名毫无作用,**换源白搭**;npmmirror
+明显低 → 换源有用。
+
+**用法**
+
+```bash
+bash build_arm.sh --registry https://registry.npmmirror.com typescript
+# 或者： export DEEPSWE_NPM_REGISTRY=https://registry.npmmirror.com
+```
+
+**换在哪儿:三个工具三个地方**(实测)
+
+| 工具 | 读什么 |
+|---|---|
+| `npm` | `.npmrc`(项目→用户→全局)+ `NPM_CONFIG_*` 环境变量;优先级 CLI > **env** > 项目 `.npmrc` |
+| `pnpm` | 同上,复用 npm 的 config 体系 |
+| **`corepack`** | **只认 `COREPACK_NPM_REGISTRY` 环境变量,完全不读 `.npmrc`** |
+
+corepack 那条不是细节:`ofetch` / `query` / `valibot` 三条 task 用 corepack 引导 pnpm,
+只设 `.npmrc` 的话它们照样走官方源。
+
+基座里 `/root/.npmrc`、`/usr/etc/npmrc`、`/etc/npmrc` **一个都不存在**,默认源
+`https://registry.npmjs.org/` 来自内建默认——所以**没有原值需要备份还原**。
+
+**为什么用 `ARG` 而不是 `ENV` 或 `.npmrc`**(三种写法实测)
+
+| 写法 | 构建期生效 | 留进镜像 `Config.Env` |
+|---|---|---|
+| 宿主机 `export` | ❌ 空 | — |
+| Dockerfile `ENV` | ✅ | ❌ **永久残留** |
+| `ARG` + `--build-arg` | ✅ | ✅ **零残留** |
+
+和代理不同,`NPM_CONFIG_REGISTRY` **不在** docker 的预定义 build-arg 白名单里
+(白名单只有 `HTTP_PROXY`/`HTTPS_PROXY`/`FTP_PROXY`/`NO_PROXY`/`ALL_PROXY` 及小写),
+所以必须往生成的 Dockerfile 里插两行 `ARG` 声明,光传 `--build-arg` 是空值。
+`build_arm.sh` 把它们插在 `FROM` 之后、第一条 `RUN` 之前。
+
+写 `/app/.npmrc` 也不行——会弄脏工作区,撞死构建期那道 `git status --porcelain` 断言。
+
+**构建后的自检**(`--registry` 生效时自动跑)
+
+1. `Config.Env` 里不得有 `NPM_CONFIG_REGISTRY` / `COREPACK_NPM_REGISTRY` 残留
+2. 真起一个容器跑 `npm config get registry`,必须已回到 `registry.npmjs.org`
+
+**保真度代价**
+
+- **tarball 内容不会漂**:pnpm 按 lockfile 的 sha512 integrity 校验,npmmirror 是
+  官方源全量同步,字节一致才过得去;不一致会直接报错,不会静默。
+- **解析可能会漂,但只影响一部分 task**:有 lockfile 的会打印
+  `Lockfile is up to date, resolution step is skipped`,纯按 lockfile 取包,零风险。
+  真会做全量 resolution 的是 `obsidian-linter` 那 3 条(只有 `package-lock.json`、
+  没有 `pnpm-lock.yaml`),镜像源同步延迟理论上可能解到不同版本,**建议单独核对**。
+- 扫过 113 份 Dockerfile,只有 `ink-grid-box-layout` 提到 `.npmrc`,且是其仓库自带的
+  `package-lock=false`,不涉及 registry,**无 scoped registry 覆盖冲突**。
 
 ### ⚠️ 路 C 的保真度代价
 
@@ -283,6 +409,13 @@ python3 run_batch.py --dry-run      # 只预检和排程
 
 ### 5.3 随包基线的口径
 
+🚫 **当前这版包（113 条）里一个 `verdict.json` 都没有**——基线只存在于 `crosslang/`
+下那 5 条对照组上，而它们已按要求从包里去掉（见 §7.1）。所以下面这张表描述的是
+**曾经的**随包基线，现在包里对不到；`run_batch.py` 每条都会打「无基线」，
+`vs_baseline` 恒为 `None`。要恢复就重跑 `make_full_trials.py`（不加 `--no-verified`）。
+
+以下口径在恢复对照组后仍然适用：
+
 `<trial>/replay/verdict.json` 是**最终口径**：执行器 `/bin/sh -c`（dash）、
 网络 `sinkhole403`。
 
@@ -359,37 +492,43 @@ docker rm -f $(docker ps -aq --filter name=^replay_)
 宿主侧还有 90s 兜底，正常不会真卡死。rust 那条基线里 agent 自己有大量 `sleep 25~29`
 在等后台编译，看着像卡住但是正常的。
 
-## 7. 全量集（118 条）
+**注意这一节说的是「重放」卡住。「构建」卡住是另一回事**——`pnpm install` / `npm install`
+停在 `Progress: resolved N, downloaded M` 上不动,判定与对策见 §2b 的
+「取包慢:换镜像源 `--registry`」。
+
+## 7. 全量集（113 条）
 
 ### 7.1 它是什么
 
 `make_full_trials.py` 把 `deepswe/data/` 里的下载态数据装配成 replay 能直接吃的布局：
 
 ```bash
-python3 make_full_trials.py                      # → ./full_trials/，118 条
+python3 make_full_trials.py --no-verified        # → ./full_trials/，113 条
 python3 make_full_trials.py --only go,python,javascript
-bash make_bundle.sh --trials-dir full_trials     # → 4.8 MB 的 tar.gz
+bash make_bundle.sh --trials-dir full_trials     # → tar.gz
 ```
 
-**118 = 113 + 5**：113 条来自 `TRAJECTORY_SELECTION.json`（每个 task 取 claude-fable-5
-优先的那次 pass），另外 5 条是更早一轮按跨模型取样挑的、**本地已跑通且 patch 逐字节
-核对过**的对照组。
+**113 条**全部来自 `TRAJECTORY_SELECTION.json`——每个 task 取 claude-fable-5 优先的
+那次 pass，一个 task 一条，一个 task 一个镜像，**三者一一对应**。
 
-这 5 条对照组必须留着。两批的 trial 不是同一次运行（模型不同、`model.patch` 大小
-也不同），所以**那 113 条里一条已验证基线都没有**——没有对照组的话，某条失败时无法
-区分「这个 task 有问题」和「整套流程有问题」。而同一个 task 用同一个镜像，带上它们
-**不增加任何构建成本**。
+| 语言 | trial 数 | 命令数 |
+|---|---|---|
+| typescript | 35 | 1620 |
+| python | 34 | 1387 |
+| go | 34 | 1039 |
+| rust | 5 | 316 |
+| javascript | 5 | 157 |
+| **合计** | **113** | **4519** |
 
-| 语言 | trial 数 | 命令数 | 其中对照组 |
-|---|---|---|---|
-| typescript | 36 | 1680 | 1 |
-| python | 35 | 1486 | 1 |
-| go | 35 | 1109 | 1 |
-| javascript | 6 | 223 | 1 |
-| rust | 6 | 393 | 1 |
-| **合计** | **118** | **4891** | **5** |
+⚠️ **包里没有任何本地已验证基线。** `make_full_trials.py` 默认会额外并入 `crosslang/`
+下那 5 条更早一轮跨模型取样、**本地已跑通且 patch 逐字节核对过**的 trial 当回归对照组
+（同 task 同镜像，零额外构建成本）；2026-09-09 按要求用 `--no-verified` 去掉了。
 
-对应 **113 个不同镜像**（对照组与选中条目共享镜像）。
+代价要知道：那 113 条**没有一条有已验证基线**（两批 trial 不是同一次运行，模型与
+`model.patch` 都不同）。所以 `run_batch.py` 会对每条都显示「无基线」，
+`vs_baseline` 恒为 `None`；**某条失败时无法区分「这个 task 有问题」和「整套流程有问题」**。
+要恢复对照组：重跑 `make_full_trials.py`（不加 `--no-verified`）即可，会变回 118 条 /
+仍是 113 个镜像。
 
 ### 7.2 边建边跑
 
@@ -398,6 +537,9 @@ bash make_bundle.sh --trials-dir full_trials     # → 4.8 MB 的 tar.gz
 ```bash
 # 建一批（语言名会展开成该语言的全部 trial）
 bash build_arm.sh --ca-cert corp-ca.crt python
+
+# 取包慢到卡住时加镜像源（先按 §2b 测过确实有用再加）
+bash build_arm.sh --ca-cert corp-ca.crt --registry https://registry.npmmirror.com typescript
 
 # 跑已经建好的那些，镜像没建好的自动跳过而不是拒绝启动
 python3 run_batch.py --skip-missing --keep-going
@@ -437,11 +579,12 @@ python 那种纯下载的增量极小，typescript 因为 `pnpm install` 把 dev
 约 8~12 小时。rust 那 5 条要单独留时间：它的 Dockerfile 里有
 `cargo nextest run --no-run`，是把测试二进制整个编译一遍，是唯一的真·编译步骤。
 
-**重放时间**——5 条对照组实测 367 条命令 862.1s，即 **2.35 s/命令**。按 ARM ×1.4 折算
+**重放时间**——单位成本来自 5 条对照组的实测（367 条命令 862.1s，即 **2.35 s/命令**）。
+这 5 条虽已不在包内，实测值依然是目前唯一的实测依据。按 ARM ×1.4 折算
 约 3.3 s/命令：
 
-- go + python + javascript（2818 条命令）≈ **2.5~3 小时**
-- 全量 118 条（4891 条命令）≈ **4.5~5 小时**
+- go + python + javascript（2583 条命令）≈ **2.5 小时**
+- 全量 113 条（4519 条命令）≈ **4~4.5 小时**
 
 注意主导项不是语言而是 **trace 里有没有 `sleep` 轮询**——rust 那条墙钟最长但 CPU 只有
 0.30 核，容器大部分时间在空转。

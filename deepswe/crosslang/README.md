@@ -149,12 +149,24 @@ python3 replay.py <trial 目录> <trial 目录>/task.json -o /tmp/one
 
 | 语言 | trial 数 | 命令数 |
 |---|---|---|
-| typescript | 35 | 1620 |
-| python | 34 | 1387 |
-| go | 34 | 1039 |
+| go | 35 | 1075 |
+| python | 34 | 1381 |
+| typescript | 34 | 1590 |
 | rust | 5 | 316 |
 | javascript | 5 | 157 |
 | **合计** | **113** | **4519** |
+
+⚠️ **上游 `task.toml` 里有 3 个 task 的语言标错了**，本包已修正（`make_full_trials.py`
+里有一张带证据的修正表，运行时会打印修正了哪几条）：
+
+| task | 上游标注 | 实际 | 判据 |
+|---|---|---|---|
+| `prometheus-transactional-reload-status` | typescript | **go** | Dockerfile 只有 `go mod download`/`go install`，零 npm |
+| `httpx-deterministic-cookie-store` | typescript | **python** | `pip install` |
+| `koota-entity-snapshot-rollback` | python | **typescript** | `pnpm install` |
+
+这不是洁癖：`build_arm.sh` 按语言展开构建目标、`run_batch.py --only` 按语言过滤，
+标错会让你 `build_arm.sh python` 时莫名撞进一个跑 `pnpm install` 的 Node 仓库。
 
 > 4519 是 **trace 里的命令总数**，含每条 trial 末尾那条哨兵命令
 > （`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`，原始运行里就没执行过，

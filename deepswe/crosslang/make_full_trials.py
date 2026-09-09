@@ -19,6 +19,8 @@ replay.py / run_batch.py 要的是另一种布局：每条 trial 一个目录，
 
 3. **语言来自 build_env.json 的静态分析**，不靠猜 Dockerfile 里的包管理器。
    typescript 与 javascript 都是 node，`pnpm install` / `npm ci` 区分不可靠。
+   例外是下面 LANGUAGE_FIXES 那几条：上游标注与 Dockerfile 里的构建栈直接矛盾
+   （Go 仓库标成 typescript 之类），这种错不是「区分不可靠」而是纯粹标错，逐条修。
 
 用法：
     python3 make_full_trials.py                        # 全部 113 条 → ./full_trials/
@@ -40,6 +42,60 @@ DATA = DEEPSWE / "data"
 # task.json 里重放/构建真正会读到的文件，其余一律不带
 KEEP_FILES = {"task.toml", "environment/Dockerfile"}
 LANG_ORDER = ["python", "go", "rust", "typescript", "javascript"]
+
+# ── 语言修正表 ────────────────────────────────────────────────────────────
+# 上游 task.toml（→ build_env.json）里有 3 条 language 标错了。
+#
+# 为什么在这里修、而不是去改上游：data/ 下的 task.toml 是**下载来的原始数据**，
+# 改它就再也没法和上游对账，下一次同步还会被覆盖回去。make_full_trials.py 是
+# 「别人的数据」变成「我们自己的元数据」的那道边界，修正落在边界上最干净：
+# 上游文件一个字节不动，meta.json 里写的是我们负责的口径。
+#
+# 为什么值得专门修：language 不是装饰性字段。build_arm.sh 按它展开构建目标、
+# run_batch.py --only 按它过滤。标错的直接后果是 `build_arm.sh python` 会莫名
+# 其妙撞进一个 `pnpm install` 的 Node 仓库，等构建炸了才发现。
+#
+# 每条的判据都取自 task.json 里的 environment/Dockerfile —— 真正决定构建栈的
+# 那个文件，而不是仓库名或印象。
+# 格式：task_id -> (上游原值, 修正值, 证据)
+LANGUAGE_FIXES = {
+    "prometheus-transactional-reload-status": (
+        "typescript", "go",
+        "prometheus/prometheus；Dockerfile 只有 go mod download / go install，零 npm"),
+    "httpx-deterministic-cookie-store": (
+        "typescript", "python",
+        "encode/httpx；Dockerfile 是 pip install -r requirements.txt，测试跑 pytest"),
+    "koota-entity-snapshot-rollback": (
+        "python", "typescript",
+        "pmndrs/koota；Dockerfile 是 pnpm install + npm install，仓库本身是 TS，"
+        "另外 4 条 koota task 上游也都标 typescript"),
+}
+
+
+def apply_language_fixes(envs):
+    """把 LANGUAGE_FIXES 落到 task_id → language 映射上，顺带体检这张表本身。
+
+    这张表迟早会过期：上游哪天自己把 task.toml 修了，或者换了一批数据，表里的
+    条目就从「修正」变成了「反向的错误」。所以每条都拿原值先对一次账，对不上就
+    停下来让人看，绝不静默跳过 —— 静默跳过意味着几个月后没人知道这张表已失效，
+    而它恰恰是在悄悄地把对的改成错的。
+
+    返回 (lang_of, applied, stale)。
+    """
+    lang_of = {name: (e or {}).get("language", "?") for name, e in envs.items()}
+    applied, stale = [], []
+    for task_id, (was, now, why) in LANGUAGE_FIXES.items():
+        cur = lang_of.get(task_id)
+        if cur is None:
+            stale.append(f"{task_id}: 修正表里有这条，但 build_env.json 里没有这个 task"
+                         f"（数据换了？task_id 拼错了？）")
+        elif cur != was:
+            stale.append(f"{task_id}: 上游现在标的是 {cur!r}，修正表却以为原值是 {was!r}"
+                         f" —— 上游可能已自行修正，请人工核对后更新或删掉这条")
+        else:
+            lang_of[task_id] = now
+            applied.append((task_id, was, now, why))
+    return lang_of, applied, stale
 
 
 def load_replay_module():
@@ -71,6 +127,22 @@ def main():
     sels = json.loads((DEEPSWE / "TRAJECTORY_SELECTION.json").read_text())["selections"]
     want = {s.strip() for s in args.only.split(",") if s.strip()}
 
+    # 语言修正必须在 --only 过滤之前完成：过滤本身就是按语言做的，
+    # 先过滤再修正等于拿错的标签去挑条目，会漏掉/多带一整条 trial。
+    lang_of, fixes_applied, fixes_stale = apply_language_fixes(envs)
+    if fixes_stale:
+        print(f"❌ 语言修正表和数据对不上 {len(fixes_stale)} 条，已停止（需人工核对 "
+              f"LANGUAGE_FIXES）：")
+        for s in fixes_stale:
+            print("   ", s)
+        return 1
+    if fixes_applied:
+        print(f"⚠️  语言修正 {len(fixes_applied)} 条（上游 task.toml 保持原样，"
+              f"只改我们自己产出的 meta.json）：")
+        for task_id, was, now, why in fixes_applied:
+            print(f"    {task_id}  {was} → {now}（{why}）")
+        print()
+
     out = pathlib.Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
     base_src = pathlib.Path(args.baseline_from)
@@ -82,7 +154,9 @@ def main():
         if env is None:
             problems.append(f"{task_name}: build_env.json 里没有")
             continue
-        lang = env.get("language", "?")
+        # 只认 lang_of：它是 build_env.json 过了修正表之后的唯一口径，
+        # 下面的 --only 过滤、meta.json、统计分组全部用这一个值。
+        lang = lang_of.get(task_name, "?")
         if want and lang not in want:
             skipped.append((lang, trial_name))
             continue
@@ -159,14 +233,22 @@ def main():
             if not d0.is_dir() or not all((d0 / f).exists() for f in need):
                 continue
             m0 = json.loads((d0 / "meta.json").read_text())
-            if want and m0.get("language") not in want:
+            # 对照组的 meta.json 是更早一轮生成的、已经落盘的，语言字段同样来自
+            # 上游标注，所以也得过一遍修正表 —— 否则同一个 task 在两批里语言不一致。
+            lang0 = lang_of.get(m0.get("task_id"), m0.get("language", "?"))
+            if want and lang0 not in want:
                 continue
             if (out / d0.name).exists():
                 continue
             d = out / d0.name
             (d / "replay").mkdir(parents=True, exist_ok=True)
-            for f in ("meta.json", "trajectory.json", "model.patch"):
+            for f in ("trajectory.json", "model.patch"):
                 shutil.copy2(d0 / f, d / f)
+            if lang0 != m0.get("language"):
+                m0["language"] = lang0
+                (d / "meta.json").write_text(json.dumps(m0, ensure_ascii=False, indent=1))
+            else:
+                shutil.copy2(d0 / "meta.json", d / "meta.json")
             full0 = json.loads((d0 / "task.json").read_text())
             kept0 = [f for f in full0["files"] if f["path"] in KEEP_FILES]
             (d / "task.json").write_text(json.dumps(
@@ -175,7 +257,7 @@ def main():
             v0 = d0 / "replay" / "verdict.json"
             if v0.exists():
                 shutil.copy2(v0, d / "replay" / "verdict.json")
-            made.append((m0.get("language", "?"), d0.name, m0.get("n_commands") or 0,
+            made.append((lang0, d0.name, m0.get("n_commands") or 0,
                          (m0.get("image") or {}).get("docker_image")))
             n_ctrl += 1
 

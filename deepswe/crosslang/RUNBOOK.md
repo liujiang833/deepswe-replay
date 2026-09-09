@@ -532,12 +532,18 @@ bash make_bundle.sh --trials-dir full_trials     # → tar.gz
 
 | 语言 | trial 数 | 命令数 |
 |---|---|---|
-| typescript | 35 | 1620 |
-| python | 34 | 1387 |
-| go | 34 | 1039 |
+| go | 35 | 1075 |
+| python | 34 | 1381 |
+| typescript | 34 | 1590 |
 | rust | 5 | 316 |
 | javascript | 5 | 157 |
 | **合计** | **113** | **4519** |
+
+**语言归类做过修正**：上游 `task.toml` 有 3 个标错（`prometheus-transactional-reload-status`
+ts→go、`httpx-deterministic-cookie-store` ts→python、`koota-entity-snapshot-rollback`
+python→ts），`make_full_trials.py` 里有一张带证据的修正表，且**修正表自身会自校验**——
+上游若自行修了导致"原值"对不上，脚本直接报错退出而不是静默跳过。修正后的分布与
+2026-09-04 工具清单调研的独立推导一致。
 
 命令数是 **trace 里的总数**，含每条 trial 末尾那条哨兵（`replay.py` 的 `load_trace`
 标 `sentinel=True` 后跳过，原始运行里本来也没执行）。一条 trial 一条，
@@ -608,7 +614,7 @@ python 那种纯下载的增量极小，typescript 因为 `pnpm install` 把 dev
 这 5 条虽已不在包内，实测值依然是目前唯一的实测依据。按 ARM ×1.4 折算
 约 3.3 s/命令：
 
-- go + python + javascript（2583 条命令）≈ **2.5 小时**
+- go + python + javascript（2613 条命令）≈ **2.5 小时**
 - 全量 113 条（4519 条命令）≈ **4~4.5 小时**
 
 注意主导项不是语言而是 **trace 里有没有 `sleep` 轮询**——rust 那条墙钟最长但 CPU 只有

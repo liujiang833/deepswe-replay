@@ -25,7 +25,8 @@
 #   bash build_arm.sh -j 4 all              # 4 条并发；默认 1 = 逐条串行
 #   bash build_arm.sh --stall-timeout 900 rust      # 放宽「日志多久不动就放弃」
 #   bash build_arm.sh --stall-timeout 0 --build-timeout 3600 all  # 关停滞检测，只留总耗时上限
-#   （并发下每 60s 打一行心跳，含每条「距上次日志输出多久」；--heartbeat <秒> 可调）
+#   （每 60s 打一行心跳，串行/并发都打，含每条「距上次日志输出多久」——
+#     这个数字逼近 --stall-timeout 才要警觉，为 0 说明在正常输出；--heartbeat <秒> 可调）
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +41,10 @@ STALL_TIMEOUT=300
 # 单条总耗时上限，停滞检测之外的兜底。默认 0（关闭）—— 有些 rust task 光
 # cargo fetch 就要十几分钟，给死上限比停滞检测更容易误杀。
 BUILD_TIMEOUT=0
-HEARTBEAT=60                       # 并发模式下多久打一行进度（调小便于自测）
+# 多久打一行进度。**按墙钟固定间隔打，不是「静默到这个秒数才打」** —— 跑得好的
+# 构建也该有进度可看，而且那一行里的「距上次日志输出 0s」本身就是健康信号。
+# -j 1 与并发模式都打（调小便于自测）。
+HEARTBEAT=60
 # 代理默认继承环境变量；--proxy 可显式覆盖
 PROXY="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
 NOPROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"
@@ -155,11 +159,12 @@ done
 # 下限逐个不同，因为 0 的语义逐个不同：
 #   -j 0 没有意义（工作池要么空转、要么永不启动），所以下限是 1、不是 0；
 #   两个 timeout 的 0 就是「关掉这项检查」，是合法取值（回显里会写明已关闭）；
-#   心跳没有「关掉」的语义 —— 并发时它是唯一的进度来源，要少打就把间隔调大。
+#   心跳没有「关掉」的语义 —— 构建跑起来之后它是唯一的进度来源（串行并发都一样），
+#   要少打就把间隔调大。
 need_num --jobs "$JOBS" 1 "-j 0 等于不启动任何构建；串行请用 -j 1（默认值）"
 need_num --stall-timeout "$STALL_TIMEOUT" 0
 need_num --build-timeout "$BUILD_TIMEOUT" 0
-need_num --heartbeat "$HEARTBEAT" 1 "心跳不提供关闭：并发模式下它是唯一的进度反馈；想少打就调大，如 --heartbeat 300"
+need_num --heartbeat "$HEARTBEAT" 1 "心跳不提供关闭：构建跑起来后它是唯一的进度反馈；想少打就调大，如 --heartbeat 300"
 # GOMAXPROCS=0 在 go 里是「按 CPU 数」的意思，即等于没设；用户写 0 多半是笔误
 [ -n "$GOMAXPROCS" ] && need_num --gomaxprocs "$GOMAXPROCS" 1 "0 等于不限制，那就干脆别给这个参数"
 
@@ -447,7 +452,10 @@ NET_ARG=(); [ -n "$BUILD_NET" ] && NET_ARG=(--network "$BUILD_NET")
 WATCH_REASON=""; WATCH_IDLE=0
 # -j 1 的心跳。并发模式由主进程的 heartbeat() 负责，串行没人管 —— 而串行恰恰最需要：
 # 并发好歹每条完成时会打一行，串行卡住就是彻底静默到 --stall-timeout 触发为止。
-# 内容与并发版一致：已跑多久 / 距上次日志输出多久 / 阈值多少，让人眼看着它逼近阈值。
+# 内容与并发版一致：已跑多久 / 距上次日志输出多久 / 阈值多少。
+# 触发条件是**每 --heartbeat 秒一次**，与静不静默无关：一路在输出的构建同样每分钟
+# 打一行，只是那行显示「距上次日志输出 0s」—— 这个数字接近 --stall-timeout 才是要
+# 警觉的信号，为 0 反而说明一切正常。
 seq_beat() {
   local name="$1" el="$2" idle="$3"
   if [ "$STALL_TIMEOUT" -gt 0 ]; then
@@ -503,7 +511,9 @@ docker_build_watched() {
 # ---- 单条：生成 Dockerfile → 构建 → 自检 ---------------------------------
 # 抽成函数是为了 -j >1 时能把一整条丢进后台子进程。子进程改不了主进程的变量
 # （N_OK/N_FAIL/FAILED 放进 & 里就随进程一起没了），所以结果一律写
-# $work/.status，跑完由主进程统一聚合。格式：<ok|skip|fail|stall> <耗时秒> <MB>
+# $work/.status，跑完由主进程统一聚合。
+# 格式：<ok|skip|fail|stall|timeout> <耗时秒> <MB>；stall 与 timeout 都是「被我们
+# 终止」，但分开记 —— 后续处置一个调 --stall-timeout、一个调 --build-timeout。
 build_one() {
   local dir="$1" I="$2"
   local lang="${LANG_OF[$dir]}"
@@ -792,13 +802,17 @@ PY
     # 问题（改 Dockerfile 或换参数），停滞多是取包网络（换源、放宽阈值，或干脆跳过）。
     dt=$(( $(date +%s) - t0 ))
     if [ "$WATCH_REASON" = timeout ]; then
-      echo "  ⏳ 停滞  ${dt}s 触到 --build-timeout=${BUILD_TIMEOUT}s 上限，已终止（最后 ${WATCH_IDLE}s 无日志）—— 最后 15 行："
+      # 这里不能说「停滞」：终止原因是总耗时超上限，日志可能一直在正常输出。
+      # 措辞与并发模式的结束行、以及结尾汇总保持一致，免得引到 --stall-timeout 上去
+      echo "  ⏳ 超时  ${dt}s 触到 --build-timeout=${BUILD_TIMEOUT}s 上限，已终止（最后 ${WATCH_IDLE}s 无日志输出）—— 最后 15 行："
     else
       echo "  ⏳ 停滞  ${dt}s，其中最后 ${WATCH_IDLE}s 日志一个字都没动，已终止 —— 最后 15 行："
     fi
     tail -15 "$work/build.log" | sed 's/^/       /'
-    echo "     继续下一条（这一条多半是取包卡在网络上，见结尾汇总的处置建议）"
-    echo "stall $dt 0" >"$work/.status"
+    echo "     继续下一条（处置建议见结尾汇总 —— 两种终止原因的处置不一样）"
+    # 终止原因要一路带到汇总去：停滞该调 --stall-timeout，超上限该调 --build-timeout，
+    # 两者混成一类会让汇总给出答非所问的建议（实测踩过）
+    echo "$WATCH_REASON $dt 0" >"$work/.status"
   else
     dt=$(( $(date +%s) - t0 ))
     echo "  ❌ 失败  ${dt}s —— 最后 15 行："
@@ -810,7 +824,7 @@ PY
 
 # ---- 计数与聚合 ----------------------------------------------------------
 N_OK=0; N_FAIL=0; N_STALL=0; N_SKIP=0; I=0; T_ALL=$(date +%s)
-FAILED=(); STALLED=()
+FAILED=(); STALLED=(); TIMEDOUT=()
 # 三个都显式赋空值：set -u 下「declare -A 了但没赋过值」的数组，展开 ${#a[@]}
 # 会被判成未定义变量而直接退出
 declare -A RUN_DIR=() RUN_T0=() RUN_I=()   # worker pid → trial 目录 / 起始时间 / 序号
@@ -825,7 +839,10 @@ collect() {
   case "${C_ST:-}" in
     ok)    N_OK=$((N_OK+1)) ;;
     skip)  N_OK=$((N_OK+1)); N_SKIP=$((N_SKIP+1)) ;;
-    stall) N_STALL=$((N_STALL+1)); STALLED+=("$dir") ;;
+    # 两者都计进 N_STALL（汇总里是「被终止」一大类），但分别留名单：类内要按
+    # 原因分行给建议
+    stall)   N_STALL=$((N_STALL+1)); STALLED+=("$dir") ;;
+    timeout) N_STALL=$((N_STALL+1)); TIMEDOUT+=("$dir") ;;
     fail)  N_FAIL=$((N_FAIL+1)); FAILED+=("$dir") ;;
     # 没留下状态 = worker 自己被杀或异常退出。宁可多报也不能漏，算失败。
     *)     C_ST="fail"; N_FAIL=$((N_FAIL+1)); FAILED+=("$dir") ;;
@@ -878,11 +895,12 @@ tick_start() {
 }
 heartbeat() {
   local now p m; now=$(date +%s)
-  printf '  ⏱  在建 %d ／ 已完成 %d（成功 %d 失败 %d 停滞 %d）／ 共 %d\n' \
+  printf '  ⏱  在建 %d ／ 已完成 %d（成功 %d 失败 %d 被终止 %d）／ 共 %d\n' \
     "${#RUN_DIR[@]}" "$((N_OK + N_FAIL + N_STALL))" "$N_OK" "$N_FAIL" "$N_STALL" \
     "${#SELECTED[@]}"
   # 「距上次日志输出」就是停滞判据本身，按它倒序排：排最前的那条离被杀最近，
   # 用户能眼看着这个数字逼近阈值，而不是等 5 分钟后才知道发生了什么。
+  # （这一行每 --heartbeat 秒无条件打一次，不是「静默了才打」；数字小说明健康。）
   for p in "${!RUN_DIR[@]}"; do
     m=$(stat -c '%Y' "$OUT/${RUN_DIR[$p]}/build.log" 2>/dev/null)
     [ -n "$m" ] || m=${RUN_T0[$p]}
@@ -914,6 +932,9 @@ finish_one() {
     skip)  printf '[%d/%d] ⏭️  跳过  %s  镜像已存在\n' "$i" "$n" "$dir" ;;
     stall) printf '[%d/%d] ⏳ 停滞  %s  %ss 后被终止（日志停了 ≥%ss）—— 最后 6 行：\n' \
              "$i" "$n" "$dir" "$C_DT" "$STALL_TIMEOUT"
+           tail -6 "$OUT/$dir/build.log" 2>/dev/null | sed 's/^/       /' ;;
+    timeout) printf '[%d/%d] ⏳ 超时  %s  %ss，触到 --build-timeout=%ss 上限 —— 最后 6 行：\n' \
+             "$i" "$n" "$dir" "$C_DT" "$BUILD_TIMEOUT"
            tail -6 "$OUT/$dir/build.log" 2>/dev/null | sed 's/^/       /' ;;
     *)     printf '[%d/%d] ❌ 失败  %s  %ss —— 最后 6 行（完整日志 %s）：\n' \
              "$i" "$n" "$dir" "$C_DT" "$OUT/$dir/build.log"
@@ -961,7 +982,7 @@ if [ "$LIST" = 1 ]; then
 fi
 
 echo "=============================================================="
-echo " 成功 $N_OK（其中已存在跳过 $N_SKIP） / 失败 $N_FAIL / 停滞被杀 $N_STALL   总耗时 $(( $(date +%s) - T_ALL ))s"
+echo " 成功 $N_OK（其中已存在跳过 $N_SKIP） / 失败 $N_FAIL / 被终止 $N_STALL   总耗时 $(( $(date +%s) - T_ALL ))s"
 echo "=============================================================="
 if [ "$N_FAIL" -gt 0 ]; then
   echo
@@ -970,24 +991,40 @@ if [ "$N_FAIL" -gt 0 ]; then
   echo
   echo " 重试其中某一条：  bash build_arm.sh [同样的 --ca-cert/--proxy 参数] <trial 目录名前缀>"
 fi
+# 「被我们终止」是一大类，但**类内必须按原因分行**：两种终止的处置完全不同 ——
+# 日志停滞该调 --stall-timeout，超总耗时上限该调 --build-timeout。混在一起讲，
+# 就会出现「停滞检测明明关着，却建议你放宽 --stall-timeout」这种答非所问。
 if [ "$N_STALL" -gt 0 ]; then
   echo
-  echo " 停滞被杀的 $N_STALL 条（日志 ≥${STALL_TIMEOUT}s 没动就放弃；日志在 $OUT/<trial>/build.log）："
-  for d in "${STALLED[@]}"; do echo "   $d"; done
+  echo " 被我们主动终止的 $N_STALL 条（日志在 $OUT/<trial>/build.log）："
   echo
-  echo " 停滞与失败不是一回事，别一起重试：失败多半是配置/依赖问题，停滞多半是取包"
-  echo " 的网络问题（go mod / pnpm / pip 连上了但不出数据）。"
-  echo " 但先看一眼日志尾停在哪一步：若那一步本来就会长时间不出声（rust 的"
-  echo " cargo nextest --no-run、大包的本地编译），这是**误杀**，该调大阈值而不是原样重试。"
-  echo " 三条路："
-  # 重试命令直接把第一条的**完整** trial 目录名填进去：脚本按前缀匹配，截短了
-  # 会连带命中同前缀的邻居，多建几条不该建的
-  echo "   换源重试：  bash build_arm.sh --goproxy https://goproxy.cn,direct \\"
-  echo "                              --registry https://registry.npmmirror.com ${STALLED[0]}"
-  echo "   放宽阈值：  bash build_arm.sh --stall-timeout 900 ${STALLED[0]}"
-  [ "$N_STALL" -gt 1 ] && \
-    echo "               （其余 $((N_STALL-1)) 条同理，trial 名可以一次给多个）"
-  echo "   直接跳过：  python3 run_batch.py --skip-missing 会自动跳过没建好的镜像"
+  if [ ${#STALLED[@]} -gt 0 ]; then
+    echo " ── 日志停滞（${STALL_TIMEOUT}s 不增长）${#STALLED[@]} 条："
+    for d in "${STALLED[@]}"; do echo "      $d"; done
+    echo "    先看一眼日志尾停在哪一步：若那步本来就会长时间不出声（rust 的"
+    echo "    cargo nextest --no-run、大包的本地编译），这是**误杀**，该调大阈值而不是原样重试。"
+    echo "    否则多半是取包的网络问题（go mod / pnpm / pip 连上了但不出数据）。三条路："
+    # 重试命令填**完整** trial 目录名：脚本按前缀匹配，截短了会连带命中同前缀的邻居
+    echo "      换源重试：  bash build_arm.sh --goproxy https://goproxy.cn,direct \\"
+    echo "                                 --registry https://registry.npmmirror.com ${STALLED[0]}"
+    echo "      放宽阈值：  bash build_arm.sh --stall-timeout 900 ${STALLED[0]}"
+    echo "      直接跳过：  python3 run_batch.py --skip-missing 会自动跳过没建好的镜像"
+    [ ${#STALLED[@]} -gt 1 ] && \
+      echo "    （其余 $(( ${#STALLED[@]} - 1 )) 条同理，trial 名可以一次给多个）"
+  fi
+  if [ ${#TIMEDOUT[@]} -gt 0 ]; then
+    [ ${#STALLED[@]} -gt 0 ] && echo
+    echo " ── 超总耗时上限（--build-timeout=${BUILD_TIMEOUT}s）${#TIMEDOUT[@]} 条："
+    for d in "${TIMEDOUT[@]}"; do echo "      $d"; done
+    # 措辞只陈述「撞上了哪个上限」，不替构建断言「它一直在输出」—— 停滞检测被
+    # --stall-timeout 0 关掉时，一条静默的构建同样会撞到这里
+    echo "    这几条撞的是**单条总耗时上限**，不是日志停滞 —— 该动的是 --build-timeout，"
+    echo "    不是 --stall-timeout。要么把上限调大，要么干脆不给（默认就没有总耗时上限）："
+    echo "      调大上限：  bash build_arm.sh --build-timeout $((BUILD_TIMEOUT * 4)) ${TIMEDOUT[0]}"
+    echo "      不设上限：  bash build_arm.sh ${TIMEDOUT[0]}"
+    [ ${#TIMEDOUT[@]} -gt 1 ] && \
+      echo "    （其余 $(( ${#TIMEDOUT[@]} - 1 )) 条同理，trial 名可以一次给多个）"
+  fi
 fi
 if [ "$N_OK" -gt 0 ]; then
   echo

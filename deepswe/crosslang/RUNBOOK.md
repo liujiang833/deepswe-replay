@@ -1,53 +1,28 @@
-# 服务器重放操作手册
+# 服务器重放参考手册
 
-把 5 条已验证的 trial 在服务器上重跑一遍，用 `patch_identical` 确认环境等价。
+**操作步骤看 `README.md`，本文件是参考手册** —— 每个坑的成因、判据、绕法，
+以及各项数字是怎么测出来的。按需跳读，不用通读。
 
-## 0. 一分钟版
+| 你想知道 | 去 |
+|---|---|
+| 怎么一步步跑完 | **`README.md`** |
+| 前置条件的细节 | §2 |
+| 拉不到镜像怎么办（重建路线） | §2b |
+| 代理 / 证书 / 换源 | §2b 的三小节 |
+| 预检在检什么 | §3 |
+| 怎么跑、有哪些开关 | §4 |
+| 结果怎么读、什么算通过 | §5 |
+| 出错了 | §6 |
+| 全量集的构成与成本 | §7 |
 
-```bash
-tar xzf deepswe-replay-bundle-*.tar.gz && cd deepswe-replay-bundle
-bash preflight.sh                  # 环境预检，有 ❌ 先解决
-python3 run_batch.py --smoke 5     # 冒烟：每条只跑前 5 条命令，约 1 分钟
-python3 run_batch.py               # 正式跑，约 15 分钟
-```
+硬标准只有一条：**`patch_identical=true`**。其余数字都是参考，
+允许有出入的部分见 §5.2。
 
-结果落在 `runs/<UTC 时间戳>/`：`SUMMARY.md`（人看）、`summary.json`（机器读）、
-`logs/*.log`（逐条实时输出）、`<trial>/{verdict.json,commands.jsonl,replayed.patch}`。
-
-**唯一的通过标准是 5 条全部 `patch_identical=true`。** 其余数字都是参考。
-
-默认**不采 cgroup 性能指标**（打通阶段用不上，采集另有专门脚本负责 flame graph /
-topdown）。这也顺带去掉了「必须 cgroup v2 且宿主侧目录可读」这条硬约束——
-rootless docker、受限容器、cgroup v1 的机器都能跑。要采时加 `--metrics`。
+默认**不采 cgroup 性能指标**（打通阶段用不上）。这顺带去掉了「必须 cgroup v2 且
+宿主侧目录可读」这条硬约束——rootless docker、受限容器、cgroup v1 的机器都能跑。
+要采时加 `--metrics`。
 
 ---
-
-## 1. 这个 bundle 里有什么
-
-```
-deepswe-replay-bundle/
-├── replay.py          单条重放器（只用 python 标准库）
-├── run_batch.py       批量 driver：串行跑全部、与基线对比、出汇总
-├── preflight.sh       环境预检（真起容器验证每项能力）
-├── RUNBOOK.md         本文件
-├── INDEX.md           上一轮跨语言验证的完整分析（含 rc 不匹配逐条归因）
-├── SHA256SUMS         传输完整性校验
-└── <trial>/           5 条，每条含：
-    ├── meta.json          语言 / 模型 / 镜像 / base_commit / 资源规格
-    ├── trajectory.json    原始 trace（命令逐字记录）
-    ├── model.patch        agent 最终提交的 patch —— 保真度比对基准
-    ├── task.json          任务定义（replay.py 从里面读 task.toml）
-    └── replay/verdict.json  上一台机器的基线判定，供跨机对比
-```
-
-解包后先核对完整性：`sha256sum -c SHA256SUMS`
-
-> **bundle 必须在开发机上打好再拷过去，不能在服务器上 clone 仓库重打。**
-> `trajectory.json` 与 `model.patch` 体量大且可复现，被 `.gitignore` 排除在版本库之外
-> （见仓库 `.gitignore` 的 `deepswe/crosslang/*/trajectory.json` 等规则），
-> 新 clone 出来的仓库里没有这两个文件。真丢了可以用
-> `deepswe/fetch_trial_artifacts.py <trial_name>` 按 `release.json` 里的 URL 模板从
-> CloudFront 重下（公开可取、无鉴权）。
 
 ## 2. 前置条件
 
@@ -359,11 +334,15 @@ bash preflight.sh
 ## 4. 跑
 
 ```bash
-python3 run_batch.py --smoke 5      # 冒烟：确认容器能起、cgroup 能读、命令能跑
-python3 run_batch.py                # 正式
-python3 run_batch.py --only go,rust # 只跑指定语言
-python3 run_batch.py --dry-run      # 只预检和排程
+python3 run_batch.py --smoke 5 --skip-missing      # 冒烟：确认容器能起、命令能跑
+python3 run_batch.py --skip-missing --keep-going   # 正式
+python3 run_batch.py --only go,rust                # 只跑指定语言
+python3 run_batch.py --dry-run                     # 只预检和排程
 ```
+
+**全量集下 `--skip-missing` 基本是必须的**：113 个镜像不可能一次建齐，不加它
+只要有一个镜像缺失整批就拒绝启动。另外它也是目前「只跑哪几条」的唯一办法——
+`--only` 只认语言、不认 trial 名，所以做法是**只建那几条的镜像**再靠它跳过其余。
 
 **串行是刻意的**：`replay.py` 采的是 cgroup 的 CPU/内存/IO，两条同时跑会互相争抢，
 性能数字直接失去可比性。上一轮就因为中途并发，rust/ts/js 三条指标偏悲观、
@@ -372,7 +351,8 @@ python3 run_batch.py --dry-run      # 只预检和排程
 **冒烟模式不校验保真度**：只跑前 N 条命令，patch 天然不完整，`--smoke` 下汇总表的
 「保真」列显示 `—(冒烟)`，不代表通过。
 
-跑起来大约需要（基线机器，2 核限额下）：
+下表是**那 5 条对照组**在基线机器（2 核限额）上的实测。**本版包里已经没有这 5 条**，
+列在这里只作单位成本参考——全量 113 条的估算见 §7.3。
 
 | 语言 | 命令数 | 基线耗时 |
 |---|---:|---:|
@@ -389,8 +369,12 @@ python3 run_batch.py --dry-run      # 只预检和排程
 
 容器内 `git diff --binary <base_commit> HEAD` 与随包的 `model.patch` **逐字节相等**。
 
-5 条应当全为 `true`。**有一条 false 就说明环境与原始运行不等价，性能数字全部作废**，
+113 条应当全为 `true`。**有一条 false 就说明环境与原始运行不等价，性能数字全部作废**，
 先查那一条的 `logs/<trial>.log`。
+
+⚠️ 但注意：这批镜像是 `build_arm.sh` 在服务器上重建的，不是原 amd64 镜像
+（见 §2b 末尾）。`patch_identical` 在重建镜像上失败，**不一定是重放流程坏了**，
+也可能是依赖漂移或架构差异。判断前先读该条的 `build/<trial>/REWRITES.md`。
 
 ### 5.2 允许有出入的：`rc_match`
 

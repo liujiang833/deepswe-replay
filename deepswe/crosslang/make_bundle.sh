@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 打一个自包含的 tarball，scp 到服务器解开就能跑。
+# 打一个自包含的 tarball，scp 到服务器解开就能跑。入口是包里的 README.md。
 #
 # 默认精简：只带重放真正需要的输入（trajectory / model.patch / task.json / meta.json）
 # 加上基线判定（replay/verdict.json）用于跨机对比。agent 原始日志与 verifier 输出
@@ -34,7 +34,7 @@ mkdir -p "$ROOT"
 
 # 顶层：脚本与手册。replay.py 从上一层复制进来，bundle 从此自包含。
 cp "$REPLAY" "$ROOT/"
-for f in run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh RUNBOOK.md INDEX.md release.json; do
+for f in run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh README.md RUNBOOK.md INDEX.md release.json; do
   [ -f "$HERE/$f" ] && cp "$HERE/$f" "$ROOT/"
 done
 

@@ -5,11 +5,30 @@
 # rootless docker / podman 兼容层 / gVisor / 嵌套容器下都可能"看着有、用起来没有"。
 # 本脚本会真起容器、真读 cgroup、真建 sidecar，失败就当场报出来。
 #
-# 用法：  bash preflight.sh            # 用 bundle 里第一个镜像做活体测试
+# ⚠️ 先建镜像再跑本脚本：活体测试要真起一个容器，手里一个镜像都没有时整段会跳过，
+#    等于什么都没验到。包里不带镜像，所以顺序是 build_arm.sh → preflight.sh。
+#
+# 用法：  bash preflight.sh            # 用 bundle 里第一个已建好的镜像做活体测试
 #         bash preflight.sh <镜像>     # 指定镜像
+#         bash preflight.sh --metrics  # 连 cgroup 性能指标一起验（默认不验）
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --metrics 与 run_batch.py 的 need_cgroup 门控是同一个口径：只跑重放 + 保真校验
+# 时压根不碰 cgroup，所以默认就不该因为 cgroup 读不到而把预检判失败——rootless
+# docker / cgroup v1 / 嵌套容器的机器跑重放没问题，不能被挡在门外。
+METRICS=0
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --metrics) METRICS=1; shift ;;
+    -h|--help) echo "用法: bash preflight.sh [--metrics] [<镜像>]"; exit 0 ;;
+    -*) echo "未知参数: $1（本脚本只有 --metrics）"; exit 1 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
 PASS=0; FAIL=0; WARN=0
 ok()   { echo "  ✅ $*"; PASS=$((PASS+1)); }
 bad()  { echo "  ❌ $*"; FAIL=$((FAIL+1)); }
@@ -37,31 +56,40 @@ fi
 # 重放会在 /app 里编译、往 /tmp 写产物；镜像本身也要落盘
 AVAIL=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
 if [ -n "$AVAIL" ]; then
-  if [ "$AVAIL" -lt 20 ]; then bad "根分区可用 ${AVAIL}GB —— 5 个镜像约 4-5GB，重放还要写 /tmp，建议 ≥20GB"
-  elif [ "$AVAIL" -lt 50 ]; then warn "根分区可用 ${AVAIL}GB，够跑这 5 条，但扩到全量 113 个镜像（去重后 24GB）会不够"
+  if [ "$AVAIL" -lt 20 ]; then bad "根分区可用 ${AVAIL}GB —— 光基座就约 5GB，加几条 task 镜像和 /tmp 产物就满，建议 ≥20GB"
+  elif [ "$AVAIL" -lt 50 ]; then warn "根分区可用 ${AVAIL}GB，够先建一批边建边跑，但全量 113 个镜像（共享基座后约 25~35GB）会不够"
   else ok "根分区可用 ${AVAIL}GB"; fi
 fi
 
 # ── 2. cgroup ──────────────────────────────────────────────────
 hdr "2. cgroup（性能指标的唯一来源）"
 FSTYPE=$(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo 未知)
-if [ "$FSTYPE" = "cgroup2fs" ]; then
-  ok "/sys/fs/cgroup 是 cgroup2fs（v2 统一层级）"
+if [ "$METRICS" = 0 ]; then
+  # 不采指标就不碰 cgroup，所以这里连查都不查——查了也只能是噪声，
+  # 更不该判失败。要采指标时加 --metrics，下面那套硬校验才会回来。
+  echo "  /sys/fs/cgroup   $FSTYPE"
+  echo "  ·  未加 --metrics → 本轮不采性能指标，整节跳过判定"
+  echo "     （口径与 run_batch.py 一致：cgroup v2 只在 --metrics 下才是硬要求，"
+  echo "       rootless docker / cgroup v1 的机器照样能跑重放与保真校验）"
 else
-  bad "/sys/fs/cgroup 是 $FSTYPE，不是 cgroup2fs —— cpu.stat/memory.current 口径只适用 v2"
+  if [ "$FSTYPE" = "cgroup2fs" ]; then
+    ok "/sys/fs/cgroup 是 cgroup2fs（v2 统一层级）"
+  else
+    bad "/sys/fs/cgroup 是 $FSTYPE，不是 cgroup2fs —— cpu.stat/memory.current 口径只适用 v2"
+  fi
+  if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+    echo "  可用控制器  $(cat /sys/fs/cgroup/cgroup.controllers)"
+    for c in cpu memory io; do
+      grep -qw "$c" /sys/fs/cgroup/cgroup.controllers \
+        && ok "$c 控制器已启用" \
+        || { [ "$c" = io ] && warn "io 控制器未启用 → rbytes/wbytes 记 0（不影响保真度结论）" \
+                          || bad "$c 控制器未启用 → 对应指标采不到"; }
+    done
+  fi
+  [ -e /sys/fs/cgroup/memory.peak ] \
+    && ok "内核有 memory.peak（6.8+）" \
+    || echo "  ·  无 memory.peak（<6.8 内核）→ 用 20ms 轮询 memory.current，与基线口径一致"
 fi
-if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
-  echo "  可用控制器  $(cat /sys/fs/cgroup/cgroup.controllers)"
-  for c in cpu memory io; do
-    grep -qw "$c" /sys/fs/cgroup/cgroup.controllers \
-      && ok "$c 控制器已启用" \
-      || { [ "$c" = io ] && warn "io 控制器未启用 → rbytes/wbytes 记 0（不影响保真度结论）" \
-                        || bad "$c 控制器未启用 → 对应指标采不到"; }
-  done
-fi
-[ -e /sys/fs/cgroup/memory.peak ] \
-  && ok "内核有 memory.peak（6.8+）" \
-  || echo "  ·  无 memory.peak（<6.8 内核）→ 用 20ms 轮询 memory.current，与基线口径一致"
 
 # ── 3. docker ──────────────────────────────────────────────────
 hdr "3. docker"
@@ -107,7 +135,7 @@ PY
 if [ -z "$IMAGES" ]; then
   bad "没找到任何 trial（本脚本应放在含 <trial>/meta.json 的目录里）"
 else
-  N_IMG=0; N_HIT=0
+  N_IMG=0; N_HIT=0; MISS=()
   while IFS=$'\t' read -r lang name img; do
     [ -z "$img" ] && continue
     N_IMG=$((N_IMG+1))
@@ -116,10 +144,26 @@ else
       ok "$(printf '%-12s' "[$lang]")已就位（$((SZ/1024/1024)) MB）"
       N_HIT=$((N_HIT+1)); FIRST_IMG="${FIRST_IMG:-$img}"
     else
-      bad "$(printf '%-12s' "[$lang]")缺失: $img"
+      # 缺镜像不判失败：113 个镜像不可能一次建齐，**边建边跑是设计上的正常流程**
+      # （run_batch.py 的 --skip-missing 就是为它准备的）。判失败的话新机器上
+      # 113 个全缺 → 预检必然 exit 1，反而把它真正的价值（活体测试）挡在门外。
+      MISS+=("[$lang] $img")
     fi
   done <<< "$IMAGES"
   echo "  → $N_HIT/$N_IMG 个镜像就位"
+  if [ "${#MISS[@]}" -gt 0 ]; then
+    # 只列前 5 条：全量集下缺几十上百个是常态，全打出来会把真正的问题冲没
+    warn "还缺 ${#MISS[@]} 个镜像 —— 不算失败，用 build_arm.sh 建、run_batch.py --skip-missing 跳过没建好的"
+    printf '       %s\n' "${MISS[@]:0:5}"
+    [ "${#MISS[@]}" -gt 5 ] && echo "       …… 另有 $(( ${#MISS[@]} - 5 )) 个"
+  fi
+  if [ "$N_HIT" = 0 ]; then
+    echo
+    echo "  ⛔ 一个镜像都没有 —— 下面的活体测试会整段跳过，等于什么都没验到。"
+    echo "     先建至少一条再回来跑预检：  bash build_arm.sh python"
+    echo "     （预检必须在有镜像之后跑，这是它与 check_sources.sh 的分工："
+    echo "       建之前探包源用 check_sources.sh，建之后验能力用本脚本）"
+  fi
 fi
 
 # ── 5. 活体测试 ────────────────────────────────────────────────
@@ -136,40 +180,45 @@ else
        --network=none "$IMG" sleep 120 >/dev/null 2>&1; then
     ok "容器可启动（--cpus=2 --memory=8192m --network=none）"
 
-    CID=$(docker inspect -f '{{.Id}}' "$C")
-    PID=$(docker inspect -f '{{.State.Pid}}' "$C")
-    # 与 replay.py 同一套三级探测
-    CGDIR=""
-    # 与 replay.py 同一套三级探测，含同一条防假阳性的复核：
-    # /proc 读到的路径必须能认出容器 ID，否则就是别人的 cgroup。
-    # （WSL 实测过：.State.Pid 在宿主 /proc 里对上了另一个进程，读出 init.scope）
-    if [ -n "$PID" ] && [ -r "/proc/$PID/cgroup" ]; then
-      REL=$(sed -n 's/^0:://p' "/proc/$PID/cgroup" | head -1)
-      case "$REL" in
-        *"${CID:0:12}"*) [ -e "/sys/fs/cgroup${REL}/cpu.stat" ] \
-            && CGDIR="/sys/fs/cgroup${REL}" && HOW="/proc/<pid>/cgroup" ;;
-      esac
-    fi
-    if [ -z "$CGDIR" ]; then
-      for c in "/sys/fs/cgroup/docker/$CID" \
-               "/sys/fs/cgroup/system.slice/docker-$CID.scope" \
-               "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/user.slice/docker-$CID.scope"; do
-        [ -e "$c/cpu.stat" ] && CGDIR="$c" && HOW="已知 driver 候选路径" && break
-      done
-    fi
-    if [ -z "$CGDIR" ]; then
-      CGDIR=$(find /sys/fs/cgroup -maxdepth 6 -type d -name "*$CID*" -print -quit 2>/dev/null)
-      [ -n "$CGDIR" ] && HOW="cgroup 树搜索"
-    fi
-    if [ -n "$CGDIR" ] && [ -r "$CGDIR/cpu.stat" ]; then
-      ok "cgroup 可读：$CGDIR"
-      echo "     （探测方式：$HOW）"
-      grep -q usage_usec "$CGDIR/cpu.stat" && ok "cpu.stat 有 usage_usec" || bad "cpu.stat 缺 usage_usec"
-      [ -r "$CGDIR/memory.current" ] && ok "memory.current 可读" || bad "memory.current 不可读"
-      [ -r "$CGDIR/io.stat" ] && ok "io.stat 可读" || warn "io.stat 不可读 → rbytes/wbytes 记 0"
+    if [ "$METRICS" = 0 ]; then
+      # 同上：不采指标就不需要宿主侧能读到容器 cgroup，探它只会制造假警报
+      echo "  ·  未加 --metrics → 跳过容器 cgroup 目录探测（重放本身不读它）"
     else
-      bad "找不到容器 cgroup 目录 —— 性能指标会采不到（replay.py 会明确报错退出，不会静默写 0）"
-    fi
+      CID=$(docker inspect -f '{{.Id}}' "$C")
+      PID=$(docker inspect -f '{{.State.Pid}}' "$C")
+      # 与 replay.py 同一套三级探测
+      CGDIR=""
+      # 与 replay.py 同一套三级探测，含同一条防假阳性的复核：
+      # /proc 读到的路径必须能认出容器 ID，否则就是别人的 cgroup。
+      # （WSL 实测过：.State.Pid 在宿主 /proc 里对上了另一个进程，读出 init.scope）
+      if [ -n "$PID" ] && [ -r "/proc/$PID/cgroup" ]; then
+        REL=$(sed -n 's/^0:://p' "/proc/$PID/cgroup" | head -1)
+        case "$REL" in
+          *"${CID:0:12}"*) [ -e "/sys/fs/cgroup${REL}/cpu.stat" ] \
+              && CGDIR="/sys/fs/cgroup${REL}" && HOW="/proc/<pid>/cgroup" ;;
+        esac
+      fi
+      if [ -z "$CGDIR" ]; then
+        for c in "/sys/fs/cgroup/docker/$CID" \
+                 "/sys/fs/cgroup/system.slice/docker-$CID.scope" \
+                 "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/user.slice/docker-$CID.scope"; do
+          [ -e "$c/cpu.stat" ] && CGDIR="$c" && HOW="已知 driver 候选路径" && break
+        done
+      fi
+      if [ -z "$CGDIR" ]; then
+        CGDIR=$(find /sys/fs/cgroup -maxdepth 6 -type d -name "*$CID*" -print -quit 2>/dev/null)
+        [ -n "$CGDIR" ] && HOW="cgroup 树搜索"
+      fi
+      if [ -n "$CGDIR" ] && [ -r "$CGDIR/cpu.stat" ]; then
+        ok "cgroup 可读：$CGDIR"
+        echo "     （探测方式：$HOW）"
+        grep -q usage_usec "$CGDIR/cpu.stat" && ok "cpu.stat 有 usage_usec" || bad "cpu.stat 缺 usage_usec"
+        [ -r "$CGDIR/memory.current" ] && ok "memory.current 可读" || bad "memory.current 不可读"
+        [ -r "$CGDIR/io.stat" ] && ok "io.stat 可读" || warn "io.stat 不可读 → rbytes/wbytes 记 0"
+      else
+        bad "找不到容器 cgroup 目录 —— 性能指标会采不到（replay.py 会明确报错退出，不会静默写 0）"
+      fi
+    fi   # /--metrics
 
     # 资源限额是否真生效（不生效则跨机数字不可比）
     QUOTA=$(docker exec "$C" cat /sys/fs/cgroup/cpu.max 2>/dev/null)
@@ -232,6 +281,9 @@ if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 [ "$WARN" -gt 0 ] && echo " ⚠️  有警告，可以跑，但请确认警告不影响你要的结论。"
-echo " ✅ 可以开跑：  python3 run_batch.py"
-echo "    先冒烟：    python3 run_batch.py --smoke 5"
+# 一律带 --skip-missing：边建边跑时镜像本来就没齐，不加它 run_batch.py 会整批
+# 拒绝启动——这段是要被照抄的，不能给一条抄了就失败的命令。
+echo " ✅ 可以开跑：  python3 run_batch.py --skip-missing --keep-going"
+echo "    先冒烟：    python3 run_batch.py --smoke 5 --skip-missing"
+echo "    （--skip-missing：镜像还没建好的自动跳过，而不是整批拒绝启动）"
 exit 0

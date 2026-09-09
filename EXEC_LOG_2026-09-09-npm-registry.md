@@ -191,7 +191,59 @@ done
 - 已修：`--registry` 原本漏在脚本用法头注释里
 
 ### Step 5: 提交 + 打包
+- **Status:** success
+- **Result location:** commit `4f2451e`；`deepswe-replay-bundle-20260909.tar.gz`
+
+### Step 6: 给 bundle 加 README（入口文档）
+- **Status:** success（待独立验证）
+- **Result location:** `deepswe/crosslang/README.md`（237 行），commit `d9cebba`
+
+**动手时发现的真问题**：包里原本没有入口文件，解开后第一眼读到的是 `RUNBOOK.md`，
+而它的 §0/§1 还是按上一版**5 条**那个 bundle 写的：
+
+- 「把 5 条已验证的 trial 在服务器上重跑一遍」
+- 「`python3 run_batch.py` 正式跑，约 15 分钟」
+- 「唯一的通过标准是 5 条全部 `patch_identical=true`」
+- 文件树里写 `<trial>/ 5 条`、`replay/verdict.json 上一台机器的基线判定`
+
+这四条在 113 条这版**全都不成立**，而且恰好是任何人打开包最先读到的两节。
+
+**处置**：
+- 新建 `README.md` 作为**操作说明本身**（用户明确要求：README 指导如何使用 bundle，
+  其余文档都是辅助）。结构是一条完整路径：前置条件 → 解包核对 → 预检 → 建镜像 →
+  重放 → 读结果；外加选择性构建语法、规模与预算表、三个必须先知道的坑
+  （无基线 / 重建镜像≠原镜像 / `--registry` 实测更慢）、故障速查表、文件清单
+- `RUNBOOK.md` 删掉与 README 重复且过时的 §0/§1（51 行 → 26 行），换成
+  「你想知道什么去第几节」的路标表；§2~§7 排查内容原样保留
+- 又修掉 RUNBOOK 其余三处按 5 条写的地方：§5.1「5 条应当全为 true」→ 113 条
+  并补「重建镜像下 `patch_identical` 失败不一定是流程坏了」；
+  §4 命令示例补 `--skip-missing` 并说明它是目前「只跑哪几条」的唯一办法；
+  §4 耗时表标注清楚是**已不在包内**的 5 条对照组的实测
+- `make_bundle.sh` 的文件清单加 `README.md`
+
+**顺带确认的一个能力缺口**（用户问「能不能指定跑哪几个」）：
+
+| 脚本 | 阶段 | 选择粒度 |
+|---|---|---|
+| `make_full_trials.py` | 装配 | 只能按语言 `--only` |
+| `build_arm.sh` | 建镜像 | **语言 / trial 目录名前缀 / all，可并列多个**（`build_arm.sh:88-97`）|
+| `run_batch.py` | 重放 | **只能按语言**（`run_batch.py:123,147-149`）|
+
+即构建端能精确到单条，重放端不能。当前只能靠「只建哪几条镜像」+ `--skip-missing`
+间接实现，或直接调 `replay.py` 跑单条。**给 `run_batch.py` 加同款前缀匹配尚未做。**
+
+### Step 7: 独立验证 README
 - **Status:** in_progress
+- **Result location:** 独立 agent，从 tarball 解包后逐条核对命令 / 数字 / § 引用
+
+## 未做的待办（已向用户提出，未获选择）
+
+1. **pnpm store 的 BuildKit cache mount** —— 省的是请求本身，不管瓶颈在 RTT
+   还是在代理都有效；35 条 typescript 里 koota×4 / obsidian-linter×3 / happy-dom×2 /
+   dynamodb-toolbox×2 同仓库。按本轮实测，**大概率比换源有用得多**
+2. **`docker build` 加超时** —— `build_arm.sh` 的 `docker build` 无超时，
+   113 个镜像通宵跑，一条挂死整批停摆
+3. **给 `run_batch.py` 加 trial 前缀匹配** —— 与 `build_arm.sh` 的选择语法统一
 
 ### Step 4: 打包（113 条）
 - **Status:** in_progress

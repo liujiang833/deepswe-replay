@@ -31,12 +31,14 @@
 | docker | 能起容器，当前用户有权限 | 直接跑不了 |
 | cgroup v2 | 仅 `--metrics` 时需要 | 不采指标就完全不碰 cgroup；采时缺它 `replay.py` 明确报错退出，不会静默写 0 |
 | python3 | ≥3.8，标准库即可 | 跑不了 |
-| 5 个镜像 | 已 `docker pull` 到本地 | `replay.py` 拒绝启动（默认不允许现拉，见下） |
+| 113 个镜像 | 本轮 ECR 拉不到，走 `build_arm.sh` 从本地基座**重建**（见 §2b 路 C） | 缺的那条跑不了；不加 `--skip-missing` 时整批拒绝启动 |
 | 磁盘 | ≥20 GB | 重放中途写满 |
 
-镜像**必须预先拉好**。`replay.py` 默认拒绝在镜像缺失时启动，因为实测出口吞吐只有
-**0.27 MB/s**，误触一个 ~800 MB 的镜像就是几十分钟。`preflight.sh` 和
-`run_batch.py --dry-run` 都会把缺失的镜像连同 `docker pull` 命令一起列出来。
+镜像**必须预先备好**——本轮是用 `build_arm.sh` 重建的，不是 `docker pull`（ECR 拉不到，
+见 §2b）。`replay.py` 默认拒绝在镜像缺失时启动，因为实测出口吞吐只有 **0.27 MB/s**，
+误触一个 ~800 MB 的镜像就是几十分钟。113 个镜像不可能一次建齐，所以批量跑一律带
+`run_batch.py --skip-missing`（缺的自动跳过而不是整批拒绝启动）；`preflight.sh` 和
+`run_batch.py --dry-run` 都会把还缺哪些列出来。
 
 ## 2b. 拉不到 registry 时(ECR / DockerHub 不通)
 
@@ -46,7 +48,7 @@
 | 路 | 前提 | 代价 |
 |---|---|---|
 | A. `docker pull` | 能连 ECR | — |
-| B. `docker save` \| zstd → 搬文件 → `docker load` | 能物理搬文件 | 5 个镜像共享基座,一次性打包约 690 MB(zstd);**分 5 次打会重复传 4 遍基座,涨到约 2.4 GB** |
+| B. `docker save` \| zstd → 搬文件 → `docker load` | 能物理搬文件 | 所有镜像共享同一个基座,所以**必须把要搬的 tag 一次性 `docker save`**——分批打会把基座重复传 N 遍。上一轮 5 个镜像实测:一次打 690 MB(zstd),分 5 次打涨到约 2.4 GB。113 个的体量没实测过 |
 | C. 从本地 mars-base 重建 | 能连各包源(npm/pypi/goproxy/crates) | 见 `build_arm.sh` |
 
 ### 路 C:重建(`check_sources.sh` + `build_arm.sh`)
@@ -62,9 +64,13 @@ bash build_arm.sh all          # 全建(自动按 python→go→js→ts→rust �
 **零 COPY / 零 ADD**,构建上下文可以是空目录;建完打上 `task.toml` 里原本的
 `docker_image` tag,所以 `replay.py` 零改动。
 
-各条需要的源:
+各条需要的源。⚠️ **下表只是 5 个例子,不是全集**——它是上一轮那 5 条对照组的样子,
+留在这里是为了说明「不同语言的依赖面差多少」。全量 113 条的上游主机集合更大:
+除了下面这些,还有 `deb.debian.org`(装系统包的 5 条)、`deb.nodesource.com` 与
+`repo.mongodb.org` / `www.mongodb.org`(eicrud 那条)、`jsr.io` 与 github 的 release
+下载域(cliffy 那条)。**以实际探测为准:`check_sources.sh` 已经把这些全打一遍。**
 
-| task | 需要 |
+| task(示例) | 需要 |
 |---|---|
 | python (returns) | github + pypi ← 依赖最少,且**唯一不需要装报告器**的 |
 | go (actionlint) | github + proxy.golang.org + sum.golang.org |
@@ -72,9 +78,16 @@ bash build_arm.sh all          # 全建(自动按 python→go→js→ts→rust �
 | ts (true-myth) | github + npmjs(`pnpm install`,**未锁定**) |
 | rust (fd) | github + crates.io + get.nexte.st + npmjs ← 最难,最后建 |
 
-**ARM 上的一处硬改写**:`fd` 的 Dockerfile 写死 `get.nexte.st/${VER}/linux`,
-那是 x86_64 产物。`build_arm.sh` 在基座是 arm64 时自动改成 `/linux-arm`。
-(实测确认:`/linux` 8.2 MB、`/linux-arm` 6.7 MB 都存在,`/linux-arm64` 是 404。)
+**ARM 上的两处硬改写**,`build_arm.sh` 在基座是 arm64 时自动做掉:
+
+1. **cargo-nextest**——**5 条 rust 全部**(boa / fd / oxvg / pest / wasmi)的 Dockerfile
+   都写死 `get.nexte.st/${VER}/linux`,那是 x86_64 产物,自动改成 `/linux-arm`。
+   (实测确认:`/linux` 8.2 MB、`/linux-arm` 6.7 MB 都存在,`/linux-arm64` 是 404。)
+2. **deno**——`cliffy` 那条写死
+   `.../deno/releases/download/v2.0.0/deno-x86_64-unknown-linux-gnu.zip`,
+   自动改成 `deno-aarch64-...`(2026-09-09 实测该资产在 v2.0.0 存在,HTTP 206)。
+   这条尤其要紧:装错架构的 deno **不会在下载时报错**,要拖到紧接着的
+   `RUN deno cache` 才 `exec format error`,不知道的话很难认。
 
 ### 代理:构建期要,运行期绝不能有
 
@@ -296,9 +309,13 @@ corepack 那条不是细节:`ofetch` / `query` / `valibot` 三条 task 用 corep
 - 换架构后工具链、native 扩展、编译产物全部不同
 - 基座本身是 `:latest`,不可复现
 
-→ 曾经是开放问题。**2026-09-07 已实测回答:成立。**
+→ **对本轮这 113 条,它仍然是开放问题。**
 
-| | 本次(ARM 重建 + qemu 模拟) | 基线(amd64 原镜像) |
+2026-09-07 做过一次实测,但**覆盖面只有另外 5 条**:上一轮跨语言验证的对照组
+(returns / actionlint / yjs / true-myth / fd),条件是**基座 arm64 重建 + qemu 模拟执行**。
+在那 5 条上、那个条件下,结论是**成立**的。下表是其中 python(returns)那条的数字:
+
+| | 那次(ARM 重建 + qemu 模拟) | 基线(amd64 原镜像) |
 |---|---|---|
 | `patch_identical` | **✅ 63,009B 逐字节一致** | ✅ 63,009B |
 | `rc_match` | 91/98(语义 93/98) | 95/98(语义 97/98) |
@@ -308,28 +325,46 @@ rc 少 4 条**全部是超时类**:7 条不匹配里 6 条是 `pytest` 撞 30s �
 边界命令被多砍几条),剩 1 条是 hypothesis 的随机性。这正是 §5.2「单侧超时(机器快慢)」
 那一类,与镜像重建无关。
 
-**而且这是在比原生 ARM 更不利的条件下成立的**——qemu 模拟更慢、超时更多,被砍的命令
+**那次还是在比原生 ARM 更不利的条件下成立的**——qemu 模拟更慢、超时更多,被砍的命令
 依然都不改文件,所以 patch 没受影响。真机上只会更稳。
 
+**但这结论外推不到本轮的 113 条**:换了 task、换了仓库、换了依赖树,
+`pnpm install` 未锁版本这类漂移会不会咬人是**逐条**的事,5 条通过不代表 113 条通过
+(两批 trial 连模型和 `model.patch` 都不是同一批,见 §7.1)。所以 `build_arm.sh`
+(脚本头、每条 `REWRITES.md`、构建结束提示)和 `README.md` 一律按「待验证的开放问题」
+措辞——那是对的,**本轮跑出来的 113 个 `patch_identical` 正是在回答这个问题**。
+
 它失败时仍按老办法排查:先分清是重放流程坏了,还是镜像本身不一样——
-`build/<lang>/REWRITES.md` 记着每条改写,是起点。
+`build/<trial>/REWRITES.md` 记着每条改写,是起点(目录名是 **trial 目录名**,
+不是语言名:同一种语言有几十条,各有各的改写清单)。
 
 ## 3. 预检
 
 ```bash
-bash preflight.sh
+bash preflight.sh                # 默认口径
+bash preflight.sh --metrics      # 要采性能指标时才加
+bash preflight.sh <镜像>         # 指定拿哪个镜像做活体测试
 ```
 
-它不只查版本号，而是**真起一个容器**把 `replay.py` 依赖的每项能力跑一遍：
+**必须先有镜像再跑它**——它不只查版本号，而是**真起一个容器**把 `replay.py` 依赖的
+每项能力跑一遍。包里不带镜像，手里一个都没有时这段整体跳过，那次预检等于什么都没验，
+所以顺序是 `build_arm.sh` → `preflight.sh`（`README.md` 的主流程图就是这个顺序）。
 
-- cgroup v2 挂载、cpu/memory/io 控制器是否启用
-- 容器 cgroup 目录能否定位（三级探测，见 §6.1）并读出 `cpu.stat`
+默认查：
+
 - `--cpus=2 --memory=8192m` 是否真的生效（不生效跨机数字不可比）
 - 镜像内有没有 `timeout` / `python3` / `git` / `sh`，`/app` 是不是 git 仓库
 - `--network=container:` 共享 netns 能否用（403 sinkhole 的实现基础）
 - `--network=none` 是否真的断网
 
-有 ❌ 就先解决。⚠️ 可以跑，但要确认不影响你要的结论。
+加 `--metrics` 才查（与 `run_batch.py` 的 `need_cgroup` 是同一个门控，不采指标就
+根本不碰 cgroup，所以默认连查都不查，更不会因此判失败）：
+
+- cgroup v2 挂载、cpu/memory/io 控制器是否启用
+- 容器 cgroup 目录能否定位（三级探测，见 §6.1）并读出 `cpu.stat`
+
+有 ❌ 就先解决。⚠️ 可以跑，但要确认不影响你要的结论。**镜像缺失只记 ⚠️ 不记 ❌**：
+边建边跑是设计好的流程（见 §7.2），不该因为 113 个没建齐就让预检 `exit 1`。
 
 ## 4. 跑
 
@@ -504,6 +539,10 @@ bash make_bundle.sh --trials-dir full_trials     # → tar.gz
 | javascript | 5 | 157 |
 | **合计** | **113** | **4519** |
 
+命令数是 **trace 里的总数**，含每条 trial 末尾那条哨兵（`replay.py` 的 `load_trace`
+标 `sentinel=True` 后跳过，原始运行里本来也没执行）。一条 trial 一条，
+所以**实跑 4519 − 113 = 4406 条**；下面 §7.3 的时间估算按 4519 算，偏保守。
+
 ⚠️ **包里没有任何本地已验证基线。** `make_full_trials.py` 默认会额外并入 `crosslang/`
 下那 5 条更早一轮跨模型取样、**本地已跑通且 patch 逐字节核对过**的 trial 当回归对照组
 （同 task 同镜像，零额外构建成本）；2026-09-09 按要求用 `--no-verified` 去掉了。
@@ -561,7 +600,9 @@ python 那种纯下载的增量极小，typescript 因为 `pnpm install` 把 dev
 
 按每条 3~8 分钟估，**73 个镜像（go+python+javascript）约 5~8 小时**，全量 113 个
 约 8~12 小时。rust 那 5 条要单独留时间：它的 Dockerfile 里有
-`cargo nextest run --no-run`，是把测试二进制整个编译一遍，是唯一的真·编译步骤。
+`cargo nextest run --no-run`，把测试二进制整个编译一遍，是**最重的编译步骤**——
+但不是唯一一个：`pest` 另有 `cargo build --package pest_bootstrap`，`eicrud` 有两处
+`npm run compile`（tsc），`goreleaser` 有 `go build ./...`。
 
 **重放时间**——单位成本来自 5 条对照组的实测（367 条命令 862.1s，即 **2.35 s/命令**）。
 这 5 条虽已不在包内，实测值依然是目前唯一的实测依据。按 ARM ×1.4 折算

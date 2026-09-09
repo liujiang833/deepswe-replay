@@ -2,6 +2,56 @@
 
 按时间倒序记录本项目的主要工作单元，用于长期上下文恢复。
 
+## 2026-09-09: 重放包缺陷修复 —— 14 条已定位问题（含 3 条阻断级）
+
+**Goal:** 让「没有上下文的人拿着 tarball 照 README 操作」这条路在新服务器上真能走通。
+
+**Steps:**
+1. 改之前先核事实：扫 113 份 Dockerfile 的真实上游主机、实算哨兵命令数、
+   curl 验 deno aarch64 资产 - success
+2. 三条阻断级：README 主流程重排、`preflight.sh` 加 `--metrics` 门控 +
+   镜像缺失降 warn、`run_batch.py` 逗号→空格 - success
+3. 事实性错误 6 条（脚本名 / 章节号 / 5 条口径 / `build/<trial>` 路径 /
+   patch_identical 结论 / ARM 硬改写数） - success
+4. ARM deno 改写落地到 `build_arm.sh`，并用真实 Dockerfile 文本验证正则 - success
+5. `check_sources.sh` 补 4 个探测点、全文改 113 口径 - success
+6. 自检：6 个 `.sh` 过 `bash -n`、3 个 `.py` 过 `py_compile`，
+   `check_sources.sh` 实跑 17/17 通，`preflight.sh` 两种模式实跑正常 - success
+
+**Key Findings:**
+- **预检与建镜像的顺序原本是反的**：README 让人先跑 `preflight.sh`，而它对每个缺失
+  镜像打一个 FAIL，新机器 113 个全缺 → 必然 `exit 1`；更糟的是无镜像时活体测试整段
+  `warn` 跳过，**预检真正的价值（起容器验能力）被架空**。`build_arm.sh` 自己的结尾
+  提示反而是对的（先建后检）
+- **`--metrics` 门控只有 `preflight.sh` 没对齐**：`run_batch.py:86` 早有 `need_cgroup`
+  门控，README 也按「默认不要求 cgroup v2」写，唯独 `preflight.sh` 四处无条件硬失败
+  → rootless docker / cgroup v1 的机器会被挡在门外
+- **`build_arm.sh` 只认空格分隔的并列目标**，`run_batch.py` 的 `--only` 才吃逗号；
+  原先打印的 `build_arm.sh a,b,c` 照抄必报「认不出目标」
+- **ARM 硬改写漏了一条**：`cliffy` 写死 `deno-x86_64-...zip`。装错架构的二进制
+  **下载时不报错**，拖到下一句 `RUN deno cache` 才 `exec format error`，极难认
+- **`check_sources.sh` 全绿也可能建不成**：漏探 `deb.nodesource.com`、
+  `repo.mongodb.org`/`www.mongodb.org`（eicrud）、`jsr.io` 与 github release 下载域（cliffy）
+- **命令数 4519 含 113 条哨兵**（一 trial 一条，`load_trace` 标 `sentinel=True` 后跳过），
+  实跑 **4406** 条
+- **`patch_identical` 对这 113 条仍是开放问题**：2026-09-07 那次实测只覆盖另外 5 条
+  对照组（ARM 重建 + qemu），RUNBOOK 原先写成「已成立」，与 `build_arm.sh` 三处
+  「待验证的开放问题」直接矛盾 —— 已改成讲清适用范围，其余三处保持不动
+
+**Files Changed:**
+- `crosslang/README.md` - 主流程重排（解包→探源→建镜像→预检→重放）并写明为什么；
+  前置条件改指 `check_sources.sh`；故障表 §2→§3；编译步骤措辞；4519/4406 口径注
+- `crosslang/preflight.sh` - 新增 `--metrics`（cgroup 两段受其门控）；镜像缺失 bad→warn
+  且零镜像时明确提示先建；磁盘/结尾提示改 113 口径并补 `--skip-missing`
+- `crosslang/check_sources.sh` - 补 4 个探测点（共 17）；全文 5 条→113 条口径
+- `crosslang/build_arm.sh` - 新增 deno x86_64→aarch64 改写；注释 118→113
+- `crosslang/run_batch.py` - 缺镜像提示的 `","` → `" "`
+- `crosslang/RUNBOOK.md` - §2 前置条件表、§2b 路 B / 源表 / ARM 改写两处、§3 预检、
+  路 C 保真度结论、`build/<lang>`→`build/<trial>`、§7.1/§7.3 口径
+- `EXEC_LOG_2026-09-09-bundle-fixes.md` - 新增
+
+**Commit:** 未提交（按要求保留在工作区）
+
 ## 2026-09-07: 重放流程可移植化 + 打包成服务器可跑的 bundle
 
 **Goal:** 把容器重放流程做成一个可整包拷到服务器、开箱即跑的 bundle，
@@ -176,5 +226,61 @@
 - `crosslang/run_batch.py`、`crosslang/make_bundle.sh` - 118 → 113 的注释修正
 - `.gitignore` - 补 `deepswe/crosslang/full_trials/`（原规则只匹配一层深）
 - `EXEC_LOG_2026-09-09-npm-registry.md` - 新增
+
+**Commit:** 见 git log
+
+## 2026-09-09（续）: bundle 可用性修复 + 重放并发 + Go 取模块开关
+
+**Goal:** 让「没有上下文的人照 README 在新服务器上操作」真能走通；把重放从串行改成可并发
+（当前阶段目标是先跑通而非收集性能数据）；解决 go 取模块被 RST 的问题。
+
+**Steps:**
+1. 给 bundle 加 `README.md` 作为入口（原本没有，解开第一眼是按 5 条那版写的 RUNBOOK）- success
+2. 独立验证 README，挖出 3 个阻断级问题 - success
+3. 修 14 条缺陷（含 ARM deno 架构改写）- success，独立复核 14/14
+4. `run_batch.py` 加 `--jobs` 并发 + 批次心跳 - success
+5. 独立验证并发，挖出「日志非实时」「Ctrl-C 启动窗口留孤儿容器」两条 - success
+6. 修上述两条 + trial 内进度节流 - success
+7. `build_arm.sh` 加 `--goproxy` / `--gosumdb` / `--godebug` - success
+8. 端到端保真度回归（真实容器，改动前后 4 轮对照）- success
+
+**Key Findings:**
+- **README 把预检排在建镜像之前是错的**：`preflight.sh` 对每个缺失镜像打 `bad`，
+  新机器 113 个全缺 → `exit 1`；且无镜像时活体测试整段跳过。正确顺序是先建后检
+  （`build_arm.sh` 自己结尾的提示本来就是「下一步 preflight.sh」）
+- **两个脚本的目标分隔符相反**：`build_arm.sh` 吃空格、`run_batch.py --only` 吃逗号。
+  `run_batch.py` 打印的建镜像命令用逗号拼，照抄必失败
+- **`logs/<trial>.log` 不是实时的**（`open(log,"w")` 块缓冲）——而并发模式下它是唯一
+  排查通道。实测：整条 10 分钟的 trial 全程 0 字节，进程关闭才落盘。
+  **两层都要修**：父侧 `buffering=1` + 子进程 `PYTHONUNBUFFERED=1`，缺一不可
+- **串行模式号称的「实时刷屏」也是假的**：真 pty 实测，旧版 14s 内第一行在 +10.2s
+  才出现（子进程退出时一次性吐出），新版 +0.2s
+- **Ctrl-C 在容器启动窗口会留孤儿**：`replay.py` 的 `try:` 在 594 行，而主容器 530 行
+  就起来了。而且**扩到「`sh(run)` 返回之后」仍然漏** —— `docker run -d` 在调用返回前
+  就已在 daemon 里建好容器，必须扩到 `sh(run)` **之前**（容器名提前算好，`rm -f` 对
+  半路被杀的 `docker run` 依然有效）
+- **`i % N` 的进度打印覆盖不到卡死**：卡住时恰恰是 `i` 不增长。必须再加一条
+  **按时间**的下限（30s 无输出就强制打一行，含卡在哪条命令、多久）
+- **并发的真正上限不是 CPU 是内存**：`--cpus` 是 CFS 配额，超配只变慢；`--memory` 超配
+  会 OOM kill，而被 OOM 的容器表现成「命令莫名失败」，极难与真实 task 失败区分
+- **并发超过 `核数÷2` 会制造假失败**：命令被拖慢撞 `timeout -k 5 30`，若被砍的命令改了
+  文件则 `patch_identical` 假失败。`INDEX.md` 已记录上一轮 rust/ts/js 三条受并发污染
+- **Go 取模块用 HTTP/2（实测 `resp.Proto = HTTP/2.0`），wget 用 1.1** —— 一度以为是
+  中间设备掐 h2，但**用户反馈 rust 能正常编译**（cargo 同样走 h2 且在同一容器内），
+  证伪了该假设。指向 `proxy.golang.org` 域名被单独阻断
+- **保真度回归结论**：改动前后 `patch_identical` 完全一致，rc 不匹配的命令下标集合也
+  逐个相同。typescript 那条的 `false` 是**本机既有损伤**（改动前的 HEAD 代码同样复现）：
+  宿主比基线机慢约 6 倍，12 条连续 `npx` 全部撞 30s 超时，`prettier --write` 被砍导致
+  生成的 `.d.ts` 格式不同、差 630 字节
+
+**Files Changed:**
+- `crosslang/README.md` - 新增，bundle 的操作说明（主文档）
+- `crosslang/RUNBOOK.md` - 改为参考手册；删与 README 重复且过时的 §0/§1
+- `crosslang/build_arm.sh` - `--goproxy`/`--gosumdb`/`--godebug`；deno 架构改写；用法头
+- `crosslang/run_batch.py` - `--jobs`/`-j auto`、心跳、日志行缓冲、汇总记未跑条数
+- `crosslang/preflight.sh` - `--metrics` 门控 cgroup 检查；镜像缺失降为 warn；口径 113
+- `crosslang/check_sources.sh` - 补探 nodesource/mongodb/jsr.io；口径 113
+- `replay.py` - try/finally 扩到容器创建之前；`ProgressTicker`（30s 静默下限）
+- `EXEC_LOG_2026-09-09-bundle-fixes.md` - 新增
 
 **Commit:** 见 git log

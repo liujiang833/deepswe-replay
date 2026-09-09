@@ -17,6 +17,8 @@
 #   bash build_arm.sh all                    # 全建，按依赖从少到多排序
 #   bash build_arm.sh --base mars-base:arm64 python
 #   bash build_arm.sh --registry https://registry.npmmirror.com typescript
+#   bash build_arm.sh --godebug http2client=0 go
+#   bash build_arm.sh --goproxy https://goproxy.cn,direct go
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +33,16 @@ CA_CERT="${DEEPSWE_CA_CERT:-}"
 INSECURE=0
 # 内网取包极慢时用：构建期把 npm 系的源换到镜像站（只在构建期生效，见「包源」一节）
 REGISTRY="${DEEPSWE_NPM_REGISTRY:-}"
+# go 取模块失败有两种完全不同的现象，别混：
+#   - `read: connection reset by peer` —— `read:` 说明 TCP 已经建起来才被掐，
+#     多半是中间设备（DPI / 老式代理）对 HTTP/2 流处理不好；wget 默认 HTTP/1.1
+#     所以「wget 通而 go 不通」就是这个味道。GODEBUG=http2client=0 把 go 降回 1.1。
+#   - 源本身不通（连不上 / 超时）才是换源的场景（内网 Athens / Artifactory / 镜像站）。
+# 三个都只在构建期生效，走 ARG 不走 ENV，理由同「包源」一节。
+GOPROXY="${DEEPSWE_GOPROXY:-}"
+# 与 GOPROXY 独立：换源多数不必关校验和，go 会走 <GOPROXY>/sumdb/… 把它一并代理掉
+GOSUMDB="${DEEPSWE_GOSUMDB:-}"
+GODEBUG="${DEEPSWE_GODEBUG:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -42,6 +54,9 @@ while [ $# -gt 0 ]; do
     --ca-cert) CA_CERT="$2"; shift 2 ;;
     --insecure) INSECURE=1; shift ;;
     --registry) REGISTRY="$2"; shift 2 ;;
+    --goproxy) GOPROXY="$2"; shift 2 ;;
+    --gosumdb) GOSUMDB="$2"; shift 2 ;;
+    --godebug) GODEBUG="$2"; shift 2 ;;
     -o) OUT="$2"; shift 2 ;;
     -*) echo "未知参数: $1"; exit 1 ;;
     *) TARGETS+=("$1"); shift ;;
@@ -68,7 +83,7 @@ BASE_ARCH=""
 # 依赖从少到多——先建最可能一次成功的，把最贵最脆的 rust 放最后
 ORDER="python go javascript typescript rust"
 
-# 语言 → trial 目录。**一种语言可能对应几十条**（全量 118 条里 go/python/typescript
+# 语言 → trial 目录。**一种语言可能对应几十条**（全量 113 条里 go/python/typescript
 # 各三十多条），所以这里存的是空格分隔的列表；早先版本用的是「一语言一目录」，
 # 在全量集上会静默只保留最后一条。
 declare -A DIRS_OF LANG_OF
@@ -185,6 +200,36 @@ else
   echo "              若目标机取 npm 包极慢，用 --registry https://registry.npmmirror.com"
   echo "              或先 export DEEPSWE_NPM_REGISTRY=... 再跑本脚本"
 fi
+
+# ---- Go 取模块 ------------------------------------------------------------
+# 34 条 go task 的 Dockerfile 一条都没写 GOPROXY/GODEBUG，全吃基座默认值，所以只能
+# 从外面注入。约束和「包源」那节一模一样：这三个变量都不在 docker 预定义 build-arg
+# 白名单里（白名单只有 *_proxy），必须在生成的 Dockerfile 里显式写 ARG，否则
+# --build-arg 传进去是空值；用 ARG 而不是 ENV，是为了不进 image config 的 Env。
+GO_OPTS=0
+if [ -n "$GOPROXY" ]; then
+  echo "  Go 模块源   $(redact "$GOPROXY")（仅构建期）"
+  BUILD_ARGS+=(--build-arg "GOPROXY=$GOPROXY"); GO_OPTS=1
+fi
+if [ -n "$GOSUMDB" ]; then
+  echo "  Go 校验和库 $GOSUMDB（仅构建期）"
+  BUILD_ARGS+=(--build-arg "GOSUMDB=$GOSUMDB"); GO_OPTS=1
+fi
+if [ -n "$GODEBUG" ]; then
+  echo "  Go GODEBUG  $GODEBUG（仅构建期）"
+  BUILD_ARGS+=(--build-arg "GODEBUG=$GODEBUG"); GO_OPTS=1
+fi
+if [ -n "$GOPROXY" ] && [ -z "$GOSUMDB" ]; then
+  echo "              （未动 GOSUMDB：go 一般会走 <GOPROXY>/sumdb/… 把校验和一起代理掉，"
+  echo "                该端点也不通时才需要 --gosumdb off）"
+fi
+if [ "$GO_OPTS" = 0 ]; then
+  echo "  Go 取模块   未设置（默认 proxy.golang.org + HTTP/2）"
+  echo "              若报 connection reset by peer 且错误里有 read: —— 连接是建起来之后"
+  echo "              被掐的，多半是中间设备掐 HTTP/2，先试 --godebug http2client=0"
+  echo "              若是源本身不通（连不上 / 超时），才换源：--goproxy https://goproxy.cn,direct"
+  echo "              也可先 export DEEPSWE_GODEBUG=... / DEEPSWE_GOPROXY=... 再跑本脚本"
+fi
 echo
 
 mkdir -p "$OUT"
@@ -204,9 +249,10 @@ for dir in "${SELECTED[@]}"; do
   # 从 task.json 里取出 Dockerfile 与目标 tag，并做架构 / 证书改写
   python3 - "$HERE/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" \
            "$([ -n "$CA_CERT" ] && basename "$CA_CERT" || echo '')" "$INSECURE" \
-           "$REGISTRY" <<'PY'
+           "$REGISTRY" "$GOPROXY" "$GOSUMDB" "$GODEBUG" <<'PY'
 import json, pathlib, re, sys
-task_json, work, base, base_arch, ca_name, insecure, registry = sys.argv[1:8]
+(task_json, work, base, base_arch, ca_name, insecure, registry,
+ goproxy, gosumdb, godebug) = sys.argv[1:11]
 insecure = insecure == "1"
 work = pathlib.Path(work)
 files = {f["path"]: f["content"] for f in json.loads(pathlib.Path(task_json).read_text())["files"]}
@@ -229,7 +275,21 @@ if base_arch in ("arm64", "aarch64") and "get.nexte.st" in df:
                          "原文写死 x86_64；ARM 上要换成 aarch64 那个产物"))
         df = new
 
-# 3) 公司内网 TLS 中间人：装内网 CA，或（退而求其次）关掉校验
+# 3) deno 的 release 资产同样按架构分叉，且**没有 fallback**：装错架构的二进制不会
+#    在下载时报错，而是拖到紧接着的 `RUN deno cache` 才 exec format error，很难认。
+#    （cliffy 那条写死 deno-x86_64-unknown-linux-gnu.zip；实测 v2.0.0 的
+#     deno-aarch64-unknown-linux-gnu.zip 存在。）
+if base_arch in ("arm64", "aarch64") and "denoland/deno/releases" in df:
+    new, n = re.subn(
+        r'(github\.com/denoland/deno/releases/download/[^/"\s]+/deno-)x86_64(-unknown-linux-gnu)',
+        r'\1aarch64\2', df)
+    if n:
+        rewrites.append(("deno-x86_64-unknown-linux-gnu.zip",
+                         "deno-aarch64-unknown-linux-gnu.zip",
+                         "原文写死 x86_64；ARM 上装进去会在 `deno cache` 时 exec format error"))
+        df = new
+
+# 4) 公司内网 TLS 中间人：装内网 CA，或（退而求其次）关掉校验
 #    插入点：第一条 RUN 之前 —— git clone 是第一个联网动作，必须在它之前生效
 def insert_before_first_run(text, block):
     lines = text.splitlines(keepends=True)
@@ -257,6 +317,20 @@ if registry:
     rewrites.append(("（无）", "ARG NPM_CONFIG_REGISTRY + ARG COREPACK_NPM_REGISTRY",
                      f"--registry={registry}；这两个变量不在预定义 build-arg 白名单里，"
                      "不声明就传不进去；corepack 只认后者、不读 .npmrc"))
+
+# 三个 go 开关互相独立：只声明实际给了值的那个 —— 没给值的空 ARG 是纯噪音，
+# 还会让 --list / REWRITES.md 看起来像做了并不存在的改写。同样必须排在 CA /
+# insecure 之前，那两段自带 RUN。
+go_args = [(n, v) for n, v in
+           (("GOPROXY", goproxy), ("GOSUMDB", gosumdb), ("GODEBUG", godebug)) if v]
+if go_args:
+    prelude += (
+        "\n# [build_arm.sh] --goproxy/--gosumdb/--godebug：构建期改 go 的取模块方式。\n"
+        "# 写 ARG 不写 ENV —— ARG 不进 image config 的 Env，运行期 go 仍是基座默认配置\n"
+        + "".join(f"ARG {n}\n" for n, _ in go_args) + "\n")
+    rewrites.append(("（无）", " + ".join(f"ARG {n}" for n, _ in go_args),
+                     "；".join(f"--{n.lower()}={v}" for n, v in go_args)
+                     + "；这些变量不在预定义 build-arg 白名单里，不声明就传不进去"))
 
 if ca_name:
     # 装 CA 是**首选**：不像关校验那样改变工具行为，而且 cargo 只认这条路。
@@ -330,6 +404,10 @@ lines += ["", "## 无法通过改写消除的漂移", "",
           "  所以镜像内容与官方源建出来的**字节不同**。上面两条自检查不到这里。",
           "  实测后果是良性的：pnpm 解析新包读自己的配置而非该文件，运行期离线报错",
           "  文本与官方源镜像**逐字节一致**。即「行为不受污染」成立，「字节完全相同」不成立",
+          "- 换 Go 模块代理（`--goproxy`）不会让模块内容漂：模块仍由仓库里提交的",
+          "  `go.sum` 逐个 hash 校验，对不上直接构建失败。`GOSUMDB=off` 关掉的只是",
+          "  「向公共透明日志（sum.golang.org）为新模块补查校验和」这一步对账，",
+          "  **不是**关掉 `go.sum` 校验",
           "- 工具链是 arm64 构建，native 扩展与编译产物全部不同",
           "- 基座本身是 `:latest` tag，不可复现",
           "",
@@ -385,6 +463,16 @@ PY
         esac
       else
         echo "     （镜像里没有 npm，跳过 registry 还原实测）"
+      fi
+    fi
+    # go 那三个同理，只能活在构建期。这里只查 Config.Env，不做 docker run 实测 ——
+    # go 的默认值本来就可能由基座 / go 自身给出，实测值容易误判成「残留」。
+    if [ -n "$GOPROXY" ] || [ -n "$GOSUMDB" ] || [ -n "$GODEBUG" ]; then
+      if docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' \
+           | grep -qiE '(^|[^A-Za-z_])(goproxy|gosumdb|godebug)='; then
+        echo "  ❌ 镜像 Env 里残留了 go 变量 —— 该用 ARG 而非 ENV，必须排查后重建"
+        docker image inspect "$TAG" -f '{{range .Config.Env}}{{println .}}{{end}}' | grep -iE 'goproxy|gosumdb|godebug' | sed 's/^/       /'
+        N_FAIL=$((N_FAIL+1)); echo; continue
       fi
     fi
     # --insecure 的配置必须已被末尾那步还原，否则运行期工具行为就变了

@@ -7,6 +7,21 @@
 本文件就是操作说明，从解包到出结果一条路走完。
 其余文档都是辅助：`RUNBOOK.md` 是深入排查用的参考手册，`INDEX.md` 是历史分析材料。
 
+**主流程 —— 顺序是有讲究的，别跳步：**
+
+```
+解包核对 → check_sources.sh → build_arm.sh（先建一批）→ preflight.sh → run_batch.py
+   §1           §2                  §3                      §4            §5
+```
+
+- **探源为什么在最前**：`check_sources.sh` 几秒钟跑完，先告诉你哪几条建得成；
+  而建镜像最慢的一条要几十分钟。先探再建，少走弯路。
+- **预检为什么在建镜像之后**：`preflight.sh` 的价值不在查版本号，而在**真起一个容器**
+  把 `replay.py` 依赖的每项能力跑一遍（netns 共享、资源限额、镜像内的 git/timeout…）。
+  包里**不带镜像**，手里一个都没有时这段会整体跳过 —— 那次预检等于什么都没验。
+  所以必须先建成至少一条再回头预检；`build_arm.sh` 跑完自己也提示「下一步：
+  `bash preflight.sh`」。
+
 ---
 
 ## 0. 前置条件
@@ -18,7 +33,8 @@
 | **`mars-base` 基座镜像** | 所有 113 个镜像都 `FROM mars-base`。**基座不在，一条都建不了** |
 | 能访问各包源 | 构建期要 clone github、取 npm/pypi/goproxy/crates |
 
-基座拉不到就 `docker load` 一份进来。`preflight.sh` 会替你核对这几项。
+基座拉不到就 `docker load` 一份进来。核对「基座在不在、各包源通不通」的是
+`check_sources.sh`（见 §2）——`preflight.sh` 不查这两样，它查的是容器能力。
 
 ⚠️ **重放期不需要外网、也不该有** —— 重放容器是 `--network=none` + 403 sinkhole，
 刻意还原原 harness 的 `allow_internet=false`。要联网的只有构建期。
@@ -33,14 +49,17 @@ sha256sum -c SHA256SUMS      # 传输完整性
 cat BUILD_INFO               # 这份包是哪个 commit 打的、各脚本的 sha256
 ```
 
-## 2. 环境预检
+## 2. 探包源
 
 ```bash
-bash preflight.sh
+bash check_sources.sh
 ```
 
-真起容器逐项验证能力，**有 ❌ 先解决再往下**。默认不要求 cgroup v2 可读
-（那是 `--metrics` 才需要的），rootless docker / cgroup v1 的机器也能跑。
+打各上游的**真实端点**看 HTTP 状态码——原环境的 `allow_internet=false` 就是靠代理返
+403 实现的，TCP 通、DNS 通但 HTTP 被拒，所以光 ping 说明不了问题。顺带核对
+**`mars-base` 基座是否已在本地**：它是 113 个 Dockerfile 的 `FROM`，不在的话一条都建不了。
+
+某个源不通只挡掉用它的那几条，**不必等全绿才开工**；只有 github 不通才是真的没法开始。
 
 ## 3. 建镜像 —— 最耗时的一步
 
@@ -48,7 +67,6 @@ bash preflight.sh
 113 条 trial 对应 **113 个镜像**，一个 task 一条 trial 一个镜像。
 
 ```bash
-bash check_sources.sh                # 先确认各包源在这台机上可达
 bash build_arm.sh --list python      # 只看会怎么改写 Dockerfile，不构建
 bash build_arm.sh python             # 真建
 ```
@@ -76,7 +94,22 @@ bash build_arm.sh --ca-cert corp-ca.crt python              # 内网 TLS 中间�
 CA 不知道从哪来就跑 `bash get_ca_cert.sh`（会抠出来并验证可用）；
 不确定内网到底有没有做中间人就跑 `bash detect_mitm.sh`。
 
-## 4. 重放
+## 4. 环境预检
+
+```bash
+bash preflight.sh                # 默认口径
+bash preflight.sh --metrics      # 要采性能指标时才加：连 cgroup 一起验
+```
+
+真起容器逐项验证能力，**有 ❌ 先解决再往下**。默认不要求 cgroup v2 可读
+（那是 `--metrics` 才需要的），rootless docker / cgroup v1 的机器也能跑——
+`preflight.sh` 和 `run_batch.py` 在这一点上是同一个门控。
+
+**镜像缺失只记警告、不算失败**：113 个不可能一次建齐，边建边跑本来就是设计好的流程
+（`run_batch.py --skip-missing` 就是为它准备的）。但**一个镜像都没有时活体测试整段会
+跳过**，等于什么都没验到 —— 这种情况先回上一步建成至少一条，再回来跑预检。
+
+## 5. 重放
 
 ```bash
 python3 run_batch.py --smoke 5 --skip-missing      # 冒烟：每条只跑前 5 条命令
@@ -94,7 +127,7 @@ python3 run_batch.py --skip-missing --keep-going   # 正式跑
 python3 replay.py <trial 目录> <trial 目录>/task.json -o /tmp/one
 ```
 
-## 5. 读结果
+## 6. 读结果
 
 结果落在 `runs/<UTC 时间戳>/`：
 
@@ -123,13 +156,21 @@ python3 replay.py <trial 目录> <trial 目录>/task.json -o /tmp/one
 | javascript | 5 | 157 |
 | **合计** | **113** | **4519** |
 
+> 4519 是 **trace 里的命令总数**，含每条 trial 末尾那条哨兵命令
+> （`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`，原始运行里就没执行过，
+> `replay.py` 的 `load_trace` 标 `sentinel=True` 后跳过）。
+> 一条 trial 一条哨兵，所以**实跑 4519 − 113 = 4406 条**。下面的时间预算按 4519 估，
+> 偏保守。
+
 | | 预算 | 依据 |
 |---|---|---|
 | 建镜像 | **8~12 小时 / 25~35 GB** | python 144s、typescript ~280s 实测外推 |
 | 重放 | **4~4.5 小时** | 2.35 s/命令实测 × ARM 1.4 折算 |
 
-rust 那 5 条单独留时间：Dockerfile 里有 `cargo nextest run --no-run`，
-是全部 113 个里唯一的真·编译步骤。
+rust 那 5 条单独留时间：Dockerfile 里有 `cargo nextest run --no-run`，把测试二进制
+整个编译一遍，是全部 113 个里**最重的编译步骤**——但不是唯一一个：`pest` 另有
+`cargo build --package pest_bootstrap`，`eicrud` 有两处 `npm run compile`（tsc），
+`goreleaser` 有 `go build ./...`。
 
 ---
 
@@ -183,7 +224,7 @@ bash build_arm.sh --registry https://registry.npmmirror.com typescript
 
 | 症状 | 去处 |
 |---|---|
-| 预检报错 | `RUNBOOK.md` §2 |
+| 预检报错 | `RUNBOOK.md` §3 |
 | 拉不到镜像 / ECR 不通 | `RUNBOOK.md` §2b |
 | `git clone` 报证书错误 | `RUNBOOK.md` §2b 证书一节 → `get_ca_cert.sh` |
 | **构建**卡在 `pnpm install` | `RUNBOOK.md` §2b「取包慢:换镜像源」 |
@@ -203,9 +244,9 @@ bash build_arm.sh --registry https://registry.npmmirror.com typescript
 
 ```
 README.md          本文件 —— 操作说明
-preflight.sh       环境预检
-check_sources.sh   各包源可达性检查
+check_sources.sh   各包源可达性检查 + 基座在不在（建之前跑）
 build_arm.sh       从本地基座重建 task 镜像
+preflight.sh       环境预检（**建出至少一个镜像之后**再跑，见 §4）
 run_batch.py       批量重放 driver
 replay.py          单条重放器（只用 python 标准库）
 ```

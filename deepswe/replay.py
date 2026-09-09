@@ -83,6 +83,17 @@ OUTER_SLACK_S = 60     # 宿主侧兜底超时 = --cmd-timeout + 该值（正常
 SINK_PORT = 3128       # sinkhole 代理监听端口（容器 netns 内的 127.0.0.1）
 CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
 
+# 单条 trial 内部的进度节奏。并发跑时 stdout 不再刷屏，logs/<trial>.log 是唯一的
+# 观察通道，这两个值决定了 `tail -f` 到底能看见多少。
+PROGRESS_EVERY_N = 5
+# 时间下限比按条数打更关键：卡住的时候 i 恰恰不增长，只按 `i % N` 打的话，「卡死了」
+# 和「跑完了」在日志里长得一模一样——都是没有新行。所以另起一个线程盯「离上次打印
+# 过了多久」，而不是「跑到第几条」。
+# 30s 与批次级心跳的 60s（run_batch.py 的 HEARTBEAT_S）刻意错开：心跳只回答「这条
+# 还活着」，trial 内部要回答「卡在哪条命令上」，粒度必须更细，否则先等一轮心跳、
+# 再等一轮 trial 进度，定位一次要两分钟。
+PROGRESS_MAX_SILENCE_S = 30
+
 # 纯 stdlib 的 403 sinkhole 代理，作为 `python3 -c` 的实参丢进 sidecar 容器。
 # 对一切进来的连接：读完请求头就回 403，然后关闭。两类客户端都能覆到——
 #   CONNECT host:443  → http.client 抛 "Tunnel connection failed: 403 Forbidden"
@@ -375,6 +386,52 @@ class MemSampler(threading.Thread):
         self.stop_evt.set()
 
 
+class ProgressTicker(threading.Thread):
+    """静默超过 PROGRESS_MAX_SILENCE_S 就强制打一行「现在卡在哪条」。
+
+    只按 `i % N` 打进度有个洞：卡住的时候 i 不增长，于是一行都不打。这个线程盯的是
+    「离上次打印过了多久」，所以命令卡在 docker exec 里、或者收尾的 git diff 很慢时，
+    照样有输出。
+
+    进度行一律走 say()，与本线程共用一把锁：run_batch.py 是按行读管道的，两个线程
+    同时 print 会把两行拼成一行。
+    """
+
+    def __init__(self, n_all):
+        super().__init__(daemon=True)
+        self.n_all = n_all
+        self.lock = threading.Lock()
+        self.stop_evt = threading.Event()
+        self.last = time.monotonic()
+        self.label, self.t0 = "启动中", time.monotonic()
+
+    def say(self, text):
+        """主线程打进度行：顺手把静默计时清零，免得刚打完 ticker 又补一行。"""
+        with self.lock:
+            self.last = time.monotonic()
+            print(text, flush=True)
+
+    def mark(self, label):
+        """记下当前在做什么（只记不打），供静默时那一行引用。"""
+        with self.lock:
+            self.label, self.t0 = label, time.monotonic()
+
+    def run(self):
+        # 1s 一轮：远细于 30s 阈值，触发时刻的误差可忽略；用 wait 而不是 sleep 是
+        # 为了让 stop() 立刻生效，不用等满一轮。
+        while not self.stop_evt.wait(1.0):
+            with self.lock:
+                now = time.monotonic()
+                if now - self.last < PROGRESS_MAX_SILENCE_S:
+                    continue
+                self.last = now
+                print(f"  {self.label} …仍在跑 {now - self.t0:>6.0f}s"
+                      f"（已 {PROGRESS_MAX_SILENCE_S}s 无新输出）", flush=True)
+
+    def stop(self):
+        self.stop_evt.set()
+
+
 def load_trace(traj):
     """把 trace 摊平成 [{命令, trace 侧 returncode, 是否哨兵, 是否 trace 侧超时, step 时间差上界}]。
 
@@ -527,73 +584,102 @@ def main():
         for v in ("NO_PROXY", "no_proxy"):
             run += ["-e", f"{v}=localhost,127.0.0.1,::1"]
     run += [image, "sleep", "infinity"]
-    r = sh(run)
-    if r.returncode != 0:
-        print("容器启动失败:", r.stderr.decode()[:400])
-        return 1
 
     def teardown():
+        # 幂等，而且必须幂等：主容器刚 docker run 出来、sidecar 还没起（甚至永远起不来）
+        # 这种半成品状态下也会被调用。`docker rm -f` 删一个不存在的容器只是返回非零，
+        # sh() 把输出吃掉，所以两个名字无脑都删一遍即可。
         sh(["docker", "rm", "-f", name])
         sh(["docker", "rm", "-f", sink])
 
-    sink_cg = None
-    if use_sink:
-        # sidecar 与主容器共享 netns（--network=container:），但 cgroup 各自独立，
-        # 所以代理自身的 CPU/内存**不会**记进被测容器的指标。
-        r = sh(["docker", "run", "-d", "--name", sink,
-                f"--network=container:{name}", "--memory=256m",
-                image, "python3", "-c", SINKHOLE_SRC, str(SINK_PORT)])
+    # 从这里到最后都必须在 try/finally 里。以前的 try 要到主循环才开始，中间「起主容器 →
+    # 起 sidecar → 最长 10s 的探活轮询 → cgroup 初始化」整段裸奔在保护之外，在那个窗口里
+    # 按 ^C 会稳定留下「主容器 + -sink」两个孤儿容器；并发度越高、daemon 越忙，窗口越宽。
+    #
+    # 注意 try 要罩住 sh(run) 本身，不能只罩它返回之后：`docker run -d` 是先让 daemon 把
+    # 容器建出来再返回，容器在 docker ps 里显示 Created 的那一刻 sh(run) 还没返回。实测
+    # 在这一刻 ^C，容器已经存在而代码还没进 try —— 照样漏。容器名是提前算好的定值，
+    # 所以哪怕 docker run 被打断在半路，teardown 里的 rm -f <name> 也删得掉。
+    #
+    # mem / ticker 先占位：finally 里要停它们，而失败或 ^C 可能发生在它们建起来之前，
+    # 直接引用会变成 NameError —— 那会把真正的 KeyboardInterrupt 盖掉，容器照样漏。
+    mem = ticker = None
+    try:
+        r = sh(run)
         if r.returncode != 0:
-            print("sinkhole sidecar 启动失败:", r.stderr.decode()[:400])
-            teardown()
+            # 走 finally 顺手 teardown：docker run 也可能是「建出来了但没起来」才失败的，
+            # 那种情况下容器以 Created 状态留在那儿。
+            print("容器启动失败:", r.stderr.decode()[:400])
             return 1
-        # 从被测容器内部探活，失败就直接退出——不静默降级成「其实没代理」
-        for _ in range(40):
-            if sh(["docker", "exec", name, "python3", "-c", SINK_PROBE]).returncode == 0:
-                break
-            time.sleep(0.25)
-        else:
-            print(f"sinkhole 探活失败：被测容器连不上 127.0.0.1:{SINK_PORT}")
-            print(sh(["docker", "logs", sink]).stderr.decode()[:400])
-            teardown()
-            return 1
-        if not args.no_metrics:
-            try:
-                sink_cg = Cgroup(sink)
-            except RuntimeError as e:
-                print(f"sinkhole cgroup 初始化失败：{e}")
+
+        sink_cg = None
+        if use_sink:
+            # sidecar 与主容器共享 netns（--network=container:），但 cgroup 各自独立，
+            # 所以代理自身的 CPU/内存**不会**记进被测容器的指标。
+            r = sh(["docker", "run", "-d", "--name", sink,
+                    f"--network=container:{name}", "--memory=256m",
+                    image, "python3", "-c", SINKHOLE_SRC, str(SINK_PORT)])
+            if r.returncode != 0:
+                print("sinkhole sidecar 启动失败:", r.stderr.decode()[:400])
+                # 这一段里的几处显式 teardown() 保留而不是交给 finally：环境没搭起来的
+                # 半成品容器留着也调不出东西，所以这里连 --keep 都不认；finally 那次
+                # 只是幂等地再删一遍（--keep 时不删），两者不冲突。
                 teardown()
                 return 1
-        print(f"sinkhole  {proxy_url}（sidecar 容器 {sink}"
-              + ("，独立 cgroup）" if sink_cg else "）"))
+            # 从被测容器内部探活，失败就直接退出——不静默降级成「其实没代理」
+            for _ in range(40):
+                if sh(["docker", "exec", name, "python3", "-c", SINK_PROBE]).returncode == 0:
+                    break
+                time.sleep(0.25)
+            else:
+                print(f"sinkhole 探活失败：被测容器连不上 127.0.0.1:{SINK_PORT}")
+                print(sh(["docker", "logs", sink]).stderr.decode()[:400])
+                teardown()
+                return 1
+            if not args.no_metrics:
+                try:
+                    sink_cg = Cgroup(sink)
+                except RuntimeError as e:
+                    print(f"sinkhole cgroup 初始化失败：{e}")
+                    teardown()
+                    return 1
+            print(f"sinkhole  {proxy_url}（sidecar 容器 {sink}"
+                  + ("，独立 cgroup）" if sink_cg else "）"))
 
-    if args.no_metrics:
-        cg, mem = NullCgroup(), NullMemSampler()
-        print("cgroup    不采集（--no-metrics）—— 只跑命令 + 保真校验")
-    else:
-        try:
-            cg = Cgroup(name)
-        except RuntimeError as e:
-            print(f"cgroup 初始化失败：{e}\n"
-                  f"\n只想打通、不要性能数据的话，加 --no-metrics 可绕过整个 cgroup 依赖。")
-            teardown()
-            return 1
-        print(f"cgroup    {cg.path}")
-        print(f"          （探测方式：{cg.how}"
-              + ("" if cg.has_io else "；io.stat 缺失 → rbytes/wbytes 记 0，不影响保真度结论")
-              + "）")
-        mem = MemSampler(cg)
-    mem.start()
-    if not args.no_metrics:
-        print(f"mem       后台轮询 memory.current @ {int(MEM_POLL_S * 1000)}ms")
-    print()
+        if args.no_metrics:
+            cg, mem = NullCgroup(), NullMemSampler()
+            print("cgroup    不采集（--no-metrics）—— 只跑命令 + 保真校验")
+        else:
+            try:
+                cg = Cgroup(name)
+            except RuntimeError as e:
+                print(f"cgroup 初始化失败：{e}\n"
+                      f"\n只想打通、不要性能数据的话，加 --no-metrics 可绕过整个 cgroup 依赖。")
+                teardown()
+                return 1
+            print(f"cgroup    {cg.path}")
+            print(f"          （探测方式：{cg.how}"
+                  + ("" if cg.has_io else "；io.stat 缺失 → rbytes/wbytes 记 0，不影响保真度结论")
+                  + "）")
+            mem = MemSampler(cg)
+        mem.start()
+        if not args.no_metrics:
+            print(f"mem       后台轮询 memory.current @ {int(MEM_POLL_S * 1000)}ms")
+        print()
 
-    recs = []
-    sink_cpu0 = sink_cg.sample()["usage_usec"] if sink_cg else 0
-    t_start = time.monotonic()
-    try:
+        recs = []
+        sink_cpu0 = sink_cg.sample()["usage_usec"] if sink_cg else 0
+        t_start = time.monotonic()
+        ticker = ProgressTicker(n_all)
+        ticker.start()
         for i, it in todo:
             cmd = it["cmd"]
+            # 先算好摘要：进度行和 ticker 的静默行引用的是同一个字符串，
+            # 两边长得一样，看日志时才对得上是同一条命令。
+            head = strip_cd(cmd)[:88].splitlines()
+            head = head[0] if head else ""
+            # 开跑前就登记：卡住时 ticker 要说得出卡在哪条上
+            ticker.mark(f"[{i:>4}/{n_all}] {head}")
             before = cg.sample()
             mem.reset()
             t0 = time.monotonic()
@@ -629,16 +715,21 @@ def main():
                    "cmd": cmd, "cmd_stripped": strip_cd(cmd),
                    "stdout_head": so[:4000].decode(errors="replace")}
             recs.append(rec)
-            if i % 25 == 0 or dt > 10:
-                head = strip_cd(cmd)[:88].splitlines()
-                print(f"  [{i:>4}/{n_all}] rc={rc:<4}{'TO' if timed_out else '  '} {dt:>7.2f}s  "
-                      f"{head[0] if head else ''}")
+            # 慢命令（dt > 10）照旧必打——它本身就是最该被看见的那种。
+            if i % PROGRESS_EVERY_N == 0 or dt > 10:
+                ticker.say(f"  [{i:>4}/{n_all}] rc={rc:<4}{'TO' if timed_out else '  '} {dt:>7.2f}s  "
+                           f"{head}")
 
         elapsed = time.monotonic() - t_start
-        print(f"\n重放完成 {elapsed:.0f}s")
+        ticker.say(f"\n重放完成 {elapsed:.0f}s")
 
         # ---- 保真度硬校验：git diff base..HEAD vs model.patch ----
+        # 这一步没有超时兜底，仓库大时可以跑很久，是最该被 ticker 罩住的收尾环节
+        ticker.mark("收尾 git diff base..HEAD")
         gd = sh(["docker", "exec", "-w", "/app", name, "git", "diff", "--binary", base_sha, "HEAD"])
+        # 往下全是密集的汇总打印，ticker 再插话只会把行拼乱；git diff 一回来就停。
+        ticker.stop()
+        ticker.join(timeout=2)
         replayed = gd.stdout
         (out / "replayed.patch").write_bytes(replayed)
         orig_p = tdir / "model.patch"
@@ -721,7 +812,12 @@ def main():
         (out / "verdict.json").write_text(json.dumps(verdict, indent=2, ensure_ascii=False))
         print(f"\n-> {out}/commands.jsonl, verdict.json, replayed.patch")
     finally:
-        mem.stop()
+        # mem / ticker 可能还是 None：失败或 ^C 发生在容器起好、它们还没建的那段窗口里。
+        # ticker 正常路径上已经停过一次，stop() 幂等，这里只是兜住异常路径。
+        if mem is not None:
+            mem.stop()
+        if ticker is not None:
+            ticker.stop()
         if not args.keep:
             teardown()
     return 0

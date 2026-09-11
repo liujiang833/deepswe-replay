@@ -180,3 +180,182 @@
 ### Step 6: 提交
 - **Status:** success
 - **Result location:** 见 git log
+
+---
+
+# 续：单条 → 批量（同日第二轮）
+
+**Date:** 2026-09-11
+**Goal:** 单条 trial 的 ARM topdown 采集已在目标机（**baremetal ARM，cgroup v1**）跑通，
+现在扩到批量：`run_batch.py` 能批量采、汇总表能横向对比、包里带全部 113 条。
+
+## Problems to Solve
+1. `run_batch.py` 加 `--topdown`，且必须与 `--jobs > 1` 互斥并报错退出
+2. 汇总表在**现有总表后面追加** topdown 列，并给一个按语言分组的横向小结
+3. 打一个带全部 113 条 trial 的新包（现有的 `make_topdown_bundle.sh` 只打 1 条）
+4. `TOPDOWN.md` 补批量流程、时间预算、为什么不能并发、跨 trial 比较的注意事项
+5.（中途追加）`--per-lang N` 每种语言抽 N 条；再追加 `--pick median|heaviest|lightest`
+
+## 关键设计决定（为什么这么做）
+
+### 1. 复用 `topdown_trial.sh`，不在 `run_batch.py` 里重写 perf 逻辑
+`--topdown` 打开时每条 trial 改调 `bash topdown_trial.sh <trial> -o <out> --cmd-timeout N
+[--limit N] [--no-metrics]`，而不是直接调 `replay.py`。
+理由：perf 那一套（`-G` 必须排在 `-e` 之后、cgroup v1 走 perf_event 独立层级、
+兜底找容器必须排掉 `-sink`）这一轮已经栽过两次，两份实现只会跟着一起错。
+
+代价是要给 `topdown_trial.sh` 补一个 `--cmd-timeout` 透传口 —— 批量入口一直给
+`replay.py` 传 `--cmd-timeout 30`（对齐原 harness），传不下去的话同一批里 topdown
+那几条就换了口径，而这种偏差在报告里完全看不出来。
+
+### 2. `--topdown` × `--jobs>1` 报错退出（比 `--metrics` 那条更硬）
+`--metrics` 并发抢的是**机器资源**，数字偏悲观但每条各有各的一份数据；
+`--topdown` 并发抢的是**同一批物理计数器**（Neoverse 一般 6 个，watchdog 开着剩 5 个），
+一轮要开 4~6 个事件且要求作为一个 `{}` 组同上同下 —— N ≥ 2 必然超，超了内核**不报错**，
+直接复用。后果是每条 C5 自检全失败、分子分母来自不同时间窗口、而屏幕上每条都「跑完了」。
+所以报错文案把这个机制整段讲出来，不是只说「不兼容」。
+
+### 3. 单条 topdown 采废 ≠ trial 失败
+`patch_identical`（保真度）与 C1~C5（数据可信度）**正交**。
+但 `topdown_trial.sh` 最后只能吐**一个**退出码，把两件事压成了同一个数（自检没过是 2）。
+→ 给它加了一份 `run_status.json`，把 `replay_rc` / `perf_rc` / `parse_rc` **分开记**；
+`run_batch.py` 按 `replay_rc` 判 trial 成没成。
+例外：**早于重放启动**的失败（事件号不合法、没 perf、等不到容器）不写这个文件，
+那种情况 trial 确实没跑起来，按失败计 —— 这是有意的。
+
+### 4. 分组小结**剔除自检没过的条**
+C5 红了说明发生了复用，那组四象限的分子分母来自不同时间窗口，比值没有物理意义；
+混进平均数只会污染整组，而平均值这个形式恰恰把「哪一条坏了」抹掉。
+→ 只统计自检全过的条，被剔掉几条**单独成列**写出来（`n=2 剔除 3` 和 `n=2 剔除 0`
+可信度完全不同，混在一个 n 里看不出来）。
+一门语言若「采到了但全被剔掉」，仍保留一行 `n=0 剔除 k` —— 让它整个消失会被误读成「没跑」。
+
+### 5. `--pick` 三策略：耗时 vs 数据干净度
+topdown 采的是**整条 trial 的聚合值**，固定含容器启动 + 收尾 `git diff`。
+trial 越轻这笔固定开销占比越大，四象限就越是在测「容器启动 + 解释器 import」。
+实测（全量 113 条，五种语言各取 2 条，按 2.35s/命令 × ARM 1.4 折算）：
+
+| --pick | 命令合计 | 粗估耗时 |
+|---|---|---|
+| median（默认） | 324 | 约 18 分钟 |
+| heaviest | 1243 | 约 68 分钟 |
+| lightest | 178 | 约 10 分钟 |
+
+差 3.8 倍。这个权衡写进了 `--help` 和 `TOPDOWN.md`，不让用户自己猜。
+
+## Steps Log
+
+### Step 1: 读现状
+- **Status:** success
+- **Result location:** —
+- **Success result:** 读完 run_batch.py / topdown_trial.sh / topdown_parse.py /
+  topdown.conf / TOPDOWN.md / make_topdown_bundle.sh / make_bundle.sh，
+  确认 `topdown.json` 的字段布局（`checks_run` 才是「真跑过哪几条」，
+  `checks` 里混着数值和「没跑所以记 None」的项，不能拿 `checks` 整个去判）
+
+### Step 2: topdown_trial.sh 加 --cmd-timeout + run_status.json
+- **Status:** success
+- **Result location:** `crosslang/topdown_trial.sh`
+
+### Step 3: topdown_parse.py 加 event_codes
+- **Status:** success
+- **Result location:** `crosslang/topdown_parse.py`
+- **Success result:** 批量跑完只剩一堆 topdown.json，而「数不对」最常见的根因就是
+  事件号指错了 —— 光看计数值无从判断当时用的是 0x003a 还是别的，结果文件必须自证口径
+
+### Step 4: run_batch.py 加 --topdown / --per-lang / --pick / --no-metrics
+- **Status:** success
+- **Result location:** `crosslang/run_batch.py`
+
+### Step 5: make_topdown_bundle.sh 加 --trials-dir 全量模式
+- **Status:** success
+- **Result location:** `crosslang/deepswe-topdown-bundle-full-20260911.tar.gz`（4.4 MB，113 条）
+- **Success result:** 全量模式下基线文件「有就带、没有不拦」（full_trials 那 113 条
+  从没在开发机上重放过，硬要求会让全量包根本打不出来）；默认文件名多一段 `-full`
+  与已有的 `-20260911.tar.gz` / `-20260911b.tar.gz` 区分开
+
+### Step 6: TOPDOWN.md 加 §5.1 批量采集
+- **Status:** success
+- **Result location:** `crosslang/TOPDOWN.md`（+225 行）
+
+### Step 7: 实跑验证（x86_64 / cgroup v2 / 无 ARM PMU）
+- **Status:** success
+- **Result location:** `/tmp/claude-1000/.../scratchpad/{regress,e2e,plang,tdrender,bundleverify}`
+- **Success result:** 见下面「Key Findings」
+
+## Key Findings（实跑验证结论）
+
+- **`--topdown` × `--jobs 2` → 报错 + 退出码 1**，报错文案含完整机制说明
+- **不加 `--topdown` 时老报告逐字节不变**：新旧 `write_summary` 各跑一遍，
+  `SUMMARY.md` 1933/1933 字节、`summary.json` 3227/3227 字节，**逐字节一致**；
+  另做了端到端 smoke 实跑（真起容器）对比，归一化后完全一致
+- **新列渲染正确**（含混合情况）：全过 `✅` / 单条红 `❌C5` / 多条红 `❌C1,C5` /
+  直接法求和红 `❌求和` / 没采到 `—` / 完全没 topdown.json `—`
+- **分组小结算术手算对账通过**：python 两条 (.40,.10,.20,.30) 与 (.30,.06,.24,.40)
+  → 均值 35.0/8.0/22.0/35.0%；「全部」三条的 BadSpec 均值 (.10+.06+.04)/3 = 6.7%、
+  中位 6.0% —— 逐位吻合
+- **单条 topdown 失败不判 trial 失败**：用 stub 模拟「重放成功、自检失败、脚本退出码 2」，
+  `汇总 1/1 通过`、整体退出码 0、「校验」列 `❌C5`
+- **参数透传正确**：stub 收到 `<trial> -o <out> --cmd-timeout 30 --limit 3 --no-metrics`
+- **`--per-lang` 确定性**：同输入连跑 5 次选出同一批（含顺序）
+- **三种 --pick 取法手算对账通过**（5 条 10/20/30/40/50：median→20,30；
+  heaviest→40,50；lightest→10,20；同命令数按目录名升序兜底已验）
+- **某语言 0 条可用 → 贡献 0 条、打印「跳过」、不报错**；可用数 < N 时明确打「可用的不够 N 条」
+- **`--dry-run` 仍可用**（开/不开 topdown 都试过）
+- **打包 → 解开 → `sha256sum -c` 466 个文件 0 失败 → 包内脚本语法全过 →
+  113 条 trial 齐全（go×35 js×5 python×34 rust×5 ts×34）→ `run_batch.py` 在包里（755）**
+- 包内 `run_batch.py --topdown --per-lang 2 --dry-run` 可独立跑通
+
+## 只能到 ARM 机器上确认的（本机验不了）
+
+- `perf stat -a -G` 在真 ARM PMU + cgroup **v1** 上能不能采到数（本机 v2、无 armv8 PMU）
+- 真实 `topdown.json` 的四象限数值是否落在合理区间
+- `--topdown` 批量下**串行**是否真的不触发复用（C5 全绿）
+- 113 条串行的**真实耗时**（本文的数小时是按 x86 基线 2.35s/命令 × 1.4 折算的粗估）
+- `--no-metrics` 在 v1 上是否确实绕开了 `sinkhole cgroup 初始化失败`
+- 重建镜像上 `patch_identical` 是否仍成立（原本就开放的问题）
+
+## Files Changed
+
+- `crosslang/run_batch.py` - 加 `--topdown` / `--per-lang` / `--pick` / `--no-metrics` /
+  `--topdown-script`；汇总表追加 5 列；按语言的横向小结；summary.json 加 `sampling` 与 `topdown` 块
+- `crosslang/topdown_trial.sh` - 加 `--cmd-timeout` 透传；落 `run_status.json`（三个退出码分开记）
+- `crosslang/topdown_parse.py` - `topdown.json` 加 `event_codes`
+- `crosslang/make_topdown_bundle.sh` - 加 `--trials-dir` 全量模式；随包带 `run_batch.py`；
+  BUILD_INFO 的 `kind` / `features` 区分两种包
+- `crosslang/TOPDOWN.md` - 新增 §5.1 批量采集（流程 / 时间预算 / 为什么不能并发 /
+  `--per-lang` `--pick` / 输出格式 / 采废不判失败）；§8 新增「跨 trial 比较的注意事项」；
+  排障表 +5 行；文件清单加 `run_batch.py`
+- `crosslang/deepswe-topdown-bundle-full-20260911.tar.gz` - 新产物（4.4 MB / 113 条 / 466 文件）
+
+**Commit:** pending（用户明确要求不提交）
+
+### Step 8: 独立验收（另起 verifier subagent）+ 返工
+- **Status:** success
+- **Result location:** 本条目；验收者的脚本在 `/tmp/acceptance-topdown/`
+- **Success result:** 11 项里 **10 项通过、1 项不通过**，另有 2 条非阻塞观察。
+  验收者独立做的几件超出要求的事：用 `fractions.Fraction` 精确重算分组小结（16 组全吻合）；
+  逐字节对比覆盖 **10 个场景 × 3 份产物 = 30 项**（含「给了 `--per-lang` 但没真抽样」
+  这个最容易漏的组合）；把 `make_topdown_bundle.sh --trials-dir` 重打一遍确认**可复现**
+  （与出货包逐文件内容一致，仅 `built_utc` 与包名不同）；把 TOPDOWN.md §5.1 里的
+  6 条命令行**在解开的包内原样实跑**，文档里 11 条 `run_batch.py` 命令行的参数逐个核对
+- **不通过的一项（已修）：** `--pick heaviest` 的**并列兜底方向反了**。
+  根因 `take = list(reversed(avail))[:n]` —— `avail` 是按 `(n_commands, 目录名)` 升序排的，
+  整体 reverse 之后命令数确实降序了，但**并列项的目录名跟着变成降序**。
+  三条都是 50 条命令时 `N=1` 取到 `ccc` 而不是 `aaa`。
+  **危险之处在于它仍然是确定的**（不抖），跑起来一切正常、只是选错了人，
+  而且与 median / lightest 的兜底方向不一致 —— 两批数据之间就此不可比，报告上看不出来。
+  修法：`sorted(avail, key=lambda t: (-(t["n_commands"] or 0), t["name"]))[:n]`，
+  命令数取负单独作主键，目录名才保持升序。
+- **顺手补的一处（验收者列为「理论缺口，实践中不可达」）：**
+  `collect_topdown` 现在要求四个象限**都是数**才算 available。
+  否则会出现「available=True、自检全过、但某象限是 None」的条 —— 它既不进均值、
+  又不算被剔掉，`可用 N = 进均值 X + 剔除 Y` 这个等式凭空少一条，而报告上看不出少在哪。
+  修后实测闭合：可用 6 = 进均值 3 + 剔除 3
+- **返工后重跑的验证：** 语法全过；老报告仍**逐字节一致**（1933/1933、3227/3227）；
+  新列渲染与分组小结不变；`--topdown × --jobs 2` 仍 rc=1；采废不判失败仍 rc=0、
+  重放失败仍 rc=1；`--dry-run` rc=0；重打包 **465/465 sha 全过、113 条齐、
+  run_batch.py 与源同文件**，且包内 heaviest 并列兜底已是修复后的行为
+- **验收者自报的两点（已确认无残留）：** ① 验收期间源文件被我改过（措辞润色），
+  它已按最终版全部重跑；② 它的 `importlib` 测试在 `crosslang/__pycache__/` 留过一个
+  `.pyc`，已自行删除，`git status` 无新增

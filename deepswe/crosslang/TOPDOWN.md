@@ -1,15 +1,24 @@
-# ARM topdown 采集包 · 单条 trial
+# ARM topdown 采集包
 
-在 ARM 服务器上重放 **1 条** DeepSWE trial，同时在**宿主侧**按 cgroup 过滤采 PMU 事件，
+在 ARM 服务器上重放 DeepSWE trial，同时在**宿主侧**按 cgroup 过滤采 PMU 事件，
 算出 ARM L1 topdown 四象限（Retiring / BadSpec / FrontendBound / BackendBound）。
 
 本文件就是操作说明，从解包到出结果一条路走完。
 
+**包有两种，`cat BUILD_INFO` 的 `kind` 一行可辨：**
+
+| kind | 带几条 trial | 入口 | 用途 |
+|---|---|---|---|
+| `topdown` | 1 条（带 x86 基线对照） | `topdown_trial.sh` | 先把采集链路在目标机上跑通 |
+| `topdown-full` | 全量 113 条（多数无基线） | `run_batch.py --topdown` | 链路通了之后批量采，做横向对比 |
+
+两种包的脚本是同一套，差别只在带几条 trial、以及全量包多带一个 `run_batch.py`。
+
 **主流程 —— 顺序是有讲究的，别跳步：**
 
 ```
-解包核对 → probe_pmu.sh → 填 topdown.conf → build_arm.sh → topdown_trial.sh
-   §1          §2              §3               §4             §5
+解包核对 → probe_pmu.sh → 填 topdown.conf → build_arm.sh → topdown_trial.sh   单条，§5
+   §1          §2              §3               §4        ↘ run_batch.py --topdown  批量，§5.1
 ```
 
 - **探针为什么必须在最前**：它一次性确认三件事 ——
@@ -21,6 +30,10 @@
   都是白做。`probe_pmu.sh` 几十秒跑完，先把这三个问题问清楚。
 - **建镜像为什么排在填配置之后**：不为什么，纯粹是建镜像最慢，让它在后台跑的同时
   你正好可以按 TRM 核对事件号。两件事互不依赖。
+- **批量为什么不是「并发跑快一点」**：`--topdown` **强制串行**，`--jobs > 1` 会被直接
+  拒绝启动。理由是计数器竞争，不是「怕慢」—— 详见 §5.1。全量 113 条串行是**数小时**
+  级别，所以实际做法是 `--skip-missing` 只跑已建好的镜像、或 `--per-lang N` 每种语言
+  抽几条，而不是硬跑满。
 
 ---
 
@@ -274,7 +287,9 @@ vi topdown.conf
 
 ## 4. 建镜像 —— 最耗时的一步
 
-包里**没有镜像**，带的是 task 的 `environment/Dockerfile`（配方）。本包只有 1 条 trial：
+包里**没有镜像**，带的是 task 的 `environment/Dockerfile`（配方）。
+
+**单条包**只有 1 条 trial：
 
 ```
 returns-validated-error-accumula__8JQj5gw     # python，仓库 dry-python/returns
@@ -285,6 +300,21 @@ bash check_sources.sh                  # 先探上游源通不通（几秒）
 bash build_arm.sh --list returns-validated   # 只看会怎么改写 Dockerfile，不构建
 bash build_arm.sh returns-validated          # 真建
 ```
+
+**全量包**（`kind = topdown-full`）有 113 条，一条一个镜像，不可能一次全建好 ——
+也**不需要**全建好。`build_arm.sh` 的目标既可以是语言名，也可以是 trial 名前缀，
+并列多个目标用**空格**分隔（不是逗号，逗号会被当成一个目标名直接报「认不出目标」）：
+
+```bash
+bash check_sources.sh                  # 先探上游源
+bash build_arm.sh --list python        # 只看会怎么改写，不构建
+bash build_arm.sh python               # 建 python 那一批
+bash build_arm.sh python go            # 两种语言一起建（空格分隔）
+bash build_arm.sh returns-validated    # 只建某一条（按 trial 名前缀）
+```
+
+建到哪算哪，然后用 `run_batch.py --skip-missing` 跑已经建好的那部分，边建边跑 ——
+见下面 §5.1。
 
 ⚠️ 重建出来的镜像**不等于**原 amd64 镜像。`patch_identical` 在重建镜像上是否仍然成立，
 本身就是这轮要测的东西之一。内网 TLS 中间人的处理见 `get_ca_cert.sh` / `detect_mitm.sh`，
@@ -365,14 +395,217 @@ replay 一退出 tail 就退出，perf 跟着收尾打印。比起「后台起 p
     ├── perf.json | perf.csv    # perf 原始输出
     ├── perf.stderr
     ├── replay.log              # 重放全部输出，出问题先看它
+    ├── run_status.json         # 三个退出码分开记：replay_rc / perf_rc / parse_rc
     └── topdown.json            # 解析结果，机读（含 backend_method / checks_run / 每条自检的过没过）
 ```
+
+> `run_status.json` 为什么要单独存在：本脚本最后只能吐**一个**退出码，而它把两件
+> 正交的事压成了一个数 —— `replay_rc` 回答「这条 trial 重放成没成」（保真度那条线），
+> `parse_rc` 回答「四象限的自检过没过」（数据可信度，2 = 数拿到了但自检没过）。
+> 调用方（`run_batch.py`）看到一个非零退出码分不清是哪一种，而把 trial 判成失败是
+> **错的**：topdown 采废不影响 `git diff` 逐字节相等这个结论。
 
 单独重新解析一份已有的 perf 输出（不用重跑）：
 
 ```bash
 python3 topdown_parse.py <outdir>/<trial名>/topdown/perf.json --slots 8
 ```
+
+**要一次跑多条 trial 就别写 for 循环**，用 `run_batch.py --topdown` —— 见 §5.1。
+
+---
+
+## 5.1 批量采集 —— `run_batch.py --topdown`
+
+链路在单条上跑通之后，用 `run_batch.py` 批量采。**不要自己写 for 循环去调
+`topdown_trial.sh`** —— `run_batch.py --topdown` 干的就是这件事，外加排程、跳过没建好
+镜像的、收三个退出码、汇总四象限。
+
+```bash
+# 标准姿势：只跑已建好镜像的那些，关掉 replay.py 自己那套 cgroup 指标
+python3 run_batch.py --topdown --skip-missing --no-metrics
+
+# 先探路：每种语言抽 2 条，十几分钟出一版横向对比
+python3 run_batch.py --topdown --per-lang 2 --no-metrics
+
+# 只看某几种语言
+python3 run_batch.py --topdown --per-lang 2 --only python,go --no-metrics
+
+# 不真跑，只看这轮会选中哪些、资源账多少
+python3 run_batch.py --topdown --per-lang 2 --dry-run
+```
+
+完整批量流程（承接前面的 §1~§4）：
+
+```
+probe_pmu.sh  →  填 topdown.conf  →  build_arm.sh <语言或前缀>  →  run_batch.py --topdown --skip-missing --no-metrics
+   §2                §3                      §4                              §5.1
+```
+
+> **`--no-metrics` 在 cgroup v1 的机器上是必须的**，不是可选项。`replay.py` 那套
+> per-command 指标只认 v2 的 `cpu.stat` / `memory.current`，v1 上它会在启动时报
+> `sinkhole cgroup 初始化失败`，**整条采集起不来**。`run_batch.py` 默认就不采指标
+> （等价于 `--no-metrics`），显式写出来只是让命令行自己说明白。它**不影响 topdown
+> 一个数**，也不影响 `patch_identical` —— PMU 是宿主侧 `perf -G` 采的，两条路互不相干。
+
+### ⚠️ 为什么 `--topdown` 不能并发 —— 这条是硬的
+
+`--topdown` 与 `--jobs > 1` **互斥，并且直接报错退出**，不是警告后继续。
+
+这和 `--metrics` 那条互斥**机制不同，也更硬**：
+
+| | `--metrics` 并发 | `--topdown` 并发 |
+|---|---|---|
+| 抢的是什么 | **机器资源**：CPU 配额、内存、磁盘队列 | **同一批物理计数器**（PMU 上的通用计数器，全机共享） |
+| 后果 | 数字被挤压得偏悲观，但每条 trial 各有各的一份数据 | 触发**复用**，每个事件只在一部分时间窗口里真计数，其余靠外推 |
+| 还能用吗 | 不能横向比，但数本身是真的 | **整批作废** |
+
+算笔账：PMU 上的通用计数器 Neoverse 一般 **6 个**，NMI watchdog 开着只剩 **5 个**。
+而一轮 topdown 要开 **4~6 个**事件（残差法 4 / 直接法 5 / 再加 `EV_STALL_SLOT` 6），
+还要求它们作为一个 `{}` 组被内核**同时上、同时下**。并发 N 条就是 N 个
+`perf stat -a` 会话同时要这批计数器，总需求 ≈ N × 4~6 —— 只要 N ≥ 2 就一定超。
+
+超了内核**不报错**，它会复用。表现是：
+
+- 每条 trial 的 **C5（最低调度占比 > 99.9%）自检全部失败**；
+- 四象限的分子和分母来自**不同的时间窗口**，比值不再有物理意义；
+- 而屏幕上每条都「跑完了」，四个数也都规规矩矩落在 0~1 之间。
+
+所以 `run_batch.py` 在这里选择**报错退出**：一批看着像真的假数据，比跑不起来危险得多。
+
+### 时间预算 —— 必须先算，再决定跑多少
+
+`--topdown` 强制串行，所以整批耗时 ≈ **各条耗时之和**，没有并发可以摊。
+
+以包里那条 python trial 的 x86 基线为参照：**98 条命令 / 222.6s**，约 **2.3s/命令**。
+ARM 上只会更慢（重建镜像、不同微架构），按 **×1.4** 粗估：
+
+| 跑法 | 条数 | 命令合计 | 粗估耗时 |
+|---|---|---|---|
+| 全量 113 条 | 113 | 约 8000+ | **数小时**（4~8h 量级，取决于机器） |
+| `--per-lang 2 --pick median`（默认） | 10 | 324 | **约 18 分钟** |
+| `--per-lang 2 --pick heaviest` | 10 | 1243 | **约 68 分钟** |
+| `--per-lang 2 --pick lightest` | 10 | 178 | 约 10 分钟 |
+
+**结论：不要一上来就跑满 113 条。** 实际做法是
+
+1. `--per-lang 2`（默认 median）先出一版横向对比，十几分钟；
+2. 觉得某几种语言值得细看，再 `--only <语言> --skip-missing` 跑那一批；
+3. 真要全量，挂 tmux / screen 过夜。
+
+> 跑之前先 `sudo -v` 把密码缓存起来 —— `perf stat -a` 要 root，串行批次跑几小时，
+> 中途卡在密码提示上时前面的容器已经起来了。
+
+### `--per-lang N` / `--pick` —— 每种语言抽 N 条
+
+```bash
+python3 run_batch.py --topdown --per-lang 2 --no-metrics                  # 默认 median
+python3 run_batch.py --topdown --per-lang 2 --pick heaviest --no-metrics  # 数据更干净，慢 3.8 倍
+python3 run_batch.py --topdown --per-lang 1 --pick lightest --no-metrics  # 只验链路通不通
+```
+
+选取规则：
+
+1. 按 `meta.json` 的 `language` 分组；
+2. **只在镜像已建好的里面挑**（和 `--skip-missing` 是同一个判断，两个同时给不冲突）；
+3. 组内按 `n_commands` 排序后按策略取 N 条，**同命令数按 trial 目录名升序兜底** ——
+   同样的输入必须选出同一批，否则两次跑的结果没法比；
+4. 某语言一条可用的都没有 → **贡献 0 条，不报错也不中断**（那正是「这门语言的镜像还没建」）。
+
+三种策略的权衡 —— **这是耗时与数据干净度的取舍，不是好坏之分**：
+
+| `--pick` | 取哪几条 | 快慢 | 数据干净度 |
+|---|---|---|---|
+| `median`（默认） | 命令数**正中间**的 N 条 | 快（全量各取 2 条约 18 分钟） | 一般 |
+| `heaviest` | 命令数**最多**的 N 条 | 慢 3.8 倍（约 68 分钟） | **最好** |
+| `lightest` | 命令数**最少**的 N 条 | 最快（约 10 分钟） | 最差 |
+
+> **为什么轻的 trial 数据更脏**：topdown 采的是**整条 trial 的聚合值**，里面固定含
+> **容器启动**和收尾的 `git diff` 保真校验。trial 越轻，这笔固定开销在聚合值里占的比重
+> 越大，四象限就越是在描述「容器启动 + 解释器 import 长什么样」，而不是这个仓库的
+> workload 长什么样。想要更干净的 workload 画像就用 `--pick heaviest`，代价是慢几倍。
+> **真正干净的对比要等 per-command 归因那一版**，这一版只能在这两头之间选。
+
+开跑前会把选取结果摊开，用的哪种策略、每条多少命令都在里面：
+
+```
+选取      --per-lang 2 --pick median（按命令数取中位，同数按名字）
+  python      3/34 已建镜像 → 取 2 条
+                <trial-a>                                     (26 条命令)
+                <trial-b>                                     (26 条命令)
+  go          1/35 已建镜像 → 取 1 条（可用的不够 2 条）
+                <trial-c>                                     (28 条命令)
+  typescript  0/34 已建镜像 → 跳过
+  合计 3 条
+```
+
+`SUMMARY.md` 和 `summary.json` 里都会记下这轮是抽样跑的（`--per-lang` 的值、`--pick`
+的值、各语言实际取了几条、总共多少条可用）—— 抽样批次和全量批次的报告长得一模一样，
+不留痕的话事后会被当成全量结论去引用。
+
+### 批量的输出
+
+```
+runs/<UTC 时间戳>/                      # 或 -o 指定的目录
+├── SUMMARY.md                          # 人读：总表 + topdown 横向小结 + 逐条
+├── summary.json                        # 机读：每条带完整 topdown 结果
+├── logs/<trial>.log                    # 每条的 topdown_trial.sh 全部输出
+└── <trial名>/
+    ├── verdict.json                    # 重放判定（patch_identical 等）
+    ├── commands.jsonl
+    └── topdown/
+        ├── perf.json | perf.csv        # perf 原始输出
+        ├── perf.stderr
+        ├── replay.log
+        ├── run_status.json             # 三个退出码分开记，见下
+        └── topdown.json                # 四象限 + 逐条自检
+```
+
+`SUMMARY.md` 的总表**在原有各列后面追加**五列（不另起一张表 —— 这张表就是拿来横向
+对比不同 benchmark 的，拆开就得来回对着行名找）：
+
+```
+| 语言 | 退出 | 保真 | rc_match | rc_语义 | 耗时s | vs基线 | Retiring | BadSpec | FE | BE | 校验 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| python | 0 | ✅ | 95/98 | 97/98 | 240.1 | — | 31.2% | 8.1% | 14.7% | 46.0% | ✅ |
+| go     | 0 | ✅ | 66/69 | 68/69 | 110.4 | — | 28.0% | 6.2% | 19.1% | 46.7% | ❌C5 |
+| rust   | 0 | ✅ | 74/76 | 75/76 | 300.2 | — | —      | —     | —     | —     | — |
+```
+
+- 四个比值是百分比、保留一位小数；
+- **「校验」列写明是哪一条红了**（`❌C1` / `❌C5` / `❌C1,C5` / `❌求和` / `❌X`），
+  不是笼统一个 ❌ —— C1 红了是「SLOTS 偏小或事件号错」，C5 红了是「计数器复用」，
+  两者的排查方向毫无交集，只写 ❌ 等于把诊断信息扔掉；
+- 没采到写 `—`；
+- **不加 `--topdown` 时这五列完全不出现**，老报告能逐字节 diff。
+
+后面还有一张按语言分组的**横向小结**（各象限的均值 / 中位数）。注意它只统计
+**自检也全过**的那些条：C5 红了的那组数分子分母来自不同时间窗口，混进平均值只会
+污染整组，而平均值这个形式恰恰把「哪一条坏了」抹掉。被剔掉几条会单独成列写出来。
+
+### ⚠️ 单条 topdown 采废，不算这条 trial 失败
+
+这两件事**正交**，报告里也分开记：
+
+| | 判据 | 归谁管 |
+|---|---|---|
+| **保真度** | `patch_identical` —— 容器内 `git diff --binary` 与 `model.patch` 逐字节相等 | `replay.py` → `verdict.json` |
+| **数据可信度** | C1~C5（+ X）自检 | `topdown_parse.py` → `topdown.json`，退出码 2 |
+
+`topdown_trial.sh` 最后只能吐**一个**退出码，它把这两件事压成了同一个数。所以它额外落
+一份 `run_status.json`，把三个退出码分开记：
+
+```json
+{ "trial": "...", "replay_rc": 0, "perf_rc": 0, "parse_rc": 2 }
+```
+
+`run_batch.py` 按 `replay_rc` 判这条 trial 成没成 —— **某条 topdown 采废了，照常记录该条
+的重放结论，topdown 那几列标 `—` 或 `❌Cx`**。逐条那一节会写清楚原因和三个退出码的分解。
+
+（例外：**早于重放启动**的失败 —— 事件号不合法、没 perf、等不到容器 —— 不会写
+`run_status.json`。那种情况这条 trial 确实没跑起来，按失败计，这是有意的。）
+
+---
 
 ---
 
@@ -506,11 +739,38 @@ PMU 是用来回答「时间花在哪」的，不是用来回答「环境对不�
   `-G` 天然把它滤掉了，不用额外处理。
 - **per-command 归因**。这一版给不出「哪条命令 Backend 高」，只有一个总数。
   那是后续工作（思路：按命令边界切窗口，或者在 replay.py 里对每条命令单独开关 perf）。
+- **干净的跨 trial 对比**。原因见紧接着的下一节。
 - **cgroup v1 机器上 `replay.py` 的 per-command cgroup 指标**（`usage_usec` / `mem_peak`）。
   它只认 v2 的 `cpu.stat` / `memory.current`，v1 上要重写成
   `cpuacct.usage` / `memory.usage_in_bytes` / `blkio.*` 三套分散在不同层级的读法 ——
   不在这一版范围内。v1 上加 `--no-metrics` 绕过即可，**topdown 四象限和
   `patch_identical` 都不受影响**（详见 §0）。
+
+### ⚠️ 跨 trial 比较的注意事项 —— 批量结果读之前先看这一节
+
+`run_batch.py --topdown` 会给出一张按语言分组的横向小结。它有用，但**不是纯 workload
+对比**，下面三件事必须一起带着看：
+
+1. **这是整条 trial 的聚合值。** 采集窗口从主容器出现到 `replay.py` 退出，里面含
+   容器启动、全部重放命令、以及收尾的 `git diff` 保真校验。没有任何一段被剔掉。
+2. **里面有一笔固定开销。** 容器启动 + 收尾 `git diff` 的量级跟 trial 大小基本无关，
+   是每条都要交的「入场费」。于是**trial 越轻，它在聚合值里占的比重越大** ——
+   一条 23 条命令的 trial 和一条 439 条命令的 trial，四象限里「容器启动长什么样」
+   的成分完全不是一个量级。
+3. **各 trial 的命令数差异极大。** 全量 113 条里从 10 条到 439 条都有，相差 40 倍。
+   所以两条 trial 的四象限之差，**既可能是 workload 真的不同，也可能只是一条更轻**。
+
+怎么用：
+
+- 横向小结里的差异，先回上面那张总表看这几条各有多少命令（`--per-lang` 的选取打印
+  和 `SUMMARY.md` 的抽样行都带命令数）。命令数量级相近时，横向比才比较有意义。
+- 想让 workload 的成分更突出，用 `--pick heaviest`（见 §5.1），代价是慢几倍。
+- **不同 `--pick` 策略选出的批次之间不可直接比较** —— median 那批天生更轻。
+  `summary.json` 的 `sampling.pick` 记着这轮用的是哪种。
+- 真正干净的对比得等 per-command 归因那一版，那时才能把容器启动和收尾单独摘出来。
+
+另外，`patch_identical` 与 topdown 自检是**正交**的两件事（见 §5.1 最后一节）：
+某条 topdown 采废不代表这条 trial 的重放结论不可信，反过来也一样。
 
 ### 短命令的数据有效性 —— 读数之前先看这一节
 
@@ -571,7 +831,11 @@ arm64 那一组里**最快的一条也要 0.201s，最快的 `cat` 是 0.237s** 
 | 「60s 内没等到重放容器」 | 镜像不在本地 / 存量容器占着名字 | 看脚本打出来的 `replay.log` 尾部。`bash build_arm.sh returns-validated` 建镜像；`docker ps -a --filter name=^replay_` 清存量 |
 | 采到的数偏小，而且容器明明在跑 | 采到 `-sink` 上去了 | sidecar 是独立 cgroup。脚本已经排掉 `-sink`，如果是手工敲的 perf 命令，检查用的是不是主容器的 ID |
 | `perf` 命令在，但一跑就报 `perf not found for kernel ...` | Debian/Ubuntu 的 `/usr/bin/perf` 是个按 `uname -r` 找真身的 **wrapper 脚本** | 装 `linux-tools-$(uname -r)`；云镜像上这个具体版本常不在源里，退一步装 `linux-tools-generic` |
-| 采集跑到一半卡住不动 | `sudo` 在等密码 | 先 `sudo -v` |
+| 采集跑到一半卡住不动 | `sudo` 在等密码 | 先 `sudo -v`。串行批次跑几小时，这一条在批量下尤其要命 |
+| `run_batch.py` 报「`--topdown` 与 `--jobs N` 互斥，拒绝启动」 | 并发下多个 `perf stat -a` 抢同一批物理计数器 | 去掉 `--jobs`（或写 `--jobs 1`）。这条**不能绕**，绕过去采到的是一批 C5 全红的废数据。要快就用 `--per-lang N` 少跑几条，见 §5.1 |
+| `run_batch.py --topdown` 报「需要 topdown_trial.sh，没找到」 | 解开的是**主重放包**（`deepswe-replay-bundle-*`），它不带 topdown 那一套 | 用 topdown 包：`kind = topdown-full` 的那个（`cat BUILD_INFO`） |
+| 批量跑完，某几条的 topdown 列是 `—` | 那几条采废了（perf 没起来 / 等不到容器 / 解析没数） | 看 `SUMMARY.md` 逐条那一节里该条的「不可用」原因和三个退出码的分解，再看 `<trial>/topdown/perf.stderr`。**这不影响该条的 `patch_identical`**，两者正交 |
+| 批量跑完，几乎每条都 `❌C5` | 计数器复用 —— 多半是同时还有别的 perf 会话，或 watchdog 占着 | `pgrep -a '^perf'` 看有没有别人在跑；`cat /proc/sys/kernel/nmi_watchdog` 非 0 就 `sudo sysctl kernel.nmi_watchdog=0`（**采完改回 1**）。确认没并发跑 `run_batch.py` 的第二个实例 |
 | 异构核（多个 `armv8*` PMU） | 事件只在一簇核上打开，进程跑到别的簇就采不到 | 用 `docker --cpuset-cpus` 把容器钉在一簇上；或每个 PMU 各采一轮自己合并（本版不支持） |
 
 ---
@@ -583,12 +847,13 @@ arm64 那一组里**最快的一条也要 0.201s，最快的 `cat` 是 0.237s** 
 | `TOPDOWN.md` | 本文件，入口 |
 | `topdown.conf` | **唯一需要你改的文件**：PMU / SLOTS / 事件号（含后端口径开关 `EV_STALL_SLOT_BE` 与可选的 `EV_STALL_SLOT`）/ EV_EXTRA / 输出格式 |
 | `probe_pmu.sh` | 目标机第一件事：验事件号有效性 + 计数器余量 + 活体验证 `-G` |
-| `topdown_trial.sh` | 采集主脚本 |
+| `topdown_trial.sh` | 采集主脚本（单条）。落 `topdown.json` 与 `run_status.json` |
+| `run_batch.py` | **批量入口**（只在 `kind = topdown-full` 的包里）：`--topdown` 逐条调 `topdown_trial.sh`，汇总四象限。`--per-lang N` / `--pick` 抽样。**perf 逻辑不在这里，全在 `topdown_trial.sh`** |
 | `topdown_parse.py` | 解析 perf 输出 → 四象限 + 自检（直接法：求和 + C2~C5；残差法：C1~C5；填了 `EV_STALL_SLOT` 再加 X）+ `topdown.json`（只用标准库） |
 | `replay.py` | 重放引擎（与主包同一份） |
 | `build_arm.sh` | 从 `mars-base` 重建 task 镜像 |
 | `check_sources.sh` | 构建期上游源连通性探测 |
 | `preflight.sh` | 重放环境预检（cgroup / docker / netns 活体测试） |
 | `get_ca_cert.sh` / `detect_mitm.sh` | 内网 TLS 中间人：检测 + 取 CA |
-| `returns-validated-error-accumula__8JQj5gw/` | 唯一一条 trial。`replay/` 下是 x86 基线对照 |
+| `<trial名>/` | trial 目录。单条包只有 1 条且 `replay/` 下带 x86 基线对照；全量包 113 条、多数没有基线（那 113 条从没在开发机上重放过，属预期） |
 | `BUILD_INFO` / `SHA256SUMS` | 这份包的来源与全量指纹 |

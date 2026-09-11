@@ -17,6 +17,14 @@
     消除的来源（双侧超时、上游 flaky 测试、机器快慢导致的单侧超时、dash 方言），
     见 `INDEX.md`「rc 不匹配逐条归因」。所以这里只报差异，不判失败。
 
+`--topdown` 顺带采 ARM topdown 四象限。它**强制串行**（与 `--jobs > 1` 互斥且报错退出），
+理由比 `--metrics` 那条更硬，见 main() 里那段报错文案：多个 `perf stat -a` 会话争抢的是
+**同一批物理计数器**，超过通用计数器个数就触发复用，整批数据一起作废。
+
+`--topdown` 打开时每条 trial 改调 `topdown_trial.sh` 而不是直接调 `replay.py` ——
+perf 那套逻辑（`-G` 的参数顺序、cgroup v1/v2 的路径口径、等容器、排掉 sidecar）
+只有那一个地方有，这里绝不再写第二份。
+
 用法:
     python3 run_batch.py                          # 跑全部，输出到 ./runs/<时间戳>
     python3 run_batch.py --only go,rust           # 只跑指定语言
@@ -24,6 +32,8 @@
     python3 run_batch.py -j auto                  # 按本机 CPU / 可用内存自动定并发度
     python3 run_batch.py --smoke 5                # 每条只跑前 5 条命令（冒烟，跳过保真度校验）
     python3 run_batch.py --dry-run                # 只做预检和排程，不真跑
+    python3 run_batch.py --topdown --skip-missing --no-metrics   # ARM 上批量采 topdown
+    python3 run_batch.py --topdown --per-lang 2 --no-metrics     # 每种语言抽 2 条先看横向
 """
 
 import collections
@@ -34,6 +44,7 @@ import json
 import os
 import pathlib
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -41,6 +52,32 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 LANG_ORDER = ["python", "go", "rust", "typescript", "javascript"]
+
+# topdown_parse.py 的自检键 → 报告里那一列的短标签。
+# 「是哪一条红了」必须出现在汇总表里，不能只打一个 ❌：C1 红了是「SLOTS 偏小 / 事件号错」，
+# C5 红了是「计数器复用」，两者的排查方向毫无交集。只写 ❌ 等于把诊断信息扔掉，
+# 事后还得回去逐条翻 topdown.json。
+# 顺序 = 报告里列出失败项的顺序，和 topdown_parse.py 的打印顺序保持一致。
+TOPDOWN_CHECK_LABELS = [
+    ("counters_present",                 "事件齐全"),   # 事件全都采到了吗
+    ("nonzero",                          "计数非零"),   # CPU_CYCLES 不为 0（cgroup 没滤空）
+    ("sum_in_tolerance",                 "求和"),   # 只有直接法才是校验
+    ("C1_residual_nonneg",               "C1"),
+    ("C2_op_spec_ge_op_retired",         "C2"),
+    ("C3_op_retired_per_cycle_le_slots", "C3"),
+    ("C4_quadrants_in_range",            "C4"),
+    ("C5_no_multiplexing",               "C5"),
+    ("X_backend_cross_check",            "X"),
+]
+
+# 四象限在报告里的列名。用短名是为了让这四列能塞进已经很宽的那张总表 ——
+# 总表是横向对比不同 benchmark 用的，一行折了就白做了。
+TOPDOWN_QUADRANTS = [
+    ("Retiring",      "Retiring"),
+    ("BadSpec",       "BadSpec"),
+    ("FrontendBound", "FE"),
+    ("BackendBound",  "BE"),
+]
 
 # replay.py 给每条 trial 附带一个 403 sinkhole sidecar 容器，那边写死 `--memory=256m`。
 # 算资源账时不能漏掉它：并发 32 就是额外 8GB。
@@ -68,6 +105,213 @@ def find_replay():
         if p.exists():
             return p
     return None
+
+
+def find_topdown():
+    """topdown_trial.sh 与本脚本同级（两个包里都是这个布局）。"""
+    p = HERE / "topdown_trial.sh"
+    return p if p.exists() else None
+
+
+def read_json(p):
+    """读一份 JSON，读不到 / 坏了都返回 None。
+
+    这些产物是采集脚本写的旁证，不是判定依据 —— 少一份、坏一份都不该让汇总跑不出来。
+    """
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def topdown_verdict(raw):
+    """从 topdown.json 算出「哪几条自检红了」和那一列要显示的字符串。
+
+    判据取 `checks_run`（topdown_parse.py 真正跑过的那几条）而不是整个 `checks` 字典 ——
+    后者里混着 `sum_tolerance` / `C1_slots_min` / `min_pcnt_running` 这类**数值**，
+    还混着「这轮没跑所以记 None」的项（残差法下的 sum_in_tolerance、没开 X 时的
+    X_backend_cross_check）。拿 `checks` 整个去判会把「没跑」误报成「没过」。
+
+    counters_present / nonzero 两条是例外：它们在算四象限之前就落了，不进 checks_run，
+    但恰恰是「一条都没采到」时唯一红的东西，必须单独补上。
+
+    值是 None 且**跑过了**算失败（C5 的 None = perf 输出里没有调度占比字段，
+    topdown_parse.py 那边也是按失败处理的）。
+    """
+    checks = (raw or {}).get("checks") or {}
+    run = list((raw or {}).get("checks_run") or [])
+    order = [k for k, _ in TOPDOWN_CHECK_LABELS
+             if k in ("counters_present", "nonzero") and k in checks]
+    order += [k for k, _ in TOPDOWN_CHECK_LABELS if k in run and k not in order]
+    label = dict(TOPDOWN_CHECK_LABELS)
+    failed = [label.get(k, k) for k in order if checks.get(k) is not True]
+    return order, failed
+
+
+def collect_topdown(out, name):
+    """把 topdown_trial.sh 落下的 run_status.json + topdown.json 读成一个 dict。
+
+    两份文件各回答一个问题，缺一不可：
+      run_status.json  三个退出码分开记（重放 / perf / 解析）—— 脚本自己只能吐一个
+                       退出码，而「trial 失败」和「PMU 数不可信」是正交的两件事。
+      topdown.json     四象限 + 逐条自检 + 事件计数。
+
+    采废了就返回 available=False 并写清原因 —— **绝不让它影响这条 trial 的重放结论**。
+    """
+    td_dir = out / name / "topdown"
+    status = read_json(td_dir / "run_status.json")
+    raw = read_json(td_dir / "topdown.json")
+    rel = lambda f: str((td_dir / f).relative_to(out))
+
+    info = {
+        "available": False,
+        "reason": None,
+        "quadrants": None,
+        "backend_method": (raw or {}).get("backend_method"),
+        "slots": (raw or {}).get("slots"),
+        "sum_check_meaningful": (raw or {}).get("sum_check_meaningful"),
+        "cross_check_enabled": (raw or {}).get("cross_check_enabled"),
+        "n_events": (raw or {}).get("n_events"),
+        # 事件计数与事件号都留下来：事后只剩报告时，「数不对」最常见的根因就是事件号
+        # 指错了，而光看计数值无从判断当时用的是 0x003a 还是别的。
+        "events": (raw or {}).get("events"),
+        "event_codes": (raw or {}).get("event_codes"),
+        "checks": (raw or {}).get("checks"),
+        "checks_run": (raw or {}).get("checks_run"),
+        "checks_failed": None,
+        "verify": "—",
+        "replay_rc": (status or {}).get("replay_rc"),
+        "perf_rc": (status or {}).get("perf_rc"),
+        "parse_rc": (status or {}).get("parse_rc"),
+        "artifacts": {"run_status_json": rel("run_status.json"),
+                      "topdown_json": rel("topdown.json")},
+    }
+
+    if raw is None:
+        info["reason"] = ("没有 topdown.json，采集没跑到解析这一步"
+                          "（perf 没起来 / 等不到容器 / 重放自己就挂了）")
+        return info
+    _, failed = topdown_verdict(raw)
+    info["checks_failed"] = failed
+    quad = raw.get("topdown")
+    if not quad:
+        info["reason"] = ("解析在算四象限之前就停了"
+                          + (f"，未通过：{'、'.join(failed)}" if failed else ""))
+        return info
+
+    vals = {k: quad.get(k) for k, _ in TOPDOWN_QUADRANTS}
+    # 四个象限必须都是数才算「可用」。少一个就整条判不可用，而不是留个半拉子的
+    # available=True —— 后者会让分组小结的账对不上：这条既进不了均值（值不是数），
+    # 又不算「自检没过被剔掉」，于是「可用 N 条 = 进均值 X 条 + 剔除 Y 条」这个
+    # 等式凭空少一条，而报告上看不出少在哪。
+    # （topdown_parse.py 一向是四个一起写，所以现实中走不到这里；但账要自洽。）
+    bad = [k for k, v in vals.items() if not isinstance(v, (int, float))]
+    if bad:
+        info["reason"] = f"四象限里有值不是数字：{'、'.join(bad)}"
+        return info
+
+    info["available"] = True
+    info["quadrants"] = vals
+    info["sum"] = quad.get("sum")
+    info["op_retired_per_cycle"] = quad.get("op_retired_per_cycle")
+    info["verify"] = "✅" if not failed else "❌" + ",".join(failed)
+    return info
+
+
+def pick_per_lang(trials, missing_ids, n, strategy="median"):
+    """每种语言只取 N 条，返回 (选中的 trial, 逐语言的选取明细)。
+
+    两条铁律，与策略无关：
+      1. **只在镜像已建好的里面挑**。目标机上镜像是边建边跑的，挑到没建的那条等于
+         白排一个必然跳过的槽。
+      2. **确定性，不用随机**。同样的输入必须选出同一批，否则两次跑的数没法比。
+         所以排序键一律是 (n_commands, 目录名)，命令数并列时也不会抖。
+
+    三种策略 —— 差别是**耗时与数据干净度的权衡**，不是好坏之分：
+
+      median（默认）  按 n_commands 升序取**正中间的 N 条**。快。
+      heaviest        降序取前 N。命令最多的那几条。
+      lightest        升序取前 N。最快，只想验证链路通不通时用。
+
+    ⚠️ 为什么这个选择会影响数据质量：topdown 采的是**整条 trial 的聚合值**，里面固定
+       含容器启动和收尾 `git diff` 的开销。trial 越轻，这笔固定开销在聚合值里占比越大，
+       四象限就越掺进「容器启动 + 解释器 import 长什么样」的成分，而不是 workload 本身。
+       heaviest 的信噪比明显更好，代价是慢几倍（全量 113 条里五种语言各取 2 条，
+       median 合计约 18 分钟、heaviest 约 68 分钟，差 3.8 倍）。
+       真正干净的对比要等 per-command 归因那一版，这一版只能在这两头之间选。
+
+    某语言一条可用的都没有 → 贡献 0 条，不报错也不中断：那正是「这台机器上这门语言
+    的镜像还没建」，是预期内的情况，不该拖垮整批。
+    """
+    by_lang = {}
+    for t in trials:
+        by_lang.setdefault(t["lang"], []).append(t)
+    picked, report = [], []
+    for lang, ts in by_lang.items():
+        avail = [t for t in ts if id(t) not in missing_ids]
+        # n_commands 可能是 None（meta.json 没这个字段），当 0 排到最前而不是炸掉
+        avail.sort(key=lambda t: ((t["n_commands"] or 0), t["name"]))
+        if strategy == "heaviest":
+            # ⚠️ 这里**不能**写成 `list(reversed(avail))[:n]`。avail 是按
+            # (n_commands, 目录名) 升序排的，整体 reverse 之后命令数确实降序了，
+            # 但**并列项的目录名也跟着变成降序** —— 三条都是 50 条命令时取到的是
+            # 名字最大的那几条，与「同数按目录名升序兜底」正好相反。
+            # 仍然是确定的（不会抖），所以跑起来一切正常，只是选错了人，
+            # 而且跟 median / lightest 的兜底方向不一致 —— 两批数据之间就此不可比。
+            # 只有把命令数取负单独作为主键，才能让目录名保持升序。
+            take = sorted(avail, key=lambda t: (-(t["n_commands"] or 0), t["name"]))[:n]
+            take.sort(key=lambda t: ((t["n_commands"] or 0), t["name"]))
+        elif strategy == "lightest":
+            take = avail[:n]
+        else:
+            # 正中间的 N 条：start = (L - N) // 2。L 是偶数、N 是偶数时正好居中；
+            # L 为奇数时整除向下取，偏轻的那一侧 —— 偏向更快，且是确定的。
+            start = max(0, (len(avail) - n) // 2)
+            take = avail[start:start + n]
+        picked.extend(take)
+        report.append({
+            "语言": lang,
+            "n_candidates": len(ts),
+            "n_available": len(avail),
+            "n_picked": len(take),
+            "short": len(avail) < n,
+            "trials": [{"trial": t["name"], "n_commands": t["n_commands"]} for t in take],
+        })
+    return picked, report
+
+
+# 三种策略在报告里的人话说明。选取结果里必须带上用的是哪种：不同策略选出的批次
+# 之间不可直接比较（median 的那批天生更轻、固定开销占比更大），报告里看不出策略
+# 就等于把两批不可比的数摆在一起。
+PICK_DESC = {
+    "median":   "按命令数取中位，同数按名字",
+    "heaviest": "按命令数降序取，同数按名字",
+    "lightest": "按命令数升序取，同数按名字",
+}
+
+
+def print_pick(report, n, strategy):
+    """开跑前把选取结果摊开。
+
+    必须打：抽样跑和全量跑的报告长得一模一样，不把「这轮只挑了几条、每种语言各几条、
+    哪几条、用的哪种策略」当场说清楚，事后翻 SUMMARY.md 会直接把它当成全量结论去引用。
+    每条的命令数也要带上 —— 那是判断这批 topdown 数据里掺了多少启动开销的唯一线索。
+    """
+    print(f"选取      --per-lang {n} --pick {strategy}"
+          f"（{PICK_DESC.get(strategy, strategy)}）")
+    w = max((len(r["语言"]) for r in report), default=6)
+    wf = max((len(f"{r['n_available']}/{r['n_candidates']}") for r in report), default=3)
+    for r in report:
+        frac = f"{r['n_available']}/{r['n_candidates']}"
+        if r["n_picked"] == 0:
+            print(f"  {r['语言']:<{w}}  {frac:<{wf}} 已建镜像 → 跳过")
+            continue
+        short = f"（可用的不够 {n} 条）" if r["short"] else ""
+        print(f"  {r['语言']:<{w}}  {frac:<{wf}} 已建镜像 → 取 {r['n_picked']} 条{short}")
+        for x in r["trials"]:
+            nc = "?" if x["n_commands"] is None else f"{x['n_commands']} 条命令"
+            print(f"  {'':<{w}}    {x['trial']:<45} ({nc})")
+    print(f"  合计 {sum(r['n_picked'] for r in report)} 条")
 
 
 def toml_field(text, key, default):
@@ -283,24 +527,44 @@ def heartbeat_loop(hb_stop, lock, running, done, n_total, t_all):
                   f"（失败 {n_fail}）/ 共 {n_total} ｜ {head or '（无）'}{more}", flush=True)
 
 
-def run_one(idx, t, n_total, replay, out, args, stream):
+def run_one(idx, t, n_total, replay, out, args, stream, topdown=None):
     """跑一条 trial，返回结果 dict。
 
     stream=True 只在 --jobs 1 下用：单条要跑几分钟，没有实时输出很难判断是卡住还是在
     编译。并发时 N 条的输出会交错成乱码，所以只落盘——logs/<trial>.log 是排查的唯一依据，
     两种模式下都必须写。
+
+    topdown 非 None 时**改调 topdown_trial.sh**，而不是直接调 replay.py。
+    那个脚本内部自己会起 replay.py、等容器、推 cgroup 路径、挂 perf、调解析器 ——
+    perf 那一套（`-G` 必须排在 `-e` 之后、cgroup v1 走 perf_event 独立层级、
+    兜底找容器时必须排掉 `-sink`）只有它那一份。这里**绝不重写第二份**：
+    这轮已经在 `-G` 顺序和 cgroup v1 上各栽过一次，两份实现只会跟着一起错。
+    输出目录约定是对齐的（两边都是 `-o <out>`，产物都落在 `<out>/<trial名>/`），
+    所以下面收 verdict.json 的路径两种模式共用。
     """
     if stream:
         print("─" * 78)
         print(f"[{idx + 1}/{n_total}] {t['lang']}  {t['name']}")
         print("─" * 78)
 
-    cmd = [sys.executable, str(replay), str(t["dir"]), str(t["dir"] / "task.json"),
-           "-o", str(out), "--cmd-timeout", str(args.cmd_timeout)]
-    if args.smoke:
-        cmd += ["--limit", str(args.smoke)]
-    if not args.metrics:
-        cmd += ["--no-metrics"]
+    if topdown is not None:
+        cmd = ["bash", str(topdown), str(t["dir"]),
+               "-o", str(out), "--cmd-timeout", str(args.cmd_timeout)]
+        if args.smoke:
+            cmd += ["--limit", str(args.smoke)]
+        # --metrics 默认是关的，所以这里默认就会透传 --no-metrics 下去。
+        # 这不是顺手：目标机是 cgroup v1，replay.py 那套指标只认 v2 的
+        # cpu.stat / memory.current，不关掉它整条采集在启动时就报
+        # 「sinkhole cgroup 初始化失败」，一条都跑不起来。
+        if not args.metrics:
+            cmd += ["--no-metrics"]
+    else:
+        cmd = [sys.executable, str(replay), str(t["dir"]), str(t["dir"] / "task.json"),
+               "-o", str(out), "--cmd-timeout", str(args.cmd_timeout)]
+        if args.smoke:
+            cmd += ["--limit", str(args.smoke)]
+        if not args.metrics:
+            cmd += ["--no-metrics"]
 
     # 日志（并发下唯一的排查通道，开场白让人 tail -f 它）链路上有两层缓冲，少拆一层
     # 都不实时：
@@ -330,12 +594,27 @@ def run_one(idx, t, n_total, replay, out, args, stream):
 
     vf = out / t["name"] / "verdict.json"
     verdict = json.loads(vf.read_text()) if vf.exists() else None
-    return {
+    res = {
         "lang": t["lang"], "trial": t["name"], "task_id": t["task_id"],
         "model": t["model"], "exit_code": rc, "wall_s": round(dt, 1),
         "verdict": verdict, "log": str(log.relative_to(out)),
         "vs_baseline": cmp_baseline(t["baseline"], verdict),
     }
+    if topdown is not None:
+        td = collect_topdown(out, t["name"])
+        res["topdown"] = td
+        # ⚠️ **topdown 采废了不能把 trial 判成失败。**
+        # patch_identical 是保真度硬标准（容器内 git diff 与 model.patch 逐字节相等），
+        # topdown 的 C1~C5 是数据可信度 —— 两者正交，一条红了跟另一条毫无关系。
+        # topdown_trial.sh 只能吐一个退出码，它把「重放挂了」和「自检没过」压成了同一个数
+        # （解析器自检没过是 2）。所以这里改用 run_status.json 里单独记的 replay_rc：
+        # 有它就以它为准，这条 trial 的重放结论照常记录；topdown 那几列另外标不可用。
+        res["script_exit_code"] = rc           # topdown_trial.sh 自己的退出码，留痕备查
+        if td.get("replay_rc") is not None:
+            res["exit_code"] = td["replay_rc"]
+        # 没有 run_status.json = 采集连重放都没起起来（事件号不合法、等不到容器…），
+        # 那种情况这条 trial 确实没跑成，保留进程退出码当失败 —— 这是有意的。
+    return res
 
 
 def progress_line(n_done, n_total, r, smoke):
@@ -369,6 +648,27 @@ def main():
     ap.add_argument("--metrics", action="store_true",
                     help="额外采 cgroup 性能指标。默认不采——打通阶段用不上，"
                          "而且它会引入「必须 cgroup v2 且宿主侧目录可读」这条硬约束")
+    ap.add_argument("--no-metrics", action="store_true",
+                    help="显式关掉 cgroup 指标（默认行为，写出来只为让命令行自我说明）。"
+                         "cgroup v1 的机器必须是关的：replay.py 那套指标只认 v2 的 "
+                         "cpu.stat / memory.current，不关整条起不来")
+    ap.add_argument("--topdown", action="store_true",
+                    help="每条 trial 顺带采 ARM topdown 四象限（改调 topdown_trial.sh，"
+                         "perf 逻辑不在这里重写）。**强制串行，与 --jobs > 1 互斥且报错退出**："
+                         "多个 perf stat -a 会话抢的是同一批物理计数器。"
+                         "topdown 采废不影响这条 trial 的重放结论，两者正交")
+    ap.add_argument("--per-lang", type=int, default=0, metavar="N",
+                    help="每种语言只抽 N 条跑（只在镜像已建好的里面挑）。"
+                         "某语言一条都没建好就贡献 0 条，不报错。可与 --only 叠加")
+    ap.add_argument("--pick", choices=("median", "heaviest", "lightest"), default="median",
+                    help="--per-lang 的选取策略，默认 median（按命令数取中位）。"
+                         "heaviest = 取命令最多的，数据更干净但慢几倍"
+                         "（全量各取 2 条：median 约 18 分钟 / heaviest 约 68 分钟）；"
+                         "lightest = 最快，只验链路通不通。"
+                         "⚠️ trial 越轻，容器启动 + 收尾 git diff 这笔固定开销在聚合值里"
+                         "占比越大，topdown 就越掺进「容器启动 + 解释器 import」的成分")
+    ap.add_argument("--topdown-script", default="",
+                    help="topdown_trial.sh 路径（默认取本脚本同目录）")
     ap.add_argument("--dry-run", action="store_true", help="只做预检和排程，不真跑")
     ap.add_argument("--skip-missing", action="store_true",
                     help="镜像还没建好的 trial 直接跳过而不是拒绝启动（全量集边建边跑用）")
@@ -378,10 +678,39 @@ def main():
     ap.add_argument("--replay", default="", help="replay.py 路径（默认自动定位）")
     args = ap.parse_args()
 
+    # --metrics 与 --no-metrics 同时给 = 自相矛盾。不静默挑一个：挑错了的后果是
+    # 整批要么白跑（v1 上起不来），要么采了一批没人要的 cgroup 数，都得重来。
+    if args.metrics and args.no_metrics:
+        print("--metrics 与 --no-metrics 同时给了，自相矛盾，拒绝启动。\n"
+              "  默认就是不采（等价于 --no-metrics），要采才加 --metrics。")
+        return 1
+    if args.no_metrics:
+        args.metrics = False
+    if args.per_lang < 0:
+        print(f"--per-lang 至少是 0（0 = 不抽样，跑全部），收到 {args.per_lang}")
+        return 1
+
     replay = pathlib.Path(args.replay) if args.replay else find_replay()
     if not replay or not replay.exists():
         print(f"找不到 replay.py（找过 {HERE}/replay.py 和 {HERE.parent}/replay.py）")
         return 1
+
+    # topdown_trial.sh 自己也会去找 replay.py，但**这里必须先确认它在**：
+    # 少了它的话，下面每条 trial 都会以「bash: 找不到文件」失败一次，跑满 113 条才发现。
+    topdown = None
+    if args.topdown:
+        topdown = (pathlib.Path(args.topdown_script) if args.topdown_script
+                   else find_topdown())
+        if not topdown or not topdown.exists():
+            print(f"--topdown 需要 topdown_trial.sh，没找到（找过 {HERE}/topdown_trial.sh）。\n"
+                  f"  它和 topdown.conf / topdown_parse.py 一起在 topdown 包里，"
+                  f"主重放包不带 —— 确认解开的是带 topdown 的那个包。")
+            return 1
+        conf = topdown.parent / "topdown.conf"
+        if not conf.exists():
+            print(f"--topdown 需要 {conf} —— 事件号和 SLOTS 全在那里面。\n"
+                  f"  先跑 bash probe_pmu.sh 把这台机器的事件号验出来再填。")
+            return 1
 
     trials = load_trials()
     if args.only:
@@ -391,9 +720,27 @@ def main():
         print("没有可跑的 trial（--only 过滤掉了全部，或目录里没有合规的 trial）")
         return 1
 
-    problems, fstype, missing = preflight(trials, args.metrics, args.skip_missing)
-    if args.skip_missing and missing:
-        miss_set = {id(t) for t in missing}
+    # --per-lang 天然只在「镜像已建好」的里面挑，所以它和 --skip-missing 是同一个前提：
+    # 缺镜像不该让预检整批拒绝启动。两个给哪个都行，同时给也不冲突。
+    tolerate_missing = args.skip_missing or bool(args.per_lang)
+    problems, fstype, missing = preflight(trials, args.metrics, tolerate_missing)
+    miss_set = {id(t) for t in missing}
+    pick_report = None
+    if args.per_lang:
+        n_candidates = len(trials)
+        picked, pick_report = pick_per_lang(trials, miss_set, args.per_lang, args.pick)
+        # 选完再按全局口径排一次序（语言顺序 + 目录名）：抽样批次的汇总表要能和全量
+        # 批次逐行对齐着看，行序就不能跟着「各语言内部按命令数排」走。
+        picked.sort(key=lambda t: (LANG_ORDER.index(t["lang"])
+                                   if t["lang"] in LANG_ORDER else 99, t["name"]))
+        print_pick(pick_report, args.per_lang, args.pick)
+        print()
+        trials = picked
+        if not trials:
+            print(f"--per-lang {args.per_lang}：{n_candidates} 条候选里一条镜像都没建好，"
+                  f"无事可做 —— 先跑 build_arm.sh")
+            return 1
+    elif args.skip_missing and missing:
         trials = [t for t in trials if id(t) not in miss_set]
         print(f"--skip-missing：{len(missing)} 条因镜像未建好被跳过，实跑 {len(trials)} 条\n")
         if not trials:
@@ -441,6 +788,42 @@ def main():
               f"  （crosslang/INDEX.md「本轮的口径污染」记的就是上次并发的后果。）\n"
               f"  要指标：--jobs 1（或不带 --jobs）；要快：去掉 --metrics。")
         return 1
+    # ── --topdown 与并发：比 --metrics 那条更硬，机制也不同 ────────────────────
+    # --metrics 抢的是**机器资源**（CPU 配额、内存、磁盘队列），采到的是被挤压之后的
+    # 数字，至少每条 trial 还各有各的一份数据。
+    # --topdown 抢的是**同一批物理计数器**：PMU 上通用计数器就那么几个（Neoverse 一般 6 个，
+    # NMI watchdog 开着只剩 5 个），而我们一轮要开 4~6 个事件、还要求它们作为一个 {} 组
+    # 同上同下。两个 `perf stat -a` 会话一起要，内核只能**复用**（multiplexing）——
+    # 每个事件只在一部分时间窗口里真正计数，其余靠外推。
+    # 后果不是「数字偏一点」，是**整批作废**：
+    #   · 每条 trial 的 C5（最低调度占比 > 99.9%）自检全部失败；
+    #   · 四象限的分子分母来自不同的时间窗口，比值不再有物理意义；
+    #   · 而屏幕上每条看起来都「跑完了」，数也都在 0~1 之间。
+    # 所以这里报错退出，不是警告后继续。判的是收敛后的 jobs（真正会同时跑几条），
+    # 说的是用户敲的 jobs_asked。
+    if args.topdown and jobs > 1:
+        print(f"--topdown 与 {jobs_asked}互斥，拒绝启动。\n"
+              f"  这不是「不兼容」，是**计数器竞争**：\n"
+              f"  topdown 靠宿主侧 `perf stat -a -G <cgroup>` 采 PMU 事件，一轮要开 4~6 个\n"
+              f"  事件，还要求它们作为一个 {{}} 组被内核同时上、同时下。而 PMU 上的通用\n"
+              f"  计数器是**物理的、全机共享的**：Neoverse 一般 6 个，NMI watchdog 开着\n"
+              f"  只剩 5 个。并发 {jobs} 条就是 {jobs} 个 perf 会话同时要这批计数器，\n"
+              f"  总需求 ≈ {jobs} × 4~6 个，一定超。超了内核不会报错，它会**复用**\n"
+              f"  （multiplexing）：每个事件只在一部分时间窗口里真正计数，剩下靠外推。\n"
+              f"  后果是整批作废，不是「偏一点」——\n"
+              f"    · 每条 trial 的 C5（最低调度占比 > 99.9%）自检**全部失败**；\n"
+              f"    · 四象限的分子和分母来自不同的时间窗口，比值不再有物理意义；\n"
+              f"    · 而屏幕上每条都「跑完了」，四个数也都规规矩矩落在 0~1 之间。\n"
+              f"  要 topdown：--jobs 1（或不带 --jobs）。113 条串行要数小时，\n"
+              f"  先用 --per-lang 2 每种语言抽几条，或 --skip-missing 只跑已建好的镜像。\n"
+              f"  要快：去掉 --topdown。")
+        return 1
+    if args.topdown and jobs_req > 1:
+        # 收敛到 1 之后只有一个 perf 会话，不存在计数器竞争，所以放行而不是报错。
+        # 但用户敲的是一组自相矛盾的参数，静默放行会让人以为 --jobs N 生效了。
+        print(f"提示：{jobs_asked}与 --topdown 本互斥，但待跑只有 {len(trials)} 条，"
+              f"并发度已收敛到 1。\n"
+              f"  实际是串行跑，只有一个 perf 会话，不会有计数器竞争 —— 照常采集，不拦。\n")
     if args.metrics and jobs_req > 1:
         # 收敛到 1 之后不会有争抢，指标口径是干净的，所以放行而不是报错。
         # 但用户敲的是一组自相矛盾的参数，静默放行会让人以为 --jobs N 生效了、
@@ -457,6 +840,11 @@ def main():
     print(f"待跑      {len(trials)} 条（{'串行' if jobs == 1 else f'并发 {jobs}'}）")
     print(f"并发度    {jobs}{jobs_note}   来源 {jobs_src}")
     print(f"指标      {'采集 cgroup 性能数据' if args.metrics else '不采（--metrics 可开）'}")
+    if args.topdown:
+        print(f"topdown   采（每条改调 {topdown.name}；强制串行，见上文计数器竞争）")
+        print(f"          配置 {topdown.parent / 'topdown.conf'}")
+        print(f"          ⚠️ 采到的是**整条 trial 的聚合值**：含容器启动与收尾 git diff，")
+        print(f"             各 trial 的命令数差异很大，跨 trial 横向比要带上这个背景")
     print_budget(trials, jobs)
     print("=" * 78)
     # 全量集下逐条列出会刷几百行；只在小批量时详列
@@ -523,13 +911,18 @@ def main():
         with lock:
             running[idx] = (t["name"], time.monotonic())
         try:
-            r = run_one(idx, t, len(trials), replay, out, args, stream)
+            r = run_one(idx, t, len(trials), replay, out, args, stream, topdown)
         except Exception as e:
             # 单条炸在 run_one 里（比如日志文件写不了）不该把整批带走，记成失败继续
             r = {"lang": t["lang"], "trial": t["name"], "task_id": t["task_id"],
                  "model": t["model"], "exit_code": -1, "wall_s": 0.0,
                  "verdict": None, "log": f"logs/{t['name']}.log",
                  "vs_baseline": None, "error": repr(e)}
+            if args.topdown:
+                # 这一条压根没跑起来，topdown 自然也没有。给个占位而不是缺键：
+                # 汇总渲染那边按「每条都有 topdown 字段」写的，缺键会在汇总时再炸一次。
+                r["topdown"] = {"available": False, "reason": f"这条 trial 没跑起来：{e!r}",
+                                "verify": "—", "quadrants": None}
         with lock:
             running.pop(idx, None)
             done[idx] = r
@@ -591,12 +984,92 @@ def main():
     # n_planned / interrupted 必须一路传到产物里：少跑了几条这件事以前只打在 stdout 上，
     # 事后翻 summary.json 只看得到 n_total=2（实际待跑 6），分不清是被 ^C 打断还是环境真坏了。
     write_summary(out, results, elapsed, args, fstype, jobs,
-                  n_planned=len(trials), interrupted=interrupted)
+                  n_planned=len(trials), interrupted=interrupted,
+                  pick_report=pick_report)
     return 0 if results and all(r["exit_code"] == 0 for r in results) else 1
 
 
-def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, interrupted=False):
+def topdown_group_stats(results):
+    """按语言给四象限的均值 / 中位数，外加一行「全部」。
+
+    只统计**自检也全过**的那些条。两道门，缺一不可：
+      1. available —— 数采到了、四象限算出来了；
+      2. 自检全过 —— C1~C5（+ 可选的 X）一条不红。
+
+    为什么第 2 道门必须有：C5 红了表示发生了计数器复用，那组四象限的分子和分母来自
+    不同的时间窗口，**比值本身没有物理意义**；C1 红了表示 SLOTS 或事件号错了，那组数
+    整体按同一比例偏移。把这种数混进平均值里，一条坏数据就能把一整门语言的画像带偏，
+    而平均值这个形式恰恰把「哪一条坏了」抹掉了 —— 报告上完全看不出来。
+    逐条的 ❌C1 / ❌C5 仍然照常出现在上面那张总表里，信息并没有丢，只是不进均值。
+
+    每组都带 n（真正参与统计的条数）和被剔掉的条数，让人自己判断这几个数值不值得信 ——
+    n=1 的「中位数」只是那一条本身。
+
+    ⚠️ 这里聚合的是**整条 trial 的聚合值**：每条里面都固定含容器启动和收尾的
+       `git diff`，而不同 trial 的命令数从几十到几百不等，固定开销的占比因此差很多。
+       所以跨语言的差异里既有 workload 本身的差异，也有「这门语言这几条 trial 恰好
+       更轻/更重」的成分。**这不是纯 workload 对比。**
+    """
+    by_lang, allv = {}, []
+    dropped, dropped_all = {}, 0
+    for r in results:
+        td = r.get("topdown") or {}
+        if not td.get("available"):
+            continue
+        # available=True 已经保证四个象限都是数（见 collect_topdown），所以这里
+        # 只剩「自检过没过」一道门。于是账是闭合的：
+        #   可用条数 = 进均值的 n + 被剔掉的 n_excluded_check_failed
+        vals = {k: (td.get("quadrants") or {}).get(k) for k, _ in TOPDOWN_QUADRANTS}
+        if td.get("checks_failed"):
+            dropped[r["lang"]] = dropped.get(r["lang"], 0) + 1
+            dropped_all += 1
+            continue
+        by_lang.setdefault(r["lang"], []).append(vals)
+        allv.append(vals)
+
+    def block(rows, n_drop):
+        out = {"n": len(rows), "n_excluded_check_failed": n_drop}
+        for key, _ in TOPDOWN_QUADRANTS:
+            xs = [x[key] for x in rows]
+            # 一条都没剩就只记 n 和剔除数，均值/中位写 None —— 空列表没有平均数，
+            # 硬算会炸；而这一行必须**留着**（见下面 langs 的取法）。
+            out[key] = ({"mean": statistics.fmean(xs), "median": statistics.median(xs)}
+                        if xs else {"mean": None, "median": None})
+        return out
+
+    # 语言名单要把「采到了数但全被剔掉」的那些也算进来，哪怕它们一条都不剩。
+    # 否则这门语言会从小结里**整个消失**，读的人只会以为它没跑 —— 而真相是
+    # 跑了、也采到了，只是数不可信。这两件事在报告里必须长得不一样。
+    seen = set(by_lang) | set(dropped)
+    langs = sorted(seen, key=lambda l: LANG_ORDER.index(l) if l in LANG_ORDER else 99)
+    stats = {l: block(by_lang.get(l, []), dropped.get(l, 0)) for l in langs}
+    if allv:
+        stats["__all__"] = block(allv, dropped_all)
+    return stats, dropped_all
+
+
+def topdown_group_lines(stats):
+    """把分组小结渲染成表格行（stdout 与 Markdown 共用同一批单元格，免得两边算出两套数）。"""
+    hdr = ["语言", "n", "剔除"] + [f"{short} 均值/中位" for _, short in TOPDOWN_QUADRANTS]
+    rows = []
+    for lang, b in stats.items():
+        name = "全部" if lang == "__all__" else lang
+        # 「剔除」= 数采到了但自检没过、因此不进均值的条数。必须单独成列而不是脚注：
+        # n=2 剔除 3 和 n=2 剔除 0 是完全不同的可信度，混在一个 n 里看不出来。
+        row = [name, str(b["n"]), str(b.get("n_excluded_check_failed", 0))]
+        for key, _ in TOPDOWN_QUADRANTS:
+            m, md = b[key]["mean"], b[key]["median"]
+            row.append("—" if m is None else f"{m * 100:.1f}% / {md * 100:.1f}%")
+        rows.append(row)
+    return hdr, rows
+
+
+def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None,
+                  interrupted=False, pick_report=None):
     smoke = bool(args.smoke)
+    # 没开 --topdown 时下面所有 topdown 相关的分支都不进，报告与加本功能前**逐字节一致**
+    # —— 历史批次的 SUMMARY.md 要能直接 diff，多一行空行都算回归。
+    td_on = bool(getattr(args, "topdown", False))
     # 缺省 = 全部跑完了。老调用方（只传 6 个位置参数）因此仍得到 n_not_run=0，不会误报。
     if n_planned is None:
         n_planned = len(results)
@@ -610,7 +1083,7 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, i
         # 冒烟模式下 patch 天然不完整，不能当失败
         ok = (r["exit_code"] == 0) and (smoke or pi is True)
         n_ok += ok
-        rows.append({
+        row = {
             "语言": r["lang"],
             "退出": r["exit_code"],
             "保真": ("—(冒烟)" if smoke else ("✅" if pi else "❌" if pi is False else "?")),
@@ -619,7 +1092,18 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, i
             "耗时s": v.get("elapsed_s", r["wall_s"]),
             "vs基线": (f"rc{c['rc_delta']:+d} 时长×{c['elapsed_ratio']}"
                        if c and c.get("elapsed_ratio") else "—"),
-        })
+        }
+        if td_on:
+            # **追加在原有那张总表后面**，不另起一张：这张表就是用来横向对比不同
+            # benchmark 的，把四象限拆到另一张表就得来回对着行名找，一眼比不了。
+            # 采废的那条这几列写 —，重放结论（退出/保真/rc）照常记 —— 两者正交。
+            td = r.get("topdown") or {}
+            q = td.get("quadrants") or {}
+            for key, short in TOPDOWN_QUADRANTS:
+                val = q.get(key)
+                row[short] = (f"{val * 100:.1f}%" if isinstance(val, (int, float)) else "—")
+            row["校验"] = td.get("verify") or "—"
+        rows.append(row)
 
     hdr = list(rows[0].keys()) if rows else []
     w = {h: max(len(h), *(len(str(r[h])) for r in rows)) for h in hdr} if rows else {}
@@ -631,6 +1115,27 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, i
         lines.append("  " + "  ".join("-" * w[h] for h in hdr))
         for r in rows:
             lines.append("  " + "  ".join(str(r[h]).ljust(w[h]) for h in hdr))
+
+    # ── 按语言分组的横向小结（只在 --topdown 下出现）──────────────────────────
+    td_stats, td_dropped = topdown_group_stats(results) if td_on else ({}, 0)
+    n_td_ok = sum(1 for r in results if (r.get("topdown") or {}).get("available"))
+    if td_on:
+        lines += ["", f"topdown  {n_td_ok}/{len(results)} 条采到可用数据"
+                      + (f"，其中 {td_dropped} 条自检没过、不进下面的均值" if td_dropped else "")]
+        if td_stats:
+            g_hdr, g_rows = topdown_group_lines(td_stats)
+            gw = {i: max(len(g_hdr[i]), *(len(r[i]) for r in g_rows))
+                  for i in range(len(g_hdr))}
+            lines.append("  " + "  ".join(g_hdr[i].ljust(gw[i]) for i in range(len(g_hdr))))
+            lines.append("  " + "  ".join("-" * gw[i] for i in range(len(g_hdr))))
+            for r in g_rows:
+                lines.append("  " + "  ".join(r[i].ljust(gw[i]) for i in range(len(g_hdr))))
+            lines += ["  ⚠️ 这是**整条 trial 的聚合值**：每条都含容器启动与收尾 git diff，",
+                      "     而各 trial 的命令数从几十到几百不等，固定开销占比因此差很多。",
+                      "     跨 trial / 跨语言的差异里混着这部分，不是纯 workload 对比。",
+                      "     n = 真正进均值的条数（自检没过的不算，见上表「校验」列）。"]
+        else:
+            lines.append("  （没有一条既采到数据又自检全过，分组小结略）")
     # 并发下总墙钟 ≠ 各条耗时之和，标一句免得被当成串行时长去比
     lines += ["", f"总墙钟 {elapsed:.0f}s" + (f"（并发 {jobs}，非各条之和）" if jobs > 1 else ""),
               f"输出   {out}"]
@@ -640,7 +1145,7 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, i
     text = "\n".join(lines)
     print(text)
 
-    (out / "summary.json").write_text(json.dumps({
+    doc = {
         "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "host": {"kernel": os.uname().release, "nproc": os.cpu_count(), "cgroup_fstype": fstype},
         "options": {"smoke": args.smoke, "cmd_timeout": args.cmd_timeout,
@@ -653,7 +1158,35 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, i
         "interrupted": interrupted,
         "not_run_reason": (not_run_why if n_not_run else None),
         "results": results,
-    }, indent=2, ensure_ascii=False))
+    }
+    # 抽样跑必须留痕：抽样批次的 summary.json 和全量批次长得一模一样，没有这一块
+    # 事后会被当成全量结论去引用。策略也要记 —— median 那批天生更轻、固定开销占比更大，
+    # 和 heaviest 那批**不可直接比较**。
+    if pick_report is not None:
+        doc["options"]["per_lang"] = args.per_lang
+        doc["options"]["pick"] = args.pick
+        doc["sampling"] = {
+            "per_lang": args.per_lang,
+            "pick": args.pick,
+            "pick_desc": PICK_DESC.get(args.pick, args.pick),
+            "n_selected": sum(r["n_picked"] for r in pick_report),
+            "n_available_total": sum(r["n_available"] for r in pick_report),
+            "n_candidates_total": sum(r["n_candidates"] for r in pick_report),
+            "by_lang": pick_report,
+            "note": "这批是抽样跑，不是全量结果；不同 --pick 策略选出的批次之间不可直接比较",
+        }
+    if td_on:
+        doc["options"]["topdown"] = True
+        doc["topdown"] = {
+            "enabled": True,
+            "n_available": n_td_ok,
+            "n_unavailable": len(results) - n_td_ok,
+            "n_excluded_check_failed": td_dropped,
+            "by_lang": td_stats,
+            "note": ("四象限是整条 trial 的聚合值，含容器启动与收尾 git diff；"
+                     "各 trial 命令数差异很大，跨 trial 比较需带上这个背景"),
+        }
+    (out / "summary.json").write_text(json.dumps(doc, indent=2, ensure_ascii=False))
 
     md = ["# 重放批次汇总", "",
           f"- 时间（UTC）：{datetime.datetime.now(datetime.timezone.utc).isoformat()}",
@@ -671,11 +1204,56 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, i
         # ^C 来得晚，所有 trial 其实都已经跑完了。仍要留痕：否则这批报告看起来
         # 和一次干净的完整运行一模一样，没人会知道当时按过 ^C。
         md.append(f"- 收到 ^C，但 {n_planned} 条都已跑完，没有少跑。")
+    # 抽样跑同样只在真抽样时插行 —— 全量批次的报告要能和历史报告逐行 diff。
+    if pick_report is not None:
+        picked_n = sum(r["n_picked"] for r in pick_report)
+        avail_n = sum(r["n_available"] for r in pick_report)
+        cand_n = sum(r["n_candidates"] for r in pick_report)
+        md.append(f"- ⚠️ **抽样跑**：`--per-lang {args.per_lang} --pick {args.pick}`"
+                  f"（{PICK_DESC.get(args.pick, args.pick)}）—— "
+                  f"候选 {cand_n} 条 / 镜像已建好 {avail_n} 条 / 实际选中 **{picked_n} 条**。"
+                  f"下面的结果**不是全量结论**；不同 `--pick` 策略选出的批次之间也不可直接比较。")
+        for r in pick_report:
+            if r["n_picked"] == 0:
+                md.append(f"  - `{r['语言']}`：{r['n_available']}/{r['n_candidates']} "
+                          f"已建镜像 → 跳过")
+                continue
+            short = f"（可用的不够 {args.per_lang} 条）" if r["short"] else ""
+            names = "、".join(f"`{x['trial']}`({x['n_commands']} 条命令)"
+                              for x in r["trials"])
+            md.append(f"  - `{r['语言']}`：{r['n_available']}/{r['n_candidates']} "
+                      f"已建镜像 → 取 {r['n_picked']} 条{short} —— {names}")
+    if td_on:
+        md.append(f"- topdown：**{n_td_ok}/{len(results)} 条**采到可用数据"
+                  + (f"，其中 **{td_dropped} 条自检没过**、不进下面的均值"
+                     if td_dropped else "")
+                  + "。强制串行（`--jobs > 1` 会被拒绝："
+                    "多个 `perf stat -a` 抢同一批物理计数器）")
     md.append("")
     if rows:
         md += ["| " + " | ".join(hdr) + " |",
                "|" + "|".join("---" for _ in hdr) + "|"]
         md += ["| " + " | ".join(str(r[h]) for r in [row] for h in hdr) + " |" for row in rows]
+    if td_on:
+        md += ["", "## topdown 横向小结（按语言）", ""]
+        if td_stats:
+            g_hdr, g_rows = topdown_group_lines(td_stats)
+            md += ["| " + " | ".join(g_hdr) + " |",
+                   "|" + "|".join("---" for _ in g_hdr) + "|"]
+            md += ["| " + " | ".join(r) + " |" for r in g_rows]
+            md += ["",
+                   "> `n` = 真正进均值的条数；`剔除` = 数采到了但自检没过（见上表「校验」列）、",
+                   "> 因此**不进均值**的条数 —— C5 红了说明发生了计数器复用，那组四象限的分子",
+                   "> 和分母来自不同的时间窗口，比值没有物理意义，混进平均数只会污染整组。",
+                   "",
+                   "> ⚠️ **这是整条 trial 的聚合值，不是纯 workload 对比。** 采集窗口从主容器",
+                   "> 出现到 `replay.py` 退出，里面固定含**容器启动**和收尾的 `git diff` 保真校验；",
+                   "> 而各 trial 的命令数从几十到几百不等，这笔固定开销占聚合值的比重因此差很多 ——",
+                   "> 轻的 trial 里它能占大头。所以跨 trial / 跨语言的差异中混着「这几条恰好更轻",
+                   "> 或更重」的成分，读的时候要一并带上上表里各条的命令数。",
+                   "> 要真正干净的对比，得等 per-command 归因那一版。"]
+        else:
+            md += ["（没有一条采到可用数据。逐条看下面「topdown」那几行的原因。）"]
     md += ["", "## 逐条", ""]
     for r in results:
         v = r["verdict"] or {}
@@ -691,6 +1269,33 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None, i
             c = r["vs_baseline"]
             md += [f"- 对比基线：基线 rc={c['baseline_rc_match']} / {c['baseline_elapsed_s']}s，"
                    f"本次 rc 差 {c['rc_delta']:+d}，耗时 ×{c['elapsed_ratio']}"]
+        if td_on:
+            td = r.get("topdown") or {}
+            if td.get("available"):
+                q = td.get("quadrants") or {}
+                quad = "，".join(f"{short} {q[key] * 100:.1f}%"
+                                 for key, short in TOPDOWN_QUADRANTS
+                                 if isinstance(q.get(key), (int, float)))
+                be = {"direct": "直接法", "residual": "残差法"}.get(
+                    td.get("backend_method"), td.get("backend_method"))
+                md += [f"- topdown：{quad}",
+                       f"  - 口径：{be}，SLOTS={td.get('slots')}，"
+                       f"事件 {td.get('n_events')} 个"
+                       f"{'，开了 X 交叉校验' if td.get('cross_check_enabled') else '，未开 X 交叉校验'}",
+                       f"  - 自检：{td.get('verify')}"
+                       + (f"（跑过 {len(td.get('checks_run') or [])} 条）"
+                          if td.get("checks_run") else ""),
+                       f"  - 机读：`{(td.get('artifacts') or {}).get('topdown_json')}`"]
+            else:
+                # 采废了要**在这条 trial 名下**写清楚原因，而不是只在总表里打一个 —。
+                # 上面的退出码 / patch_identical 仍然是有效结论 —— 两者正交，
+                # 不写清楚的话读报告的人会以为这条 trial 整个失败了。
+                md += [f"- topdown：**不可用** —— {td.get('reason') or '未知原因'}",
+                       f"  （这不影响上面的 patch_identical 与 rc_match：保真度与 PMU "
+                       f"数据可信度是正交的两件事）"]
+                if td.get("replay_rc") is not None:
+                    md.append(f"  - 退出码分解：重放 {td.get('replay_rc')} / "
+                              f"perf {td.get('perf_rc')} / 解析 {td.get('parse_rc')}")
         md.append("")
     (out / "SUMMARY.md").write_text("\n".join(md))
     print(f"       {out}/SUMMARY.md, summary.json")

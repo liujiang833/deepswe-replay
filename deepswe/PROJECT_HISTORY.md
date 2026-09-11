@@ -330,3 +330,62 @@
 - `crosslang/EXEC_LOG_2026-09-11-topdown.md` - 新增，本轮执行日志
 
 **Commit:** pending
+
+## 2026-09-11: ARM topdown 从单条扩到批量（run_batch.py --topdown / 全量 113 条包）
+
+**Goal:** 单条 trial 的 ARM topdown 采集已在目标机（baremetal ARM，**cgroup v1**）跑通，
+把它扩到批量：能一次跑多条、汇总表能横向对比不同 benchmark、包里带全部 113 条 trial。
+
+**Steps:**
+1. `topdown_trial.sh` 加 `--cmd-timeout` 透传 + 落 `run_status.json` - success
+2. `topdown_parse.py` 的 `topdown.json` 加 `event_codes`（结果文件自证口径）- success
+3. `run_batch.py` 加 `--topdown` / `--per-lang N` / `--pick` / `--no-metrics` - success
+4. 汇总表在现有总表**后面追加** `Retiring|BadSpec|FE|BE|校验` 五列 + 按语言的横向小结 - success
+5. `make_topdown_bundle.sh` 加 `--trials-dir` 全量模式，随包带 `run_batch.py` - success
+6. `TOPDOWN.md` 新增 §5.1 批量采集 + §8「跨 trial 比较的注意事项」- success
+7. x86 上能验的全部实跑验证 - success（ARM 相关的验不了，已列出）
+
+**Key Findings:**
+- **`--topdown` 必须强制串行，而且理由和 `--metrics` 那条不同**：`--metrics` 并发抢的是
+  机器资源（数偏悲观但每条各有各的数据）；`--topdown` 并发抢的是**同一批物理计数器** ——
+  Neoverse 一般 6 个通用计数器、watchdog 开着剩 5 个，而一轮要开 4~6 个事件且要求作为
+  一个 `{}` 组同上同下。N≥2 必然超，超了内核**不报错**直接复用，后果是每条 C5 自检全失败、
+  分子分母来自不同时间窗口、**而屏幕上每条都「跑完了」**。所以是报错退出，不是警告后继续
+- **perf 逻辑只能有一份**：`--topdown` 打开时改调 `topdown_trial.sh` 而不是在 `run_batch.py`
+  里重写。这一轮已经在 `-G` 参数顺序和 cgroup v1 路径上各栽过一次，两份实现只会跟着一起错
+- **`patch_identical` 与 topdown 自检正交，必须分开记**：`topdown_trial.sh` 最后只能吐一个
+  退出码（自检没过是 2），把两件事压成了一个数。加 `run_status.json` 把
+  `replay_rc` / `perf_rc` / `parse_rc` 分开记，`run_batch.py` 按 `replay_rc` 判 trial 成没成 ——
+  某条 topdown 采废了，该条的重放结论照常记录
+- **自检没过的条不能进均值**：C5 红了说明复用，那组比值没有物理意义；而平均值这个形式
+  恰恰把「哪一条坏了」抹掉。→ 只统计自检全过的条，被剔掉几条**单独成列**
+- **「校验」列必须写明是哪一条红了**（`❌C1` vs `❌C5`）：C1 是「SLOTS 偏小 / 事件号错」、
+  C5 是「计数器复用」，排查方向毫无交集，只打一个 ❌ 等于把诊断信息扔掉
+- **抽样的 `--pick` 是耗时与数据干净度的取舍**：topdown 是整条 trial 的聚合值，固定含
+  容器启动 + 收尾 `git diff`；trial 越轻这笔固定开销占比越大。实测全量各取 2 条：
+  median 约 18 分钟 / heaviest 约 68 分钟（差 3.8 倍）/ lightest 约 10 分钟
+- **跨 trial 比较有前提**：全量 113 条的命令数从 10 到 439，相差 40 倍。两条 trial 的四象限
+  之差既可能是 workload 不同，也可能只是一条更轻。真正干净的对比要等 per-command 归因
+- 不加 `--topdown` 时老报告**逐字节不变**（新旧 `write_summary` 对比：SUMMARY.md 1933/1933、
+  summary.json 3227/3227 字节），历史批次仍可逐行 diff
+
+**Files Changed:**
+- `crosslang/run_batch.py` - `--topdown`/`--per-lang`/`--pick`/`--no-metrics`/`--topdown-script`；
+  汇总表追加 5 列；按语言的横向小结；summary.json 加 `sampling` 与 `topdown` 块
+- `crosslang/topdown_trial.sh` - `--cmd-timeout` 透传；落 `run_status.json`
+- `crosslang/topdown_parse.py` - `topdown.json` 加 `event_codes`
+- `crosslang/make_topdown_bundle.sh` - `--trials-dir` 全量模式；随包带 `run_batch.py`；
+  BUILD_INFO 用 `kind` 区分 `topdown` / `topdown-full`
+- `crosslang/TOPDOWN.md` - §5.1 批量采集；§8 跨 trial 比较注意事项；排障表 +5 行
+- `crosslang/deepswe-topdown-bundle-full-20260911.tar.gz` - 新产物（4.4 MB / 113 条 / 466 文件）
+- `crosslang/EXEC_LOG_2026-09-11-topdown.md` - 续写本轮
+
+**独立验收：** 另起 verifier subagent 复核，11 项里 10 项通过、**1 项不通过并已返工**：
+`--pick heaviest` 的并列兜底方向反了（`list(reversed(avail))[:n]` 把并列项的目录名也一起
+反成降序，与 median / lightest 相反）。**危险在于它仍然是确定的** —— 跑起来一切正常、
+只是选错了人，两批数据之间就此不可比而报告上看不出来。已改为
+`sorted(avail, key=lambda t: (-(t["n_commands"] or 0), t["name"]))[:n]`。
+顺手补上：`collect_topdown` 现在要求四个象限都是数才算 available，
+否则「可用 = 进均值 + 剔除」这个等式会凭空少一条。返工后全部验证重跑通过。
+
+**Commit:** pending（用户明确要求不提交）

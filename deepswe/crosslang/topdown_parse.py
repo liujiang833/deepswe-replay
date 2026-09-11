@@ -403,6 +403,8 @@ def main():
             print(f"  {name:22s} {code:8s} {int(r['value']):>18,d}   调度占比 {pc}")
 
     n_ev = len(wanted) + len(extras)
+    event_codes = {name: (conf.get(key) or "").strip() for key, name, _ in wanted}
+    event_codes.update({name: code for name, code in extras})
     result = {
         "generated_utc": datetime.datetime.now(datetime.timezone.utc)
                                   .strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -418,6 +420,10 @@ def main():
         "n_events": n_ev,
         "events": {r["name"]: {"value": r["value"], "pcnt_running": r["pcnt_running"],
                                "cgroup": r["cgroup"]} for r in by_name.values()},
+        # 事件名 → 这轮实际用的事件号。之所以要落盘：批量跑完只剩一堆 topdown.json，
+        # 而「数不对」最常见的根因就是事件号指错了 —— 事后光看计数值根本无从判断
+        # 当时用的是 0x003a 还是别的。配置文件是会被改的，结果文件必须自证口径。
+        "event_codes": event_codes,
         "topdown": None,
         "checks_run": [],
         "checks": {},

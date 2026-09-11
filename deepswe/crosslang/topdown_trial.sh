@@ -21,6 +21,10 @@
 #   bash topdown_trial.sh <trial目录> -o <输出目录>
 #   bash topdown_trial.sh <trial目录> --limit 5      # 只重放前 5 条命令，冒烟用
 #   bash topdown_trial.sh <trial目录> --no-metrics   # 关掉 replay.py 自己那套 cgroup 指标
+#   bash topdown_trial.sh <trial目录> --cmd-timeout 30   # 透传给 replay.py 的单命令超时
+#
+# 批量：不要自己写循环。`python3 run_batch.py --topdown` 就是对本脚本逐条调用
+# （它负责排程、跳过没建镜像的、汇总四象限），perf 那套逻辑只有这里这一份。
 #
 # 什么时候要 --no-metrics：replay.py 启动时报「sinkhole cgroup 初始化失败」，
 # 整条采集根本起不来。它那套指标（usage_usec / mem_peak）是**自己去读容器 cgroup 文件**
@@ -33,18 +37,23 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$HERE/topdown.conf"
 
-TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0
+TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--outdir) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; OUTDIR="$2"; shift 2 ;;
     --limit)     [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; LIMIT="$2"; shift 2 ;;
+    # --cmd-timeout 只是原样透传给 replay.py。之所以要有这个口子：批量入口
+    # （run_batch.py）一直在给 replay.py 传 --cmd-timeout 30（对齐原 harness 口径），
+    # 改走本脚本之后如果这个值传不下去，同一批里 topdown 的那几条就换了口径，
+    # 耗时和 rc_match 都不再能跟历史批次比 —— 而且这种偏差在报告里完全看不出来。
+    --cmd-timeout) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; CMD_TIMEOUT="$2"; shift 2 ;;
     --no-metrics) NO_METRICS=1; shift ;;
     -h|--help)   sed -n '2,/^set -[eu]/p' "$0" | sed '$d'; exit 0 ;;
     -*)          echo "❌ 未知参数: $1"; exit 1 ;;
     *)           TRIAL="$1"; shift ;;
   esac
 done
-[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N] [--no-metrics]"; exit 1; }
+[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N] [--cmd-timeout N] [--no-metrics]"; exit 1; }
 [ -d "$TRIAL" ] || { echo "❌ trial 目录不存在: $TRIAL"; exit 1; }
 TRIAL="$(cd "$TRIAL" && pwd)"
 TNAME="$(basename "$TRIAL")"
@@ -205,6 +214,24 @@ mkdir -p "$TD"
 if [ "$OUTFMT" = json ]; then PERFOUT="$TD/perf.json"; OUTOPT=(-j)
 else                          PERFOUT="$TD/perf.csv";  OUTOPT=(-x,); fi
 RLOG="$TD/replay.log"
+STATUS="$TD/run_status.json"
+
+# ── 机读状态文件：把三个退出码分开记下来 ─────────────────────
+# 为什么必须分开：本脚本最后只能吐**一个**退出码，而它把两件正交的事压成了一个数 ——
+#   重放退出码 RRC   → 这条 trial 到底重放成没成（patch_identical 那条线，保真度）
+#   解析退出码 PRC   → 四象限的自检过没过（数据可信度，2 = 数拿到了但自检没过）
+# 调用方（run_batch.py）看到一个非零退出码，分不清是「trial 失败了」还是
+# 「trial 好好的，只是这轮 PMU 数不可信」。把 trial 判成失败是**错的**：
+# topdown 采废了不影响 git diff 逐字节相等这个结论。
+# 所以这里额外落一份 run_status.json，调用方按字段各取各的。
+#
+# 注意：早于重放启动的失败（事件号不合法、等不到容器…）**不会**写这个文件 ——
+# 那种情况 trial 确实没跑起来，调用方就该按进程退出码判失败，这是有意的。
+RRC=null; PERF_RC=0
+write_status() {   # $1 = 解析退出码（还没跑到解析就传 null）
+  printf '{\n  "trial": "%s",\n  "replay_rc": %s,\n  "perf_rc": %s,\n  "parse_rc": %s,\n  "topdown_json": "%s",\n  "verdict_json": "%s"\n}\n' \
+    "$TNAME" "$RRC" "$PERF_RC" "$1" "$TD/topdown.json" "$OUTDIR/$TNAME/verdict.json" > "$STATUS"
+}
 
 # 非 root 时这个 test 返回 1 —— set -e 下必须写成 if，不能用 `test && 赋值`
 SUDO="sudo"
@@ -234,6 +261,9 @@ fi
 if [ "$NO_METRICS" = 1 ]; then
   echo "  --no-metrics：replay.py 的 cgroup 指标关闭（commands.jsonl 里那几列记 null）"
   echo "                不影响 topdown —— PMU 是宿主侧 perf -G 采的，两条路互不相干"
+fi
+if [ -n "$CMD_TIMEOUT" ]; then
+  echo "  单命令超时   ${CMD_TIMEOUT}s（透传给 replay.py）"
 fi
 echo
 
@@ -291,6 +321,7 @@ trap 'echo; echo "  ⚠️  收到 SIGTERM，中止采集"; cleanup; exit 143' T
 echo "── 起重放（后台）──────────────────────────────────────────"
 RCMD=(python3 "$REPLAY" "$TRIAL" "$TRIAL/task.json" -o "$OUTDIR")
 if [ -n "$LIMIT" ]; then RCMD+=(--limit "$LIMIT"); fi
+if [ -n "$CMD_TIMEOUT" ]; then RCMD+=(--cmd-timeout "$CMD_TIMEOUT"); fi
 # replay.py 的 cgroup 指标和本脚本的 PMU 采集互不相干，关掉不影响四象限
 if [ "$NO_METRICS" = 1 ]; then RCMD+=(--no-metrics); fi
 echo "  ${RCMD[*]}"
@@ -471,6 +502,9 @@ $SUDO perf stat -a "${OUTOPT[@]}" -o "$PERFOUT" \
 RRC=0
 wait "$RPID" || RRC=$?
 RPID=""          # 已经收尸，cleanup 不用再动它
+# 先落一版（parse_rc 还不知道，记 null）：万一下面解析这一步自己炸了，
+# 调用方至少还能知道重放本身成没成。
+write_status null
 echo "  重放退出码  $RRC"
 echo "  perf 退出码 $PERF_RC"
 if [ "$PERF_RC" != 0 ]; then
@@ -498,12 +532,15 @@ echo
 if [ ! -s "$PERFOUT" ]; then
   echo "❌ perf 没写出任何结果：$PERFOUT"
   head -12 "$TD/perf.stderr" | sed 's/^/     /'
+  # parse_rc 记 1：解析根本没跑（没东西可解析）。重放的结论仍然在 replay_rc 里。
+  write_status 1
   exit 1
 fi
 PRC=0
 python3 "$HERE/topdown_parse.py" "$PERFOUT" --conf "$CONF" --slots "$SLOTS" \
         --json-out "$TD/topdown.json" \
         --title "ARM L1 Topdown · $TNAME（整条 trial 聚合）" || PRC=$?
+write_status "$PRC"
 
 echo
 echo "── 覆盖范围提醒 ────────────────────────────────────────────"

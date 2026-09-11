@@ -284,3 +284,49 @@
 - `EXEC_LOG_2026-09-09-bundle-fixes.md` - 新增
 
 **Commit:** 见 git log
+
+## 2026-09-11: ARM topdown 采集包（单条 trial）
+
+**Goal:** 在 baremetal ARM 服务器上重放 1 条 trial，同时宿主侧按 cgroup 过滤采 PMU 事件，
+算出 ARM L1 topdown 四象限；打成自包含 tarball。事件号完全解耦到配置文件，脚本不硬编码。
+
+**Steps:**
+1. 读现有约定（`make_bundle.sh` / `preflight.sh` / `build_arm.sh` / `replay.py`）- 完成
+2. 新增 6 个文件：`topdown.conf` / `probe_pmu.sh` / `topdown_trial.sh` / `topdown_parse.py`
+   / `TOPDOWN.md` / `make_topdown_bundle.sh`（**未改 `make_bundle.sh`**，113 条主包路径不冒险）- 完成
+3. x86 上能跑的全部实跑验证（语法 / 解析器正反例 / 假 sysfs+假 perf 的全流程 / 失败路径
+   / 中断路径 / 真打包解开核对）- 完成，暴露并修掉 5 个真 bug
+4. 打包产出 `crosslang/deepswe-topdown-bundle-20260911.tar.gz`（280KB / 19 文件）- 完成
+
+**Key Findings:**
+- **`docker exec` 采不到**：真实进程是 containerd-shim fork 的，不在 perf 子进程树里。
+  只能 `perf stat -a -G <cgroup>` 系统级采样 + cgroup 过滤。采集窗口用
+  `-- tail --pid=<replay PID> -f /dev/null` 划定，无竞态、不用折腾信号
+- **`-G` 路径推错时 perf 不报错，只给一串 0** —— 这是整套里最隐蔽的失败模式，所以
+  `probe_pmu.sh` 必须做活体验证（真起容器、真烧 CPU、真采一次）而不是查配置
+- **SLOTS 绝不能硬编码**：它是四象限的公共分母（V1=8 / N2=5），写死后换机器会让四个比值
+  一起按同一比例静默偏移，每一项看着都还正常。唯一兜底是「四象限求和 ≈ 1」自检
+- **baremetal 上的头号风险是计数器余量，不是 vPMU**：NMI/hardlockup watchdog（perf 版）
+  常驻占一个通用计数器，6 变 5，而 L1 正好要 5 个 —— 加一个 `EV_EXTRA` 就必然复用，
+  而复用的现象与「事件号写错」一模一样，极易把排查带偏
+- **后台任务的 SIGINT 被 shell 置成 SIG_IGN**（非交互 + 无作业控制，且被 exec 继承）：
+  `kill -INT` 对后台 replay.py 完全无效，只能靠 `set -m` 让它拿到独立进程组
+- **`kill -0` 判不出僵尸**，清理逻辑会白等满超时再补 SIGKILL
+- **`command -v perf` 成功 ≠ perf 能用**：Debian/Ubuntu 的 `/usr/bin/perf` 是按 `uname -r`
+  找真身的 wrapper，包没装时它照样在（本机 WSL2 就是这个情况）
+- **perf CSV 加 `-G` 后多一列 cgroup，各版本插入位置不一致** → 解析一律按事件的 `name=`
+  匹配再按「形状」取值，列号一次都不用；`-j` 的输出是逐行 JSON 对象，不是数组
+- **这一版是整条 trial 的聚合值**，覆盖容器启动 + 98 条命令 + 收尾 git diff；
+  sidecar 独立 cgroup 天然滤掉；per-command 归因是后续工作
+- **PMU 数字跨架构不可比**：判定环境等价的仍然只有 `patch_identical`
+
+**Files Changed:**
+- `crosslang/topdown.conf` - 新增，唯一需要用户改的文件（PMU/SLOTS/5 个事件号/EV_EXTRA/输出格式）
+- `crosslang/probe_pmu.sh` - 新增，目标机第一件事：事件号有效性 + 计数器余量 + 活体验证 `-G`
+- `crosslang/topdown_trial.sh` - 新增，采集主脚本
+- `crosslang/topdown_parse.py` - 新增，perf 输出 → 四象限 + 两个自检 + `topdown.json`（纯标准库）
+- `crosslang/TOPDOWN.md` - 新增，包的入口文档
+- `crosslang/make_topdown_bundle.sh` - 新增，打包脚本（与 `make_bundle.sh` 并列，互不影响）
+- `crosslang/EXEC_LOG_2026-09-11-topdown.md` - 新增，本轮执行日志
+
+**Commit:** pending

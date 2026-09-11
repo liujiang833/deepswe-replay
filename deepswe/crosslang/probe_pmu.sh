@@ -211,7 +211,17 @@ fi
 # caps/slots —— 四象限的公共分母，也是最不能猜的一个数
 CAPS_SLOTS=""
 if [ -r "$EVSRC/$PMU/caps/slots" ]; then
-  CAPS_SLOTS="$(cat "$EVSRC/$PMU/caps/slots" 2>/dev/null | tr -dc '0-9')"
+  # 进制不统一：arm64 导出的是十六进制（0x8），x86 是十进制。
+  # 早先用 `tr -dc '0-9'` 剥字符 —— 0xa 会变成 "0"（分母归零，下游除零崩溃），
+  # 0x10 会变成 "10"（真值 16，静默错 60% 且不报错）。必须按进制解析。
+  CAPS_RAW="$(tr -d '[:space:]' < "$EVSRC/$PMU/caps/slots" 2>/dev/null || true)"
+  case "$CAPS_RAW" in
+    0[xX]*[!0-9a-fA-FxX]*) CAPS_SLOTS="" ;;
+    0[xX]*)                CAPS_SLOTS=$(( CAPS_RAW )) ;;
+    *[!0-9]*|"")           CAPS_SLOTS="" ;;
+    *)                     CAPS_SLOTS=$(( 10#$CAPS_RAW )) ;;
+  esac
+  [ "${CAPS_SLOTS:-0}" -gt 0 ] 2>/dev/null || CAPS_SLOTS=""
 fi
 # 取值优先级必须和 topdown_trial.sh 完全一致（配置里写了就用配置的），
 # 否则探针验的是一套数、正式采集用的是另一套，探针就白验了。

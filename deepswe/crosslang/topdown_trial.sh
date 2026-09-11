@@ -84,8 +84,22 @@ fi
 
 # SLOTS：**永远优先运行时读**。配置里留空是推荐用法，写死常数换机器就会静默算错。
 if [ -z "${SLOTS:-}" ]; then
-  SLOTS="$(cat "$EVSRC/$PMU/caps/slots" 2>/dev/null | tr -dc '0-9' || true)"
+  # caps/slots 的进制不统一：arm64 的 armv8_pmuv3 导出的是**十六进制**（`0x8`），
+  # x86 那边是十进制。早先这里写的是 `tr -dc '0-9'`，它把 `x` 剥掉 ——
+  #   0x8 → "08" → 8    碰巧对
+  #   0xa → "0"  → 0    **分母归零**，解析器除零崩溃，连 topdown.json 都落不下来
+  # 而且失败得毫无征兆：perf 照常退出 0、perf.json 照常有内容。
+  # 所以必须按进制解析，并且解析不出来要明确拒绝，绝不能降级成某个数。
+  SLOTS_RAW="$(tr -d '[:space:]' < "$EVSRC/$PMU/caps/slots" 2>/dev/null || true)"
   SLOTS_SRC="$EVSRC/$PMU/caps/slots"
+  case "$SLOTS_RAW" in
+    0[xX]*[!0-9a-fA-FxX]*) SLOTS="" ;;                      # 含非法字符
+    0[xX]*)                SLOTS=$(( SLOTS_RAW )) ;;        # 十六进制，$(( )) 认 0x
+    *[!0-9]*|"")           SLOTS="" ;;                      # 含非数字，或空
+    *)                     SLOTS=$(( 10#$SLOTS_RAW )) ;;    # 十进制。必须加 10# ——
+                                                            # 否则 "08" 会被当八进制而报错
+  esac
+  [ "${SLOTS:-0}" -gt 0 ] 2>/dev/null || SLOTS=""           # 0 和负数一律当没读到
   if [ -z "$SLOTS" ]; then
     echo "❌ 读不到 $EVSRC/$PMU/caps/slots，topdown.conf 里也没填 SLOTS。"
     echo "   没有 SLOTS 就算不出四象限，而**猜一个常数比算不出更糟**：四个比值会"

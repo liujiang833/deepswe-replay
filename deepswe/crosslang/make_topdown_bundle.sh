@@ -8,23 +8,44 @@
 # 约定（BUILD_INFO 记 built_utc/git_commit/host、SHA256SUMS 记全量指纹、
 # tarball 根目录名固定）与 make_bundle.sh 保持一致，两个包可以用同一套手法核对。
 #
-# 用法：  bash make_topdown_bundle.sh                 # → deepswe-topdown-bundle-<日期>.tar.gz
-#         bash make_topdown_bundle.sh -o /tmp/x.tar.gz
-#         bash make_topdown_bundle.sh --trial <trial目录名>   # 换一条 trial
+# 用法：  bash make_topdown_bundle.sh                 # → deepswe-topdown-bundle-<日期>[后缀].tar.gz
+#         bash make_topdown_bundle.sh -o /tmp/x.tar.gz          # 完全指定输出名
+#         bash make_topdown_bundle.sh --tag b                   # 强制后缀 → …-<日期>b.tar.gz
+#         bash make_topdown_bundle.sh --trial <trial目录名>     # 换一条 trial
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT=""
+OUT=""; TAG=""
 TRIAL_NAME="returns-validated-error-accumula__8JQj5gw"
 while [ $# -gt 0 ]; do
   case "$1" in
     -o)      [ $# -ge 2 ] || { echo "❌ -o 缺少值"; exit 1; }; OUT="$2"; shift 2 ;;
+    --tag)   [ $# -ge 2 ] || { echo "❌ --tag 缺少值"; exit 1; }; TAG="$2"; shift 2 ;;
     --trial) [ $# -ge 2 ] || { echo "❌ --trial 缺少值"; exit 1; }; TRIAL_NAME="$2"; shift 2 ;;
     -h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "❌ 未知参数: $1"; exit 1 ;;
   esac
 done
-[ -n "$OUT" ] || OUT="$HERE/deepswe-topdown-bundle-$(date +%Y%m%d).tar.gz"
+# 默认输出名：同一天重打**不覆盖**，自动往后加一位字母（…-20260911.tar.gz → …-20260911b.tar.gz）。
+# 为什么不直接覆盖：用户手上往往已经 scp 过一份旧包，文件名一样、内容不一样，
+# 到时候「服务器上跑的到底是哪一版」就只能靠 BUILD_INFO 猜。宁可多一个文件，也不要同名两份。
+# （真想覆盖就显式 -o 指定同名。）
+if [ -z "$OUT" ]; then
+  BASE="$HERE/deepswe-topdown-bundle-$(date +%Y%m%d)"
+  if [ -n "$TAG" ]; then
+    OUT="${BASE}${TAG}.tar.gz"
+  else
+    OUT="${BASE}.tar.gz"
+    for suf in b c d e f g h i j k l m n o p q r s t u v w x y z; do
+      [ -e "$OUT" ] || break
+      OUT="${BASE}${suf}.tar.gz"
+    done
+    if [ -e "$OUT" ]; then
+      echo "❌ $BASE{,b..z}.tar.gz 全都存在了 —— 今天打得够多了，用 -o 显式指定输出名"
+      exit 1
+    fi
+  fi
+fi
 
 SRC="$HERE/$TRIAL_NAME"
 [ -d "$SRC" ] || { echo "❌ trial 目录不存在: $SRC"; exit 1; }
@@ -73,8 +94,8 @@ done
 # 不影响使用，但用户敲 `./probe_pmu.sh` 会 Permission denied，没必要留这个坑。
 chmod 755 "$ROOT"/*.sh "$ROOT"/*.py
 
-# 版本标识：文件名只带日期，同一天重打会同名覆盖、跨天又会多出一个包，
-# 光看文件名分不清手上这份是哪一版。服务器上 `cat BUILD_INFO` 一眼可辨。
+# 版本标识：文件名只带日期（同一天多次重打会带 b/c/d… 后缀），光看文件名
+# 分不清手上这份在功能上是哪一版。服务器上 `cat BUILD_INFO` 一眼可辨。
 GITSHA=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # 只看进了包的那些路径：仓库里别处的未提交改动与本包无关，算进来会让标识长期显示"脏"而失去意义。
 # 末尾 || true 不能省：set -euo pipefail 下 grep -v 无匹配时返回 1（正是"干净"的情况），
@@ -86,6 +107,14 @@ GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null \
   echo "git_commit  $GITSHA${GITDIRTY:+ (工作区有未提交改动)}"
   echo "host        $(uname -srm)"
   echo "kind        topdown（单条 trial 的 ARM PMU 采集）"
+  echo "bundle      $(basename "$OUT")"
+  # 同一天可能打出好几个包（…-20260911.tar.gz / …-20260911b.tar.gz），光看日期分不清。
+  # 这一行写死这一版**在功能上**是什么，服务器上 `cat BUILD_INFO` 一眼可辨新旧。
+  echo "features    后端双口径（EV_STALL_SLOT_BE 留空=残差法 / 填=直接法）"
+  echo "            残差法下求和自检失效 → 改跑 C1~C5；可选 EV_STALL_SLOT 开 X 交叉校验"
+  echo "            事件号强制 0x 前缀校验；perf 的 -G 排在 -e 之后（must define events before cgroups）"
+  echo "            cgroup v1/v2 都支持：路径改为读 /proc/<pid>/cgroup，不猜 docker driver"
+  echo "            topdown_trial.sh 支持 --no-metrics 透传给 replay.py（v1 上绕开 replay 指标）"
   echo "trial       $TRIAL_NAME"
   echo "baseline    $(python3 -c "
 import json,sys

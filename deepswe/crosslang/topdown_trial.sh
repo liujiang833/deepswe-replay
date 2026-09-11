@@ -20,23 +20,31 @@
 #   bash topdown_trial.sh <trial目录>
 #   bash topdown_trial.sh <trial目录> -o <输出目录>
 #   bash topdown_trial.sh <trial目录> --limit 5      # 只重放前 5 条命令，冒烟用
+#   bash topdown_trial.sh <trial目录> --no-metrics   # 关掉 replay.py 自己那套 cgroup 指标
+#
+# 什么时候要 --no-metrics：replay.py 启动时报「sinkhole cgroup 初始化失败」，
+# 整条采集根本起不来。它那套指标（usage_usec / mem_peak）是**自己去读容器 cgroup 文件**
+# 拿的，和本脚本在宿主侧用 perf -G 采 PMU 完全是两条独立的路 ——
+# 关掉它不影响四象限一个数，只是 commands.jsonl 里那几列记成 null。
+# 换句话说：cgroup 指标采不到 ≠ topdown 采不到，别因为前者放弃整轮采集。
 #
 # 跑之前先跑 probe_pmu.sh —— 那一步才是判断这台机器能不能采的地方。
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$HERE/topdown.conf"
 
-TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""
+TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--outdir) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; OUTDIR="$2"; shift 2 ;;
     --limit)     [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; LIMIT="$2"; shift 2 ;;
+    --no-metrics) NO_METRICS=1; shift ;;
     -h|--help)   sed -n '2,/^set -[eu]/p' "$0" | sed '$d'; exit 0 ;;
     -*)          echo "❌ 未知参数: $1"; exit 1 ;;
     *)           TRIAL="$1"; shift ;;
   esac
 done
-[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N]"; exit 1; }
+[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N] [--no-metrics]"; exit 1; }
 [ -d "$TRIAL" ] || { echo "❌ trial 目录不存在: $TRIAL"; exit 1; }
 TRIAL="$(cd "$TRIAL" && pwd)"
 TNAME="$(basename "$TRIAL")"
@@ -80,21 +88,87 @@ else
   SLOTS_SRC="topdown.conf（⚠️ 写死的值，换机器/换核请复核）"
 fi
 
-# 事件组。整组用 {} 包住 —— 保证这几个事件被内核当成一个调度单元同时上同时下，
+# ── cgroup 版本：v1 和 v2 下 perf -G 的路径口径完全不同 ────────
+# v2（统一层级）：-G 的路径相对 /sys/fs/cgroup/
+# v1（多层级）：perf 用的是 **perf_event 这个独立层级**，路径相对
+#              /sys/fs/cgroup/perf_event/
+# 这件事必须在第一屏就告诉用户：v1 上路径推错的表现是
+# `no access to cgroup /sys/fs/cgroup/perf_event/xxx`，
+# 而同一台 v1 机器上 replay.py 还会另外报一句「sinkhole cgroup 初始化失败」
+# （它那套指标只认 v2 的 cpu.stat / memory.current）—— 两个报错看着不相干，
+# 根因是同一个。不把版本打出来，人就会当成两个独立问题去查。
+CGFS_T="$(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo 未知)"
+if [ "$CGFS_T" = cgroup2fs ]; then CGVER=v2; else CGVER=v1; fi
+
+# ── 事件号校验：必须是 0x 开头的十六进制 ──────────────────────
+# 为什么值得专门拦一道：perf 的 `event=` 字段按 **C 风格**解析数字 ——
+# 配置里写 `11`，perf 读到的是**十进制 11**，也就是事件 0xb（BR_MIS_PRED），
+# 而你想要的 CPU_CYCLES 是 0x11。这个错误 perf **完全不报错**：0xb 是合法事件，
+# 照样有数，只是数的是别的东西 —— 四象限整套静默算错，而且「看起来很正常」。
+# 之前这里是把 conf 里的值**原样**拼进 event=，零校验，这就是那个坑。
+# （这段校验和 probe_pmu.sh 里的 evcode_bad 是同一套，改一处要两处一起改。）
+evcode_bad() {   # $1=配置键名  $2=值；不合法时打印原因并返回 0（真）
+  local key="$1" val="$2"
+  if [[ "$val" =~ ^0[xX][0-9a-fA-F]+$ ]]; then return 1; fi
+  echo "❌ $key=$val —— 事件号必须写成 0x 开头的十六进制（如 0x0011 / 0x11）"
+  echo "   perf 的 event= 按 C 风格解析数字：写 \`11\` 它读的是**十进制 11**（= 0xb），"
+  echo "   数到的是另一个合法事件，**不报任何错**，四象限静默算错。"
+  echo "   改成 0x${val} 很可能就是你想要的（但请按目标核 TRM 核对一遍）。"
+  return 0
+}
+
+# 四个必需事件：不能空，且必须 0x 打头
+for key in EV_CPU_CYCLES EV_OP_RETIRED EV_OP_SPEC EV_STALL_SLOT_FE; do
+  val="${!key:-}"          # bash 间接展开，比 eval 干净也安全
+  [ -n "$val" ] || { echo "❌ topdown.conf 里 $key 是空的 —— 这四个事件是必需的，不能留空"; exit 1; }
+  if evcode_bad "$key" "$val"; then exit 1; fi
+done
+# 两个可选事件：留空合法（留空各有含义），填了就必须合格
+for key in EV_STALL_SLOT_BE EV_STALL_SLOT; do
+  val="${!key:-}"
+  [ -n "$val" ] || continue
+  if evcode_bad "$key" "$val"; then exit 1; fi
+done
+
+# ── 事件组 ────────────────────────────────────────────────────
+# 整组用 {} 包住 —— 保证这几个事件被内核当成一个调度单元同时上同时下，
 # 否则它们各自在不同时间窗口里计数，四象限的比值就没有意义了。
+#
+# ⚠️ EV_STALL_SLOT_BE 留空时**绝对不能**把它拼进去：拼出来会是
+#    `.../event=,name=stall_slot_backend/`，perf 直接拒绝解析，**整组都开不起来**，
+#    连另外四个事件都采不到。留空 = 走残差法（BackendBound 由 1 减出来），
+#    这是没实现 STALL_SLOT_BACKEND 的核上的正常用法，不是降级。
+#    EV_STALL_SLOT 同理（它只用于 topdown_parse.py 的 X 交叉校验）。
 # （这段拼法和 probe_pmu.sh 里的 build_evspec 是同一套，改一处要两处一起改。）
+PAIRS=("$EV_CPU_CYCLES:cpu_cycles" "$EV_OP_RETIRED:op_retired" \
+       "$EV_OP_SPEC:op_spec" "$EV_STALL_SLOT_FE:stall_slot_frontend")
+if [ -n "${EV_STALL_SLOT_BE:-}" ]; then
+  PAIRS+=("$EV_STALL_SLOT_BE:stall_slot_backend")
+  BE_MODE="直接法（BackendBound = STALL_SLOT_BACKEND / 分母）"
+else
+  BE_MODE="残差法（BackendBound = 1 − 其余三项；求和自检失效，改跑 C1~C5）"
+fi
+# name= 取 stall_slot_total 而不是 stall_slot：后者是另外两个名字的前缀，
+# topdown_parse.py 按 name 做子串兜底匹配时会出歧义。
+if [ -n "${EV_STALL_SLOT:-}" ]; then
+  PAIRS+=("$EV_STALL_SLOT:stall_slot_total")
+  X_MODE="开（EV_STALL_SLOT=$EV_STALL_SLOT）"
+else
+  X_MODE="关（EV_STALL_SLOT 留空 —— 残差法下就没有任何一条校验能抓「SLOTS 偏大」）"
+fi
 SEP=""; EVSPEC="{"
-for pair in "$EV_CPU_CYCLES:cpu_cycles" "$EV_OP_RETIRED:op_retired" \
-            "$EV_OP_SPEC:op_spec" "$EV_STALL_SLOT_FE:stall_slot_frontend" \
-            "$EV_STALL_SLOT_BE:stall_slot_backend"; do
+for pair in "${PAIRS[@]}"; do
   EVSPEC="${EVSPEC}${SEP}${PMU}/event=${pair%%:*},name=${pair##*:}/"; SEP=","
 done
-N_EV=5
+N_MAIN=${#PAIRS[@]}
+N_EV=$N_MAIN
 for kv in ${EV_EXTRA:-}; do
   [ -n "$kv" ] || continue
   case "${kv%%=*}" in
     *[!A-Za-z0-9_]*|"") echo "❌ EV_EXTRA 里的事件名不合法: ${kv%%=*}（perf 的 name= 只收 [A-Za-z0-9_]）"; exit 1 ;;
   esac
+  # EV_EXTRA 的事件号同样要校验 —— 和五个主事件同一个坑，一样静默数错东西
+  if evcode_bad "EV_EXTRA 里的 ${kv%%=*}" "${kv#*=}"; then exit 1; fi
   EVSPEC="${EVSPEC}${SEP}${PMU}/event=${kv#*=},name=${kv%%=*}/"; SEP=","
   N_EV=$((N_EV + 1))
 done
@@ -142,13 +216,24 @@ echo "=============================================================="
 echo "  trial      $TNAME"
 echo "  replay.py  $REPLAY"
 echo "  输出       $TD"
+echo "  cgroup     $CGVER（/sys/fs/cgroup 类型 $CGFS_T）"
+if [ "$CGVER" = v1 ]; then
+  echo "             ⚠️ v1：perf -G 走 perf_event 独立层级；replay.py 的 per-command"
+  echo "                cgroup 指标在 v1 上不可用，起不来就加 --no-metrics（不影响 topdown）"
+fi
 echo "  PMU        $PMU（$PMU_SRC）"
 echo "  SLOTS      $SLOTS（$SLOTS_SRC）"
 echo "  perf       ${PERF_VER_RAW:-未知} → $OUTFMT"
-echo "  事件       $N_EV 个"
+echo "  后端口径   $BE_MODE"
+echo "  X 交叉校验 $X_MODE"
+echo "  事件       $N_EV 个（主事件 $N_MAIN + EV_EXTRA $((N_EV - N_MAIN))）"
 printf '%s\n' "$EVSPEC" | fold -w 66 | sed 's/^/             /'
 if [ -n "$LIMIT" ]; then
   echo "  ⚠️  --limit $LIMIT：只重放前 $LIMIT 条命令，这是冒烟不是正式采集"
+fi
+if [ "$NO_METRICS" = 1 ]; then
+  echo "  --no-metrics：replay.py 的 cgroup 指标关闭（commands.jsonl 里那几列记 null）"
+  echo "                不影响 topdown —— PMU 是宿主侧 perf -G 采的，两条路互不相干"
 fi
 echo
 
@@ -206,6 +291,8 @@ trap 'echo; echo "  ⚠️  收到 SIGTERM，中止采集"; cleanup; exit 143' T
 echo "── 起重放（后台）──────────────────────────────────────────"
 RCMD=(python3 "$REPLAY" "$TRIAL" "$TRIAL/task.json" -o "$OUTDIR")
 if [ -n "$LIMIT" ]; then RCMD+=(--limit "$LIMIT"); fi
+# replay.py 的 cgroup 指标和本脚本的 PMU 采集互不相干，关掉不影响四象限
+if [ "$NO_METRICS" = 1 ]; then RCMD+=(--no-metrics); fi
 echo "  ${RCMD[*]}"
 echo "  日志  $RLOG"
 # ⚠️ 这里的 `set -m` 不能删，删了清理逻辑会静默失效。
@@ -293,33 +380,70 @@ fi
 CID="$FULLID"
 echo "  ✅ $CNAME  ($CID)"
 
-# ── 4. 推 cgroup 相对路径 ──────────────────────────────────────
-# perf -G 要的是相对 /sys/fs/cgroup 的路径。docker 的两种 cgroup driver
-# 落点完全不同，都得试。**路径不存在时 perf 不报错，只给你一串 0** ——
-# 所以这里必须先确认目录真的在，找不到就直接停，别去采一堆 0 回来。
-CG=""; TRIED=""
-for cand in "system.slice/docker-${CID}.scope" "docker/${CID}"; do
-  TRIED="$TRIED
-     /sys/fs/cgroup/$cand"
-  if [ -d "/sys/fs/cgroup/$cand" ]; then CG="$cand"; break; fi
-done
-if [ -z "$CG" ]; then
-  FOUND="$(find /sys/fs/cgroup -maxdepth 6 -type d -name "*${CID}*" -print -quit 2>/dev/null || true)"
-  if [ -n "$FOUND" ]; then
-    CG="${FOUND#/sys/fs/cgroup/}"
-    TRIED="$TRIED
-     $FOUND   (find 兜底命中)"
-  fi
-fi
-if [ -z "$CG" ]; then
+# ── 4. 推 cgroup 路径 ──────────────────────────────────────────
+# **不猜 docker 的 cgroup driver，直接问内核**：读容器 1 号进程的 /proc/<pid>/cgroup，
+# 那里写的就是这个进程当前所在的 cgroup，driver 是 systemd 还是 cgroupfs、
+# 有没有自定义 cgroup-parent、是不是 rootless，一概不用管。
+#
+# 为什么把原来那套「猜两条路径 + find 兜底」整个换掉：**它在 cgroup v1 上会静默推错**。
+# v1 的 /sys/fs/cgroup/ 下是 blkio/ memory/ perf_event/ … 一堆并列的控制器目录，
+# 每个下面都有 docker/<id>。原来的 `find -maxdepth 6 -name "*<id>*"` 会命中其中
+# **随便一个**（字母序大概率是 blkio），于是 CG 变成 `blkio/docker/<id>`；
+# perf 再把它拼到自己的 perf_event 挂载点下 → 一个根本不存在的路径，
+# 报错是 `no access to cgroup /sys/fs/cgroup/perf_event/blkio/docker/<id>`，
+# 完全看不出是「推导选错了控制器目录」。
+#
+# v1 / v2 的口径差别：
+#   v2  统一层级，-G 的路径相对 /sys/fs/cgroup/      ，/proc/<pid>/cgroup 里是 `0::/...`
+#   v1  perf 走 perf_event 独立层级，相对 /sys/fs/cgroup/perf_event/，
+#       /proc/<pid>/cgroup 里是 `<n>:perf_event:/...`
+#       （v1 上控制器常常是 co-mount 的，那一列会是 `cpu,cpuacct` 这种逗号列表，
+#         所以只能用正则按边界匹配 perf_event，不能整列相等比较。）
+#
+# **路径不存在时 perf 未必报错，可能只给你一串 0** —— 所以这里必须先确认目录真的在，
+# 推不出来就直接停，别去采一堆 0 回来。
+CPID="$(docker inspect -f '{{.State.Pid}}' "$CID" 2>/dev/null || true)"
+if [ -z "$CPID" ] || [ "$CPID" = 0 ]; then
   echo
-  echo "❌ 找不到容器的 cgroup 目录。试过："
-  printf '%s\n' "$TRIED"
-  echo "     /sys/fs/cgroup 类型: $(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo 未知)"
-  echo "     rootless docker 落在 user.slice 下；自定义 cgroup-parent 则任意。"
+  echo "❌ 取不到容器主进程 PID（docker inspect -f '{{.State.Pid}}' $CID）"
+  echo "   PID 为 0 一般意味着容器已经退出了 —— 看重放日志："
+  tail -20 "$RLOG" | sed 's/^/     /'
+  exit 1
+fi
+PROCCG="/proc/$CPID/cgroup"
+if [ ! -r "$PROCCG" ]; then
+  echo
+  echo "❌ 读不到 $PROCCG —— 容器主进程（PID $CPID）可能刚退出。"
+  echo "   没有它就推不出 cgroup 路径。重放日志："
+  tail -20 "$RLOG" | sed 's/^/     /'
+  exit 1
+fi
+# awk 说明：$3 是以 / 开头的 cgroup 路径，substr($3,2) 去掉前导 /（perf -G 要相对路径）；
+# 加 exit 是保证只取第一条匹配，多条时不会拼成带换行的值。
+if [ "$CGVER" = v1 ]; then
+  CG="$(awk -F: '$2 ~ /(^|,)perf_event(,|$)/ {print substr($3,2); exit}' "$PROCCG")"
+  CGABS="/sys/fs/cgroup/perf_event/$CG"
+else
+  CG="$(awk -F: '$1==0 {print substr($3,2); exit}' "$PROCCG")"
+  CGABS="/sys/fs/cgroup/$CG"
+fi
+if [ -z "$CG" ] || [ ! -d "$CGABS" ]; then
+  echo
+  echo "❌ 推不出容器的 cgroup 路径（cgroup $CGVER）。"
+  echo "   相对路径  ${CG:-<空>}"
+  echo "   绝对路径  $CGABS   $([ -d "$CGABS" ] && echo '(存在)' || echo '(不存在)')"
+  echo "   $PROCCG 原文（这是排查这件事的唯一线索）："
+  sed 's/^/     /' "$PROCCG"
+  if [ "$CGVER" = v1 ]; then
+    echo "   v1 上要找的是 perf_event 那一行。如果压根没有这一行，说明内核没挂载"
+    echo "   perf_event 控制器：ls /sys/fs/cgroup/ 看一眼，没有 perf_event/ 就采不了。"
+  else
+    echo '   v2 上要找的是 `0::/...` 那一行。'
+  fi
   exit 1
 fi
 echo "  cgroup      $CG"
+echo "  绝对路径    $CGABS（cgroup $CGVER，由 $PROCCG 推出，不猜 driver）"
 
 # ── 5. 采集 ────────────────────────────────────────────────────
 # tail --pid=$RPID -f /dev/null 只是个「跟着 replay 一起活」的空壳子进程：
@@ -327,12 +451,21 @@ echo "  cgroup      $CG"
 # 它唯一的作用是给 perf 一个准确的结束时刻。
 echo
 echo "── 采集中 ──────────────────────────────────────────────────"
-echo "  $SUDO perf stat -a -G $CG ${OUTOPT[*]} -o $PERFOUT -e '<事件组>' -- tail --pid=$RPID -f /dev/null"
+echo "  $SUDO perf stat -a ${OUTOPT[*]} -o $PERFOUT -e '<事件组>' -G $CG -- tail --pid=$RPID -f /dev/null"
 echo "  （重放跑完 perf 自动收尾；进度看 tail -f $RLOG）"
 echo
 PERF_RC=0
-$SUDO perf stat -a -G "$CG" "${OUTOPT[@]}" -o "$PERFOUT" \
-      -e "$EVSPEC" -- tail --pid="$RPID" -f /dev/null 2>"$TD/perf.stderr" || PERF_RC=$?
+# ⚠️⚠️ **`-G` 必须排在 `-e` 后面**，顺序反了 perf 直接拒绝启动：
+#     `must define events before cgroups`
+#   原因在 perf 自己的 util/cgroup.c：parse_cgroups() 解析 -G 时会检查 evlist
+#   是不是空的，空就报这句然后退出。man perf-stat 的原话是 cgroup
+#   "always refer to events defined earlier on the command line" ——
+#   也就是 -G 是**按位置**绑到它前面那些 -e 上的，不是一个全局开关。
+#   这个报错信息完全没提「参数顺序」，不翻 man page 很难联想到，
+#   所以这行的顺序不要「顺手整理」成看着更顺眼的样子。
+#   （上面那行 echo 打给用户看的命令必须和这里**逐字一致**，否则排查时会把人带偏。）
+$SUDO perf stat -a "${OUTOPT[@]}" -o "$PERFOUT" \
+      -e "$EVSPEC" -G "$CG" -- tail --pid="$RPID" -f /dev/null 2>"$TD/perf.stderr" || PERF_RC=$?
 
 # ── 6. 收重放的退出码 ──────────────────────────────────────────
 RRC=0

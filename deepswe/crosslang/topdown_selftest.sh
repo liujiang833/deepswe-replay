@@ -74,7 +74,8 @@ echo "  事件组     {$EVSPEC}"
 
 # ── 找个镜像 ──────────────────────────────────────────────────────
 if [ -z "$IMAGE" ]; then
-  for d in */; do
+  # 两处都找：bundle 是平铺的（trial 直接在本目录下），仓库布局里全量在 full_trials/
+  for d in */ full_trials/*/; do
     [ -f "${d}meta.json" ] || continue
     im=$(python3 -c "import json;print((json.load(open('${d}meta.json')).get('image') or {}).get('docker_image',''))" 2>/dev/null)
     [ -n "$im" ] && docker image inspect "$im" >/dev/null 2>&1 && { IMAGE="$im"; break; }

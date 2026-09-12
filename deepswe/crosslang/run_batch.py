@@ -350,11 +350,17 @@ def meminfo_mb(key):
     return None
 
 
-def load_trials():
-    """扫描同目录下的 trial 子目录。判据是四个必需文件齐全，不靠目录名。"""
+def load_trials(root=None):
+    """扫描 trial 子目录。判据是四个必需文件齐全，不靠目录名。
+
+    root 默认是本脚本所在目录（打好的 bundle 就是这个平铺布局）。仓库布局里
+    全量 113 条在 `full_trials/` 子目录下，而 crosslang/ 根下只有已验证的那几条 ——
+    所以 `--trials-dir full_trials` 是仓库里跑全量的入口，不必把脚本拷来拷去。
+    """
+    root = root or HERE
     need = ("meta.json", "trajectory.json", "model.patch", "task.json")
     out = []
-    for d in sorted(HERE.iterdir()):
+    for d in sorted(root.iterdir()):
         if not d.is_dir() or not all((d / f).exists() for f in need):
             continue
         meta = json.loads((d / "meta.json").read_text())
@@ -670,6 +676,9 @@ def main():
     ap.add_argument("--topdown-script", default="",
                     help="topdown_trial.sh 路径（默认取本脚本同目录）")
     ap.add_argument("--dry-run", action="store_true", help="只做预检和排程，不真跑")
+    ap.add_argument("--trials-dir", default="",
+                    help="去哪个目录找 trial（默认本脚本所在目录）。仓库布局下全量 113 条"
+                         "在 full_trials/，用 --trials-dir full_trials")
     ap.add_argument("--skip-missing", action="store_true",
                     help="镜像还没建好的 trial 直接跳过而不是拒绝启动（全量集边建边跑用）")
     ap.add_argument("--keep-going", action="store_true",
@@ -712,7 +721,18 @@ def main():
                   f"  先跑 bash probe_pmu.sh 把这台机器的事件号验出来再填。")
             return 1
 
-    trials = load_trials()
+    # trial 根目录：相对路径按「本脚本所在目录」解释，这样在 crosslang/ 下
+    # `--trials-dir full_trials` 和在别处用绝对路径都成立。
+    if args.trials_dir:
+        trials_root = pathlib.Path(args.trials_dir)
+        if not trials_root.is_absolute():
+            trials_root = HERE / trials_root
+        if not trials_root.is_dir():
+            print(f"❌ --trials-dir 不是目录: {trials_root}")
+            return 1
+    else:
+        trials_root = HERE
+    trials = load_trials(trials_root)
     if args.only:
         want = {s.strip() for s in args.only.split(",") if s.strip()}
         trials = [t for t in trials if t["lang"] in want]

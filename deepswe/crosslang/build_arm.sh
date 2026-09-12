@@ -51,6 +51,7 @@ NOPROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"
 BUILD_NET=""
 # 公司内网做 TLS 中间人时用：装内网 CA（推荐）或干脆关掉校验（有残留代价，见下）
 CA_CERT="${DEEPSWE_CA_CERT:-}"
+TRIALS_DIR=""
 INSECURE=0
 # 内网取包极慢时用：构建期把 npm 系的源换到镜像站（只在构建期生效，见「包源」一节）
 REGISTRY="${DEEPSWE_NPM_REGISTRY:-}"
@@ -138,6 +139,10 @@ while [ $# -gt 0 ]; do
     --no-proxy) need_val --no-proxy "$@"; NOPROXY="$2"; shift 2 ;;
     --build-network) need_val --build-network "$@"; BUILD_NET="$2"; shift 2 ;;
     --ca-cert) need_val --ca-cert "$@"; CA_CERT="$2"; shift 2 ;;
+    # trial 根目录。bundle 是平铺的（trial 就在本脚本同级），而仓库布局里
+    # 全量 113 条在 full_trials/ 子目录，crosslang/ 根下只有已验证的那几条。
+    # 相对路径按本脚本所在目录解释，于是 `--trials-dir full_trials` 即可。
+    --trials-dir) need_val --trials-dir "$@"; TRIALS_DIR="$2"; shift 2 ;;
     --insecure) INSECURE=1; shift ;;
     --registry) need_val --registry "$@"; REGISTRY="$2"; shift 2 ;;
     --goproxy) need_val --goproxy "$@"; GOPROXY="$2"; shift 2 ;;
@@ -246,9 +251,17 @@ ORDER="python go javascript typescript rust"
 # 各三十多条），所以这里存的是空格分隔的列表；早先版本用的是「一语言一目录」，
 # 在全量集上会静默只保留最后一条。
 declare -A DIRS_OF LANG_OF
+# trial 根目录解析：相对路径按本脚本所在目录算，绝对路径直接用。
+if [ -n "$TRIALS_DIR" ]; then
+  case "$TRIALS_DIR" in /*) TRIALS_ROOT="$TRIALS_DIR" ;; *) TRIALS_ROOT="$HERE/$TRIALS_DIR" ;; esac
+  [ -d "$TRIALS_ROOT" ] || { echo "❌ --trials-dir 不是目录: $TRIALS_ROOT"; exit 1; }
+else
+  TRIALS_ROOT="$HERE"
+fi
+
 while IFS=$'\t' read -r lang dir; do
   DIRS_OF[$lang]="${DIRS_OF[$lang]:-} $dir"; LANG_OF[$dir]="$lang"
-done < <(python3 - "$HERE" <<'PY'
+done < <(python3 - "$TRIALS_ROOT" <<'PY'
 import json, pathlib, sys
 for d in sorted(pathlib.Path(sys.argv[1]).iterdir()):
     m = d / "meta.json"

@@ -226,3 +226,41 @@
 - `deepswe/data/trajectories/` - 1095 个产物 / 274MB，被 .gitignore 忽略，不入库（可由上述两脚本复现）
 
 **Commit:** pending
+
+## 2026-09-14: replay 命令类型 × 次数/耗时统计（cmd_stats）+ 分类器跨语言扩展
+
+**Goal:** 一轮 replay 跑完后，按「命令类型」统计次数与耗时，出 per-benchmark / per-language / 全体三层；
+只统计本轮成功跑起来的 benchmark，排除项写明原因。命令分类器从只认 python 工具扩到 go/rust/ts/js。
+
+**Steps:**
+1. 勘察 run_batch.py / replay.py / summarize_replay.py 与现有数据 - success
+2. 扩展 `summarize_replay.py` 分类器（不复制，原地改；新增 `classify_command_full` 返回 program）- success
+3. python 回归 diff + full_trials 113 条 trace 覆盖率检查 - success
+4. 新增 `crosslang/cmd_stats.py`（collect / aggregate / 缺省两步连跑）- success
+5. run_batch.py 收尾自动调用；两个打包脚本加进清单 - success
+6. 合成多语言假 run 端到端自检（`cmd_stats_selftest.py`，54 项 PASS，计数口径 = 输出里的 PASS 行数）+ 真实 `runs/full-arm-test` - success
+
+**Key Findings:**
+- 纳入判据与 run_batch.py 的 `n_pass` 同式：`exit_code == 0 且 (smoke 或 patch_identical is True)`；
+  另外排除截断（`options.smoke > 0`，或 verdict 里 `n_replayed + n_skipped_sentinel < n_cmds_trace`——
+  replay.py 的 verdict 不记 `--limit`，只能这样反推）、commands.jsonl 缺失 / 坏行 / 条数 ≠ `n_replayed`。
+- 分类器改动前，full_trials 4406 条命令主类别落「其他」：python 2.7% / go 6.9% / rust 8.7% / ts 12.8% / js 12.5%；
+  改动后 2.3% / 0.2% / 0.3% / 0.4% / 1.3%，「未识别」303 → 0。更大的偏差其实不在「其他」：
+  旧版把 `sed -i … && go test` 这类判成「写文件」（未识别程序只算其他，排在写文件之后），
+  改后有 495 条从写文件、76 条从版本控制、57 条从读文件迁到跑测试。
+- python 的 DEFAULT_JSONL（gql）默认输出 / --audit / --json 与改动前逐字一致；crosslang/returns 基线 default/--audit 一致，
+  --json 里 2 处细类有意变化：`未识别:ps` → `ps`、`git -c`（把全局选项当成子命令的老 bug）→ `git commit`。
+- 切分器顺带修了三处会让跨语言命令整段误判的问题：shell 注释（注释里的撇号会开出不闭合的引号吞掉后文）、
+  行尾续行符、`(cd x && …)` 子 shell 开头；`bash -c '…'` / `setsid` 递归看里面的程序。
+
+**Files Changed:**
+- `deepswe/summarize_replay.py` - 跨语言工具表、program_key、classify_command_full；老 API 不变
+- `deepswe/crosslang/cmd_stats.py` - 新增，统计主脚本（只用标准库）
+- `deepswe/crosslang/cmd_stats_selftest.py` - 新增，端到端自检
+- `deepswe/crosslang/classify_coverage.py`、`deepswe/crosslang/classify_coverage/` - 新增，覆盖率检查脚本与结果（before/after.json、COVERAGE.md、python_regression.txt、reproduce.sh）
+- `deepswe/crosslang/run_batch.py` - 收尾调用 cmd_stats（失败只提示、不改退出码；--dry-run 不调）
+- `deepswe/crosslang/make_bundle.sh`、`make_topdown_bundle.sh` - 打包清单加 cmd_stats.py + summarize_replay.py
+- `deepswe/crosslang/README.md`、`RUNBOOK.md` - 用法与口径（RUNBOOK §5.5）
+- `EXEC_LOG_2026-09-14-cmd-stats.md` - 执行日志（本地）
+
+**Commit:** 见 git log —— 本条目与代码同一次提交入库（提交标题「replay 命令类型 × 次数/耗时统计：cmd_stats + 分类器跨语言扩展」）；提交不可能包含自己的 hash，沿用 deepswe/PROJECT_HISTORY.md「见 git log」的做法，不另做回填提交

@@ -456,6 +456,88 @@ python3 run_batch.py --dry-run                     # 只预检和排程
 两边都是 2 核限额、都串行、cgroup 口径相同（`verdict.json` 的 `host` 字段记了内核、
 cgroup 目录与探测方式、CPU 数）。
 
+### 5.5 命令类型统计：`cmd_stats.py`
+
+回答「这一轮里各类命令跑了多少次、花了多少时间」，分 per-benchmark / per-language / 全体三层。
+
+**什么时候跑**：`run_batch.py` 一轮跑完（写好 `summary.json` 之后）会自动调一次，
+结果落 `<输出目录>/cmd_stats/`，屏幕上只多一行 `命令统计 …/SUMMARY.md（纳入 N 条 / 排除 M 条）`。
+`--dry-run` 不调；统计失败只打一行 `⚠️ 命令统计失败（不影响本批结果）…；手动重跑 …`，
+**不改变 run_batch 的退出码**。手动跑：
+
+```bash
+python3 cmd_stats.py                          # 取 runs/ 下最新一轮（summary.json 的 mtime 最新，不按目录名）
+python3 cmd_stats.py runs/<批次>               # collect + aggregate，输出 runs/<批次>/cmd_stats/
+python3 cmd_stats.py runs/<批次> -o /tmp/stats # 指定输出目录
+python3 cmd_stats.py collect runs/<批次> [-o OUT]   # 只做第一步
+python3 cmd_stats.py aggregate runs/<批次>/cmd_stats # 只做第二步（只读 per_benchmark/*.json）
+```
+
+退出码：0 正常（含「一条都没纳入」）；1 自检不过；2 输入不对（没有 summary.json 等）。
+依赖同目录（包里）或上一级目录（仓库里）的 `summarize_replay.py`，只用 python 标准库。
+
+**产物**
+
+| 文件 | 内容 |
+|---|---|
+| `SUMMARY.md` | 人读：纳入/排除清单与原因、全体 / 按语言 / 按 benchmark 的主要表格 |
+| `manifest.json` | collect 的清单：纳入谁、排除谁（逐条原因）、分类器路径与 sha256 |
+| `per_benchmark/<trial>.json` | meta + **逐条命令记录**（i / 主类别 / 细类 / program / wall_s / rc / timed_out / usage_usec）+ 分组表 |
+| `per_language/<lang>.json`、`all.json` | 汇聚后的分组表，另带 `n_benchmarks` 与每个 key 的 `n_benchmarks_with_key` |
+| `per_benchmark.csv`、`per_language.csv`、`all.csv` | 三层各一份长表（一行 = 一个范围里一个维度的一个 key），UTF-8 带 BOM，Excel 直接开 |
+
+**纳入口径** —— 只统计「本轮成功跑起来」的 benchmark，四条同时满足：
+
+1. `exit_code == 0` 且（冒烟模式 或 `patch_identical is True`）—— 与 `run_batch.py` 算 `n_pass` 的式子逐字相同；
+2. 没被截断：`summary.json` 的 `options.smoke == 0`，且 `verdict.json` 里
+   `n_replayed + n_skipped_sentinel == n_cmds_trace`（`replay.py --limit` 会让左边变小）。
+   冒烟批次在第 1 条里算「通过」，但在这一条被排除 —— 所以 `--smoke` 批次统计出来是空的，这是对的；
+3. `<trial>/commands.jsonl` 存在，每行都是合法 JSON 且带 `i / rc / timed_out / wall_s / cmd_stripped`；
+4. 条数 == `verdict.n_replayed`。
+
+不满足的进 `manifest.json` 的 `excluded`，**所有**不满足的原因都列出来（不止第一条）。
+不在 `summary.json` 里的目录（比如上一轮残留的 trial 目录）一律无视。
+
+**命令类型的两个维度**（一条命令一个标签，都取「决定主类别的那条语句」，
+分类器是 `summarize_replay.classify_command_full`）：
+
+- **主类别 / 细类**：跑测试 > 写文件 > 语法校验 > 搜索 > 版本控制 > 读文件 > 其他（优先级）。
+  跨语言的口径：测试、编译/构建、类型检查、lint/格式化都归「跑测试」，细类是工具名
+  （`go test` / `cargo check` / `vitest` / `tsc` / `gofmt`）；装包、查版本归「其他 › 环境查询」；
+  跑脚本文件（`node x.mjs` / `tsx x.ts` / `bun run x.ts`）归「跑测试 › 复现脚本」，与 `python3 x.py` 同口径
+  （`go run` / `cargo run` 细类就是它自己）；`node -e` / `node <<EOF` 与 python 内联脚本同一套判据；
+  以路径或变量调用的未知程序（`/tmp/abs`、`$FD`）归「跑测试 › 运行本地程序」；
+  `npx` / `pnpm exec` / `uv run` / `bash -c '…'` 看里面那个程序。
+- **program**：
+  - 一般程序取 basename；`python3*` → `python`，`pip3` → `pip`；
+  - `python -m X` → `python -m X`；
+  - git / go / cargo / npm / pnpm / yarn / bun / deno / pip / uv / poetry / rustup 带第一个位置参数
+    （跳过选项，带值选项连值跳过）：`go test`、`git status`、`pnpm test`（`pnpm -F core test` 也是它）；
+  - npx / bunx / uvx 带被启动的程序：`npx vitest`；
+  - run / run-script / exec / x / dlx / `go tool` 再带一段脚本名或程序名：`npm run build`、`uv run pytest`；
+    那一段像路径（含 `/` 或脚本扩展名）就不带：`bun run src/t.ts` → `bun run`。
+
+**指标口径**
+
+- `count_pct` / `wall_pct` 的分母是同一范围（这条 benchmark / 这门语言 / 全体）的总条数、总 wall_s；
+- `mean_s / median_s / p90_s / max_s` 是单条命令的 wall_s。**分位数每一层都用合并后的逐条记录重算**
+  （线性插值），不是下层统计值的平均；
+- `cpu_s` = Σ`usage_usec`/1e6。组内**有任何一条没采**（`--no-metrics`，默认就是不采）就记 `null`
+  并给出 `n_cpu_null`，不记 0、也不做部分求和；
+- `n_timed_out` = replay 侧 `timed_out`（rc 124/137）；`n_rc_nonzero` 含超时。
+- ⚠️ 一条命令的 wall_s 只是它自己那次 `docker exec` 的时长。agent 常把构建丢后台
+  （`nohup cargo test … &` 然后下一条 `sleep 25; tail log`），后台进程的耗时会记在后面那几条
+  `sleep` / `tail` 上，而分类记在发起的那一条上。
+
+**自检**（不过就退出码 1，不出结果）：每个 benchmark 的各维度分组必须不重不漏；
+aggregate 读回 per_benchmark 文件时，用逐条记录重算的分组表必须与文件里存的一致；
+language 层逐 key 的 count / wall_s 必须等于该语言各 benchmark 之和，all 层必须等于各语言之和。
+
+**分类器改动的验收材料**在 `classify_coverage/`：`python_regression.txt`（改动前后对 python jsonl 的
+默认输出逐字 diff）、`COVERAGE.md`（full_trials 113 条 trace 按语言落进「其他」的比例与 top 程序，
+改动前 vs 改动后），`bash classify_coverage/reproduce.sh` 可复现。
+端到端自检：`python3 cmd_stats_selftest.py`（需要本机有 crosslang/*/replay/ 下的基线 jsonl）。
+
 ## 6. 故障排查
 
 ### 6.1 `找不到容器 XXX 的 cgroup 目录`

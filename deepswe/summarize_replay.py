@@ -22,6 +22,14 @@
     python3 deepswe/summarize_replay.py --audit              # 附逐条分类，供抽查
     python3 deepswe/summarize_replay.py --charts             # 另出 3 张 PNG
     python3 deepswe/summarize_replay.py --json out.json      # 机器可读快照
+
+跨语言（2026-09-14 扩展）：分类器同时认 go / cargo / npm / pnpm / yarn / bun / deno / npx /
+node / tsc / vitest / jest … 这些测试与构建工具，口径见「跨语言工具」那一节的注释。
+对 DEFAULT_JSONL（gql）的默认输出 / --audit / --json 与改动前逐字一致（见
+crosslang/classify_coverage/python_regression.txt）；其他 python trace 上只有新增工具（ruff、ps …）
+带来的有意变化，逐条迁移见 crosslang/classify_coverage/COVERAGE.md。批量统计的入口是 crosslang/cmd_stats.py，
+它用的是 `classify_command_full`：在 `classify_command` 的基础上多给一个 program
+（决定主类别的那条语句的程序名，工具带子命令，粒度见 `program_key`）。
 """
 from __future__ import annotations
 
@@ -50,8 +58,8 @@ PRIORITY = [TEST, WRITE, SEARCH, VCS, READ, OTHER]
 
 
 def rank(pair):
-    """(类别, 细类) -> 档位序号，越小越优先。"""
-    cat, detail = pair
+    """(类别, 细类[, program]) -> 档位序号，越小越优先。只看前两项。"""
+    cat, detail = pair[0], pair[1]
     if cat == TEST and detail == SYNTAX_CHECK:
         return RANKS.index((TEST, SYNTAX_CHECK))
     return RANKS.index((cat, None))
@@ -80,11 +88,16 @@ PROG_CAT = {
     "pip": OTHER, "pip3": OTHER, "curl": OTHER, "wget": OTHER, "date": OTHER,
     "source": OTHER, ".": OTHER, "set": OTHER, "read": OTHER, "apt": OTHER,
     "apt-get": OTHER, "uname": OTHER, "whoami": OTHER, "id": OTHER, "env": OTHER,
+    # 以下为跨语言 trace 里见到的（2026-09-14 补）：进程查看/管理、条件判断、比较文件
+    "ps": OTHER, "pgrep": OTHER, "pkill": OTHER, "kill": OTHER, "wait": OTHER,
+    "uptime": OTHER, "[": OTHER,
+    "cmp": READ, "paste": READ,
 }
 
 # 语句头部可以直接丢掉、继续往后看真正程序名的词
 DROP_AND_CONTINUE = {"if", "then", "else", "elif", "do", "while", "until", "!",
-                     "time", "command", "exec", "nohup", "sudo", "env", "{", "("}
+                     "time", "command", "exec", "nohup", "sudo", "env", "{", "(",
+                     "setsid"}
 # 语句头部是这些词时，本语句不承载意图（循环的词表、块结束符等）
 STOP_WORDS = {"for", "case", "esac", "fi", "done", "}", ")", ";;", "in", "elif;", "select"}
 
@@ -144,6 +157,13 @@ def split_statements(cmd: str):
             quote = c; cur.append(c); i += 1; continue
         if c == "\\" and i + 1 < n:
             cur.append(c); cur.append(cmd[i + 1]); i += 2; continue
+        # shell 注释：引号外、词首的 `#` 一直到行尾。不跳过的话注释里的 `;` `|` 会切出假语句，
+        # 注释里的撇号（`# don't …`）更糟——会开出一个永远不闭合的引号，把后面整段命令吞掉。
+        # 词首 = 本段还空着或前一个字符是空白；`${#x}` / `$#` / `a#b` 都不算。
+        if c == "#" and (not cur or cur[-1].isspace()):
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
 
         m = re.match(r'<<(-?)\s*(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2', cmd[i:])
         if m:                                         # heredoc 开头，登记分隔符
@@ -213,6 +233,8 @@ def unquote_tokens(text: str):
         if c in "'\"":
             quote = c; i += 1; continue
         if c == "\\" and i + 1 < n:
+            if text[i + 1] == "\n":                    # 行尾续行符：等于空白，不是字面换行
+                push(); i += 2; continue
             cur.append(text[i + 1]); i += 2; continue
         if c.isspace():
             push(); i += 1; continue
@@ -240,6 +262,12 @@ def program_of(tokens):
     i = 0
     while i < len(tokens):
         t = tokens[i]
+        if t.startswith("#"):                                  # 注释（兜底，切分器一般已剥掉）
+            return None
+        if t.startswith("("):                                  # `(cd x` / `(timeout 600 …` 子 shell 开头
+            t = t.lstrip("(")
+            if not t:
+                i += 1; continue
         if t in STOP_WORDS:
             return None
         if t in DROP_AND_CONTINUE:
@@ -252,70 +280,410 @@ def program_of(tokens):
                                        re.fullmatch(r"\d+(\.\d+)?[smhd]?", tokens[i])):
                 i += 1
             continue
+        if t.endswith(")") and not t.startswith("$("):         # 子 shell 收尾 `true)`
+            t = t.rstrip(")") or t
         return t, tokens[i + 1:]
     return None
 
 
-def classify_segment(seg):
-    """单条语句 -> 类别。返回 (类别, 细类标签) 或 None（无意图，如 `done`）。"""
-    toks, redirs = unquote_tokens(seg["text"])
+# ---------------------------------------------------------------- 跨语言工具（go / rust / ts / js）
+#
+# 这些表只在老分支（python / sed / cat 写文件 / git / pip）都没命中之后才查，
+# 所以 python trace 上的既有分类不受影响。口径与 python 那边对齐：
+#
+#   跑测试   测试、编译/构建、类型检查、lint/格式化，细类 = 工具名（`go test` / `cargo check` /
+#            `vitest` / `tsc` …）。依据：python 这边 mypy / flake8 / black / isort 早就在「跑测试」里；
+#            `go build` / `cargo check` / `tsc --noEmit` 是 agent 改完代码后的校验，而且吃 CPU，
+#            所以取 TEST 本档，**不是**「语法/编译校验」那一档（那一档是给 ast.parse 一行守卫的）。
+#            跑脚本文件（node x.mjs / tsx x.ts / bun run x.ts）与 `python3 x.py` 同口径 = 复现脚本；
+#            `node -e` / `node <<EOF` 走和 python 内联脚本同一套判据（JS_* 正则）。
+#            以路径或变量调用、表里没有的程序（/tmp/abs、./target/debug/fd、$FD）= 运行本地程序：
+#            trace 里它们几乎都是 agent 刚编出来的被测程序或复现脚本。
+#   其他     装包、查版本、查依赖（npm install / go mod tidy / cargo --version …）= 环境查询，
+#            与 pip 同一个细类。
+#   启动器   npx / pnpm exec / yarn dlx / bunx / uv run / poetry run 只是壳，意图看它后面那个程序；
+#            `bash -c '<脚本>'` / `sh -c` 同理，递归分类里面那段脚本（setsid bash -c 'go build …'）。
+
+ENV_QUERY = "环境查询"
+REPRO_SCRIPT = "复现脚本"
+LOCAL_BIN = "运行本地程序"
+SHELL_MAX_DEPTH = 3            # bash -c 里再套 bash -c 的递归上限
+
+# 独立工具：直接判「跑测试」，细类 = 工具名
+TOOL_TEST = {
+    # js/ts 测试
+    "vitest", "jest", "mocha", "ava", "tap", "tstyche", "tsd", "playwright", "cypress",
+    "karma", "uvu", "c8", "nyc",
+    # js/ts 编译 / 类型检查 / 打包
+    "tsc", "vue-tsc", "rollup", "esbuild", "webpack", "vite", "tsup", "tsdown", "babel", "swc",
+    "turbo", "nx", "lerna",
+    # js/ts lint / 格式化
+    "eslint", "oxlint", "xo", "biome", "prettier", "standard", "knip", "cspell", "dprint",
+    "stylelint",
+    # go
+    "gofmt", "goimports", "golangci-lint", "staticcheck", "goyacc",
+    # rust
+    "rustc", "rustfmt",
+    # python：老表里没有的几个 lint，与 flake8 同口径
+    "ruff", "pycodestyle", "pyflakes", "pyright",
+    # 通用构建
+    "make",
+}
+# 跑 ts/js 脚本文件的解释器壳
+SCRIPT_RUNNERS = {"tsx", "ts-node", "babel-node", "tsm", "esno", "vite-node", "jiti"}
+# 包管理器 / 启动器
+PKG_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
+LAUNCHERS = {"npx", "bunx", "uvx"}
+
+# 带值的选项：取子命令时要连值一起跳过（`pnpm -F core test` 的子命令是 test，不是 core）
+VALUE_OPTS = {
+    "git": {"-C", "-c", "--git-dir", "--work-tree", "--namespace"},
+    "npm": {"--prefix", "-w", "--workspace", "-C"},
+    "pnpm": {"-F", "--filter", "-C", "--dir"},
+    "yarn": {"--cwd"},
+    "bun": {"--cwd"},
+    "cargo": {"--manifest-path", "--config", "-Z", "--color"},
+    "npx": {"-p", "--package"},
+    "uv": {"--directory", "--project", "-p", "--python", "--with"},
+    "poetry": {"-C", "--directory"},
+    "node": {"-r", "--require", "--import", "--loader", "--experimental-loader",
+             "--conditions", "-C", "--input-type"},
+}
+# program 带子命令的工具
+SUBCMD_TOOLS = {"git", "go", "cargo", "npm", "pnpm", "yarn", "bun", "deno", "pip", "uv",
+                "poetry", "rustup", "npx", "bunx", "uvx"}
+# 这些子命令后面跟的是脚本名 / 程序名，program 再多带一段（`npm run build`、`uv run pytest`）
+RUNNER_SUBCMDS = {"npm": {"run", "run-script", "exec", "x"}, "pnpm": {"run", "exec", "dlx"},
+                  "yarn": {"run", "dlx", "exec"}, "bun": {"run", "x"}, "uv": {"run"},
+                  "poetry": {"run"}, "go": {"tool"}}
+
+PM_ENV_SUBCMDS = {
+    "install", "i", "ci", "add", "remove", "rm", "uninstall", "un", "update", "up", "upgrade",
+    "ls", "list", "ll", "la", "view", "info", "show", "why", "outdated", "audit", "config",
+    "get", "set", "root", "bin", "prefix", "version", "help", "init", "link", "unlink", "pack",
+    "publish", "prune", "dedupe", "store", "env", "cache", "doctor", "whoami", "query",
+    "explain", "fund", "pkg", "import", "rebuild", "setup", "create", "licenses", "fetch",
+}
+GO_TEST_SUBCMDS = {"test", "build", "vet", "run", "generate", "install", "fmt", "tool", "fix"}
+GO_ENV_SUBCMDS = {"mod", "get", "list", "env", "version", "clean", "work", "telemetry"}
+CARGO_TEST_SUBCMDS = {"test", "nextest", "bench", "check", "build", "b", "c", "t", "r",
+                      "clippy", "fmt", "run", "doc", "miri", "fix"}
+DENO_TEST_SUBCMDS = {"test", "bench", "check", "lint", "fmt", "compile", "bundle", "doc", "coverage"}
+VERSION_FLAGS = {"--version", "-v", "-V", "version"}
+SCRIPT_EXT = re.compile(r"\.(m?[jt]sx?|c[jt]s|py|go|rs|sh)$")
+
+# node 内联脚本（`node -e` / `node <<EOF`）正文的判据，顺序与 python 那套一致：
+#   写文件 -> 读文件并做匹配（脚本扫文件）-> 构造对象/调函数取结果（内联脚本验证）-> 其余（接口探查）。
+# `const x = require(...)` / `import(...)` 只是加载模块，不算「调函数」——对应 python 的只 import。
+JS_WRITE = re.compile(r"\b(writeFileSync|appendFileSync|renameSync|unlinkSync|rmSync|rmdirSync|"
+                      r"mkdirSync|copyFileSync|cpSync|createWriteStream)\s*\(|"
+                      r"\bfs(?:\.promises)?\.(writeFile|appendFile|rename|unlink|rm|mkdir|copyFile)\s*\(")
+JS_READ_FILE = re.compile(r"\b(readFileSync|readdirSync)\s*\(|\bfs(?:\.promises)?\.readFile\s*\(")
+JS_SCAN2 = re.compile(r"\.(match|matchAll|test|search|includes|indexOf|startsWith)\s*\(|\bRegExp\s*\(")
+JS_RUN = re.compile(r"^\s*(?:const|let|var)?\s*[\w$]+\s*=\s*(?:await\s+)?(?!require\b|import\b)[\w$.]+\s*\(|"
+                    r"^\s*(?:async\s+)?function[\s*]|\bassert\b|\bawait\s|\bnew\s+[A-Z][\w$]*\s*\(",
+                    re.M)
+
+
+def norm_prog(prog):
+    """program 归一：python3 / python3.12 -> python，pip3 -> pip。其余原样（已取 basename）。"""
+    if re.fullmatch(r"python[\d.]*", prog):
+        return "python"
+    if re.fullmatch(r"pip[\d.]*", prog):
+        return "pip"
+    return prog
+
+
+def positionals(prog, args):
+    """[(下标, 位置参数)]：跳过 `-x` 选项（带值的连值一起跳）、cargo 的 `+toolchain`、
+    以及分词器从 `2>&1` 里拆出来的 fd 号。"""
+    vo = VALUE_OPTS.get(prog, ())
+    out, skip = [], False
+    for k, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            if a in vo:
+                skip = True
+            continue
+        if a.startswith("+") and prog in ("cargo", "rustup"):
+            continue
+        if re.fullmatch(r"\d+", a):
+            continue
+        out.append((k, a))
+    return out
+
+
+def looks_like_path(s):
+    return "/" in s or bool(SCRIPT_EXT.search(s))
+
+
+def program_key(prog, args):
+    """决定主类别的那条语句的 program 标签。粒度：
+
+    - 一般程序：basename（`/usr/bin/grep` -> grep，`node_modules/.bin/vitest` -> vitest）；
+      python* 归一成 python，pip* 归一成 pip。
+    - `python -m X` -> `python -m X`；其余 python 调用 -> python。
+    - SUBCMD_TOOLS（git/go/cargo/npm/pnpm/yarn/bun/deno/pip/uv/poetry/rustup）带第一个位置参数：
+      `go test`、`cargo clippy`、`git status`、`pnpm test`、`pip install`。带值选项连值跳过。
+    - npx/bunx/uvx 带被启动的程序名：`npx vitest`。
+    - 启动类子命令（npm/pnpm/yarn run|exec|dlx、bun run|x、uv/poetry run、go tool）再带一段
+      脚本名或程序名：`npm run build`、`pnpm exec tsc`、`uv run pytest`；
+      那一段像路径（含 / 或脚本扩展名）时不带，免得 `bun run /tmp/t.ts` 这类把 key 打散。
+    """
+    p = norm_prog(prog)
+    if p == "python":
+        if "-m" in args:
+            k = args.index("-m")
+            if k + 1 < len(args) and "-c" not in args[:k]:
+                return f"python -m {args[k + 1]}"
+        return "python"
+    if p not in SUBCMD_TOOLS:
+        return p
+    pos = positionals(p, args)
+    if not pos:
+        return p
+    sub = pos[0][1]
+    if p in LAUNCHERS:
+        return f"{p} {sub.rsplit('/', 1)[-1]}"
+    key = f"{p} {sub}"
+    if sub in RUNNER_SUBCMDS.get(p, ()) and len(pos) > 1 and not looks_like_path(pos[1][1]):
+        key += " " + pos[1][1]
+    return key
+
+
+def only_version(args):
+    rest = [a for a in args if not re.fullmatch(r"\d+", a)]
+    return len(rest) == 1 and rest[0] in VERSION_FLAGS
+
+
+def shell_c_script(args):
+    """`bash -c '<脚本>'` / `sh -lc …` 里的脚本正文；不是 -c 形式返回 None。"""
+    for k, a in enumerate(args):
+        if a.startswith("-") and not a.startswith("--") and "c" in a[1:]:
+            return args[k + 1] if k + 1 < len(args) else None
+        if not a.startswith("-"):
+            return None
+    return None
+
+
+def js_inline(code, writes_file):
+    if writes_file:
+        return WRITE, "重定向写文件"
+    if JS_WRITE.search(code):
+        return WRITE, "node 改文件"
+    if JS_READ_FILE.search(code) and JS_SCAN2.search(code):
+        return SEARCH, "脚本扫文件"
+    if JS_RUN.search(code):
+        return TEST, "内联脚本验证"
+    return OTHER, "接口探查"
+
+
+def classify_tool(prog, args, redirs, body, depth):
+    """跨语言工具 -> (类别, 细类) 或 None（不认识，交回老逻辑）。
+    program 不在这里定：启动器也用外层语句自己的 program_key（`npx vitest`）。"""
+    writes_file = bool([r for r in redirs if not r.startswith("/dev/")])
+
+    if prog in TOOL_TEST:
+        return (OTHER, ENV_QUERY) if only_version(args) else (TEST, prog)
+
+    if prog in LAUNCHERS or (prog in PKG_MANAGERS | {"uv", "poetry"}):
+        p = prog
+        pos = positionals(p, args)
+        if not pos:
+            return OTHER, ENV_QUERY
+        k, sub = pos[0]
+        if p in LAUNCHERS:
+            inner = classify_tokens(args[k:], redirs, body, depth + 1)
+            return inner[:2] if inner else (OTHER, ENV_QUERY)
+        if p in ("uv", "poetry"):
+            if sub == "run" and len(pos) > 1:
+                inner = classify_tokens(args[pos[1][0]:], redirs, body, depth + 1)
+                return inner[:2] if inner else (OTHER, ENV_QUERY)
+            return OTHER, ENV_QUERY
+        # npm / pnpm / yarn / bun
+        if sub in ("test", "t", "tst"):
+            return TEST, f"{p} test"
+        if sub in ("exec", "x", "dlx"):
+            if len(pos) > 1:
+                inner = classify_tokens(args[pos[1][0]:], redirs, body, depth + 1)
+                if inner:
+                    return inner[:2]
+            return OTHER, ENV_QUERY
+        if sub in ("run", "run-script"):
+            if len(pos) < 2:
+                return OTHER, ENV_QUERY               # `npm run` 不带参数 = 列脚本
+            target = pos[1][1]
+            if p == "bun" and looks_like_path(target):
+                return TEST, REPRO_SCRIPT
+            return TEST, f"{p} run {target}"
+        if sub in PM_ENV_SUBCMDS or sub in VERSION_FLAGS:
+            return OTHER, ENV_QUERY
+        if p != "npm":
+            # pnpm/yarn/bun 的隐式形式：`pnpm vitest` 跑的是本地 bin，`pnpm lint` 跑的是脚本
+            if sub in TOOL_TEST or sub in SCRIPT_RUNNERS or sub == "node":
+                inner = classify_tokens(args[k:], redirs, body, depth + 1)
+                if inner:
+                    return inner[:2]
+            if p == "bun" and looks_like_path(sub):
+                return TEST, REPRO_SCRIPT
+            return TEST, f"{p} {sub}"
+        return TEST, f"npm {sub}"                    # npm start / npm stop 之类的内置脚本
+
+    if prog == "go":
+        pos = positionals(prog, args)
+        sub = pos[0][1] if pos else ""
+        if sub in GO_TEST_SUBCMDS:
+            return TEST, f"go {sub}"
+        if sub == "doc":
+            return READ, "go doc"
+        if not sub or sub in GO_ENV_SUBCMDS or only_version(args):
+            return OTHER, ENV_QUERY
+        return OTHER, f"未识别:go {sub}"
+
+    if prog == "cargo":
+        pos = positionals(prog, args)
+        sub = pos[0][1] if pos else ""
+        if sub in CARGO_TEST_SUBCMDS:
+            return TEST, f"cargo {sub}"
+        return OTHER, ENV_QUERY                      # --version / metadata / tree / add …
+
+    if prog == "rustup":
+        return OTHER, ENV_QUERY
+
+    if prog == "deno":
+        pos = positionals(prog, args)
+        sub = pos[0][1] if pos else ""
+        if sub in DENO_TEST_SUBCMDS:
+            return TEST, f"deno {sub}"
+        if sub == "eval":
+            return js_inline(body + "\n" + " ".join(args[pos[0][0] + 1:]), writes_file)
+        if sub == "run" or looks_like_path(sub):
+            return TEST, REPRO_SCRIPT
+        return OTHER, ENV_QUERY
+
+    if prog == "node" or prog in SCRIPT_RUNNERS:
+        if "--test" in args:
+            return TEST, f"{prog} --test"
+        if "--check" in args or (prog == "node" and "-c" in args):
+            return TEST, SYNTAX_CHECK
+        evals = [k for k, a in enumerate(args) if a in ("-e", "-p", "--eval", "--print")]
+        if evals or body.strip() or "-" in args:
+            code = body
+            if evals:
+                code = code + "\n" + " ".join(args[evals[0] + 1:])
+            return js_inline(code, writes_file)
+        if positionals(prog, args):
+            return TEST, REPRO_SCRIPT
+        if only_version(args):
+            return OTHER, ENV_QUERY
+        return OTHER, "接口探查"
+
+    if prog == "perl":
+        opts = [a for a in args if a.startswith("-") and not a.startswith("--")]
+        if any(re.match(r"-[0-9a-zA-Z]*i", a) and a[1:2] not in ("M", "m", "I") for a in opts):
+            return WRITE, "perl -i"
+        return SEARCH, "perl"
+
+    return None
+
+
+def strip_unbalanced_close(a):
+    """剥掉词尾多出来的 `)`（右括号比左括号多几个就剥几个）。"""
+    extra = a.count(")") - a.count("(")
+    while extra > 0 and a.endswith(")"):
+        a, extra = a[:-1], extra - 1
+    return a
+
+
+def classify_tokens(toks, redirs, body, depth=0):
+    """已分好词的一条语句 -> (类别, 细类, program) 或 None（无意图，如 `done`）。"""
     got = program_of(toks)
     if not got:
         return None
-    prog, args = got
-    prog = prog.rsplit("/", 1)[-1]
-    body = seg["body"]
+    prog_tok, args = got
+    # 子 shell 收尾的 `)` 粘在最后一个参数上：`(cd pkg && npm test)` 的参数是 `test)`。
+    # 只剥「右括号比左括号多」的那几个，`print(x)` 这类配平的不动。
+    args = [a for a in map(strip_unbalanced_close, args) if a]
+    prog = prog_tok.rsplit("/", 1)[-1]
+    pkey = program_key(prog, args)
     writes_file = bool([r for r in redirs if not r.startswith("/dev/")])
 
     if prog in ("python", "python3", "python3.11", "python3.12"):
         joined = " ".join(args)
         if re.search(r"(^|\s)-m\s+pytest\b", joined) or args[:1] == ["-m"] and args[1:2] == ["pytest"]:
-            return TEST, "pytest"
+            return TEST, "pytest", pkey
         if re.search(r"(^|\s)-m\s+(compileall|py_compile)\b", joined):
-            return TEST, "语法/编译校验"
+            return TEST, "语法/编译校验", pkey
         if re.search(r"(^|\s)-m\s+pip\b", joined):
-            return OTHER, "环境查询"
+            return OTHER, "环境查询", pkey
         code = body
         if "-c" in args:                                     # python3 -c "..." 的正文就是那个参数
             k = args.index("-c")
             code = code + "\n" + " ".join(args[k + 1:])
         if args and args[0].endswith(".py"):                 # python3 /tmp/test_repro_x.py
-            return TEST, "复现脚本"
+            return TEST, "复现脚本", pkey
         if writes_file:
-            return WRITE, "重定向写文件"
+            return WRITE, "重定向写文件", pkey
         if PY_WRITE.search(code):
-            return WRITE, "python 改文件"
+            return WRITE, "python 改文件", pkey
         if PY_CHECK.search(code):
-            return TEST, "语法/编译校验"
+            return TEST, "语法/编译校验", pkey
         if PY_READ.search(code):
-            return READ, "读库源码"
+            return READ, "读库源码", pkey
         if PY_SCAN.search(code) and PY_SCAN2.search(code):
-            return SEARCH, "脚本扫文件"
+            return SEARCH, "脚本扫文件", pkey
         if PY_RUN.search(code):
-            return TEST, "内联脚本验证"
-        return OTHER, "接口探查"
+            return TEST, "内联脚本验证", pkey
+        return OTHER, "接口探查", pkey
 
     if prog == "sed":
-        return (WRITE, "sed -i") if "-i" in args or any(a.startswith("-i") for a in args) \
-            else (READ, "sed 取行段")
+        return ((WRITE, "sed -i", pkey) if "-i" in args or any(a.startswith("-i") for a in args)
+                else (READ, "sed 取行段", pkey))
     if prog in ("cat", "tee", "printf", "echo") and writes_file:
-        return WRITE, ("heredoc 写文件" if seg["body"] else "重定向写文件")
+        return WRITE, ("heredoc 写文件" if body else "重定向写文件"), pkey
     if prog == "git":
-        sub = args[0] if args else ""
+        # 取子命令要跳过 `-C dir` / `-c k=v` 这类全局选项，否则 `git -C /app checkout` 的细类是 `git -C`
+        pos = positionals("git", args)
+        sub = pos[0][1] if pos else ""
         if sub in ("mv", "rm", "clean", "checkout", "restore", "apply", "reset", "stash"):
-            return VCS, f"git {sub}（改工作区）"
-        return VCS, f"git {sub}" if sub else VCS
+            return VCS, f"git {sub}（改工作区）", pkey
+        return VCS, (f"git {sub}" if sub else VCS), pkey
     if prog in ("pip", "pip3"):
-        return OTHER, "环境查询"
+        return OTHER, "环境查询", pkey
     if prog == "bash" or prog == "sh":
-        return OTHER, "子 shell"
+        script = shell_c_script(args)
+        if script is not None and depth < SHELL_MAX_DEPTH:
+            inner = classify_command_full(script, depth + 1)
+            if inner["program"] is not None:
+                return inner["cat"], inner["detail"], inner["program"]
+        return OTHER, "子 shell", pkey
+
+    got = classify_tool(prog, args, redirs, body, depth)
+    if got:
+        return got[0], got[1], pkey
 
     cat = PROG_CAT.get(prog)
     if cat is None:
-        return OTHER, f"未识别:{prog}"
+        if "/" in prog_tok or prog_tok.startswith("$"):     # /tmp/abs、./target/debug/fd、$FD
+            return TEST, LOCAL_BIN, pkey
+        return OTHER, f"未识别:{prog}", pkey
     if cat == READ and writes_file:
-        return WRITE, "重定向写文件"
-    return cat, prog
+        return WRITE, "重定向写文件", pkey
+    return cat, prog, pkey
+
+
+def classify_segment_full(seg, depth=0):
+    """单条语句 -> (类别, 细类标签, program) 或 None（无意图，如 `done`）。"""
+    toks, redirs = unquote_tokens(seg["text"])
+    return classify_tokens(toks, redirs, seg["body"], depth)
+
+
+def classify_segment(seg):
+    """单条语句 -> 类别。返回 (类别, 细类标签) 或 None（无意图，如 `done`）。"""
+    r = classify_segment_full(seg)
+    return r[:2] if r else None
 
 
 # 管道头是这些程序时，它只是给下游喂文本，意图由下游决定
@@ -326,11 +694,11 @@ VIEWER_DETAILS = {"cat", "nl", "head", "tail", "sed 取行段", "wc", "sort", "u
                   "cut", "tr", "column", "jq", "less", "more", "echo"}
 
 
-def classify_pipeline(pipe):
-    """一条管道 -> (类别, 细类)。规则：**管道头决定意图**，
+def classify_pipeline_full(pipe, depth=0):
+    """一条管道 -> (类别, 细类, program)。规则：**管道头决定意图**，
     因为下游多半只是 head/tail/grep 在过滤；唯一例外是管道头本身只是喂文本
     （cat/nl/sed -n/git diff…），这时看下游第一个非查看类的程序。"""
-    res = [r for r in (classify_segment(s) for s in pipe) if r]
+    res = [r for r in (classify_segment_full(s, depth) for s in pipe) if r]
     if not res:
         return None
     head = res[0]
@@ -341,20 +709,41 @@ def classify_pipeline(pipe):
     return head
 
 
-def classify_command(cmd: str):
-    """整条命令 -> (主类别, 命中的类别集合, (类别,细类) 列表, 主类别对应的细类)。"""
+def classify_pipeline(pipe):
+    """一条管道 -> (类别, 细类)。见 classify_pipeline_full。"""
+    r = classify_pipeline_full(pipe)
+    return r[:2] if r else None
+
+
+def classify_command_full(cmd: str, depth=0):
+    """整条命令 -> dict：
+        cat      主类别
+        detail   主类别对应的细类
+        program  决定主类别的那条语句的 program（粒度见 program_key；空命令为 None）
+        cats     命中的类别集合
+        pairs    [(类别, 细类)]，每条管道一个
+        triples  [(类别, 细类, program)]，与 pairs 一一对应
+    """
     pipes = []
     for seg in split_statements(cmd):
         if seg["piped"] and pipes:
             pipes[-1].append(seg)
         else:
             pipes.append([seg])
-    pairs = [r for r in (classify_pipeline(p) for p in pipes) if r]
-    if not pairs:
-        return OTHER, set(), [], "空命令"
-    hits = {c for c, _ in pairs}
-    main, main_detail = min(pairs, key=rank)
-    return main, hits, pairs, main_detail
+    triples = [r for r in (classify_pipeline_full(p, depth) for p in pipes) if r]
+    if not triples:
+        return {"cat": OTHER, "detail": "空命令", "program": None, "cats": set(),
+                "pairs": [], "triples": []}
+    main = min(triples, key=rank)
+    return {"cat": main[0], "detail": main[1], "program": main[2],
+            "cats": {t[0] for t in triples}, "pairs": [t[:2] for t in triples],
+            "triples": triples}
+
+
+def classify_command(cmd: str):
+    """整条命令 -> (主类别, 命中的类别集合, (类别,细类) 列表, 主类别对应的细类)。"""
+    r = classify_command_full(cmd)
+    return r["cat"], r["cats"], r["pairs"], r["detail"]
 
 
 # ---------------------------------------------------------------- 统计

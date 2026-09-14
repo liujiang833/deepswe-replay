@@ -26,15 +26,21 @@ done
 
 REPLAY="$HERE/../replay.py"
 [ -f "$REPLAY" ] || { echo "找不到 $REPLAY"; exit 1; }
+# 命令分类器：cmd_stats.py（run_batch 收尾自动调）要 import 它。仓库里它和 replay.py 一样在上一层。
+CLASSIFIER="$HERE/../summarize_replay.py"
+[ -f "$CLASSIFIER" ] || { echo "找不到 $CLASSIFIER"; exit 1; }
+[ -f "$HERE/cmd_stats.py" ] || { echo "找不到 $HERE/cmd_stats.py"; exit 1; }
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 ROOT="$STAGE/deepswe-replay-bundle"
 mkdir -p "$ROOT"
 
-# 顶层：脚本与手册。replay.py 从上一层复制进来，bundle 从此自包含。
+# 顶层：脚本与手册。replay.py / summarize_replay.py 从上一层复制进来，bundle 从此自包含
+# （平铺后 cmd_stats.py 先找同级的 summarize_replay.py，与 run_batch.py 找 replay.py 同一个顺序）。
 cp "$REPLAY" "$ROOT/"
-for f in run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh README.md RUNBOOK.md INDEX.md release.json; do
+cp "$CLASSIFIER" "$ROOT/"
+for f in run_batch.py cmd_stats.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh README.md RUNBOOK.md INDEX.md release.json; do
   [ -f "$HERE/$f" ] && cp "$HERE/$f" "$ROOT/"
 done
 
@@ -66,7 +72,7 @@ GITSHA=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # 只看进了包的那些路径：仓库里别处的未提交改动与本包无关，算进来会让标识长期显示"脏"而失去意义
 # 末尾 || true 不能省：set -euo pipefail 下，grep -v 无匹配时返回 1（正是"干净"的情况），
 # 会把整个脚本打断
-GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null | grep -v '\.tar\.gz$' | head -1 || true)
+GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" "$CLASSIFIER" 2>/dev/null | grep -v '\.tar\.gz$' | head -1 || true)
 {
   echo "built_utc   $(date -u +%FT%TZ)"
   echo "git_commit  $GITSHA${GITDIRTY:+ (工作区有未提交改动)}"
@@ -76,8 +82,8 @@ GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null | 
   echo "mode        $([ "$FULL" = 1 ] && echo full || echo slim)"
   echo
   echo "scripts:"
-  for f in replay.py run_batch.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh; do
-    [ -f "$ROOT/$f" ] && printf '  %-18s %s\n' "$f" "$(sha256sum "$ROOT/$f" | cut -c1-12)"
+  for f in replay.py run_batch.py cmd_stats.py summarize_replay.py preflight.sh check_sources.sh build_arm.sh get_ca_cert.sh detect_mitm.sh; do
+    [ -f "$ROOT/$f" ] && printf '  %-20s %s\n' "$f" "$(sha256sum "$ROOT/$f" | cut -c1-12)"
   done
 } > "$ROOT/BUILD_INFO"
 

@@ -25,6 +25,9 @@
 perf 那套逻辑（`-G` 的参数顺序、cgroup v1/v2 的路径口径、等容器、排掉 sidecar）
 只有那一个地方有，这里绝不再写第二份。
 
+一轮跑完（写好 summary.json 之后）会自动调 `cmd_stats.py <输出目录>`，把「命令类型 × 次数/耗时」
+统计落到 `<输出目录>/cmd_stats/`（`--dry-run` 不调）。它失败只打一行提示，不影响本脚本的退出码。
+
 用法:
     python3 run_batch.py                          # 跑全部，输出到 ./runs/<时间戳>
     python3 run_batch.py --only go,rust           # 只跑指定语言
@@ -1006,7 +1009,37 @@ def main():
     write_summary(out, results, elapsed, args, fstype, jobs,
                   n_planned=len(trials), interrupted=interrupted,
                   pick_report=pick_report)
+    # 收尾顺手出命令类型统计。放在 write_summary 之后：cmd_stats 读的就是刚写好的 summary.json。
+    # --dry-run 在上面早就 return 了，走不到这里。
+    run_cmd_stats(out)
     return 0 if results and all(r["exit_code"] == 0 for r in results) else 1
+
+
+def run_cmd_stats(out):
+    """对本轮输出目录跑 cmd_stats.py（collect + aggregate），结果落 <out>/cmd_stats/。
+
+    **它失败不能影响本批的退出码**：统计是重放结论之外的附加产物，重放本身跑成什么样
+    由 summary.json 说了算。所以这里起子进程（统计脚本自己炸了也带不走本进程）、
+    吞掉一切异常，失败只打一行提示，告诉人怎么手动重跑。
+    成功时也只打一行：-j 1 的屏幕输出要尽量保持原样。
+    """
+    script = HERE / "cmd_stats.py"
+    retry = f"python3 {script} {out}"
+    try:
+        if not script.exists():
+            print(f"命令统计  跳过：没找到 {script}（旧版包没带它）")
+            return
+        p = subprocess.run([sys.executable, str(script), str(out)],
+                           capture_output=True, text=True, timeout=600)
+        if p.returncode == 0:
+            m = read_json(out / "cmd_stats" / "manifest.json") or {}
+            print(f"命令统计  {out / 'cmd_stats' / 'SUMMARY.md'}"
+                  f"（纳入 {m.get('n_included', '?')} 条 / 排除 {m.get('n_excluded', '?')} 条）")
+        else:
+            why = ((p.stderr or p.stdout).strip().splitlines() or ["无输出"])[-1]
+            print(f"⚠️  命令统计失败（退出码 {p.returncode}，不影响本批结果）：{why}；手动重跑 {retry}")
+    except Exception as e:                     # 超时 / 起不来 / 其他一切
+        print(f"⚠️  命令统计失败（不影响本批结果）：{e!r}；手动重跑 {retry}")
 
 
 def topdown_group_stats(results):

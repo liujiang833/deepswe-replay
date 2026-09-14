@@ -77,6 +77,9 @@ if [ -z "$TRIALS_DIR" ]; then
 fi
 REPLAY="$HERE/../replay.py"
 [ -f "$REPLAY" ] || { echo "❌ 找不到 $REPLAY"; exit 1; }
+# 命令分类器：cmd_stats.py（run_batch 收尾自动调）要 import 它，仓库里和 replay.py 一样在上一层
+CLASSIFIER="$HERE/../summarize_replay.py"
+[ -f "$CLASSIFIER" ] || { echo "❌ 找不到 $CLASSIFIER"; exit 1; }
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -86,6 +89,8 @@ mkdir -p "$ROOT"
 # 顶层：replay.py 从上一层复制进来，复制后它和 trial 目录同级 ——
 # topdown_trial.sh 的 replay.py 定位逻辑（先 ./replay.py，再 ../replay.py）就是为这个布局写的。
 cp "$REPLAY" "$ROOT/"
+# summarize_replay.py 同理：平铺后 cmd_stats.py 先找同级的，再找上一层。
+cp "$CLASSIFIER" "$ROOT/"
 
 # topdown 这一套 + 建镜像要用的那几个脚本。
 # 建镜像的脚本一个都不能少：check_sources.sh 先探源、build_arm.sh 真建，
@@ -93,8 +98,10 @@ cp "$REPLAY" "$ROOT/"
 # run_batch.py 是这一版新加的：批量采 topdown 的入口就是它
 # （`run_batch.py --topdown` 逐条调 topdown_trial.sh）。上一版的 topdown 包没带它，
 # 于是全量集到了服务器上也只能一条条手敲 topdown_trial.sh。
+# cmd_stats.py：run_batch.py 一轮跑完自动调它出「命令类型 × 次数/耗时」统计；
+# 缺了它 run_batch 只会打一行「跳过」，不会失败 —— 但那样统计就得回开发机补，所以也列为必需。
 MUST=(topdown.conf probe_pmu.sh topdown_trial.sh topdown_parse.py TOPDOWN.md
-      run_batch.py
+      run_batch.py cmd_stats.py
       build_arm.sh check_sources.sh preflight.sh get_ca_cert.sh detect_mitm.sh)
 MISSING=()
 for f in "${MUST[@]}"; do
@@ -169,7 +176,7 @@ GITSHA=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # 只看进了包的那些路径：仓库里别处的未提交改动与本包无关，算进来会让标识长期显示"脏"而失去意义。
 # 末尾 || true 不能省：set -euo pipefail 下 grep -v 无匹配时返回 1（正是"干净"的情况），
 # 会把整个脚本打断。
-GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null \
+GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" "$CLASSIFIER" 2>/dev/null \
            | grep -v '\.tar\.gz$' | head -1 || true)
 {
   echo "built_utc   $(date -u +%FT%TZ)"
@@ -196,6 +203,8 @@ GITDIRTY=$(git -C "$HERE" status --porcelain -- "$HERE" "$REPLAY" 2>/dev/null \
   echo "            ★  SUMMARY.md 总表追加 Retiring/BadSpec/FE/BE/校验 五列 + 按语言的横向小结"
   echo "            ★  单条 topdown 采废不把 trial 判成失败（保真度与数据可信度正交）"
   echo "            ★  topdown_trial.sh 落 run_status.json（重放/perf/解析三个退出码分开记）"
+  echo "            ◆2026-09-14：随包带 cmd_stats.py + summarize_replay.py，run_batch 一轮跑完"
+  echo "            ◆  自动出 <输出目录>/cmd_stats/（命令类型 × 次数/耗时，per-benchmark/语言/全体）"
   if [ -n "$TRIALS_DIR" ]; then
     echo "trials      $N_TRIALS（来源 $TRIALS_DIR）"
     echo "baseline    $N_BASELINE 条带 x86 基线对照（全量集多数没有，属预期）"
@@ -210,7 +219,7 @@ print('patch_identical=%s n_replayed=%s rc_match=%s elapsed_s=%s（开发机 x86
   fi
   echo
   echo "scripts:"
-  for f in replay.py run_batch.py probe_pmu.sh topdown_trial.sh topdown_parse.py topdown.conf \
+  for f in replay.py run_batch.py cmd_stats.py summarize_replay.py probe_pmu.sh topdown_trial.sh topdown_parse.py topdown.conf \
            build_arm.sh check_sources.sh preflight.sh get_ca_cert.sh detect_mitm.sh; do
     # 必须写成 if：set -e 下 `[ -f ... ] && printf` 在文件不存在时整条返回 1，
     # 会把打包脚本在「生成 BUILD_INFO」这一步静默打断（上面的 MUST 校验保证了

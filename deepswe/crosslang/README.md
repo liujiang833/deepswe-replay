@@ -139,6 +139,11 @@ python3 replay.py <trial 目录> <trial 目录>/task.json -o /tmp/one
 | `<trial>/verdict.json` | 单条判定 |
 | `<trial>/commands.jsonl` | per-command 指标 |
 | `<trial>/replayed.patch` | 重放后从容器里 diff 出来的 patch |
+| `cmd_stats/SUMMARY.md` 等 | 命令类型 × 次数/耗时统计（per-benchmark / 语言 / 全体），一轮跑完自动出 |
+
+命令类型统计只算「本轮成功跑起来」的 trial（判据同 `n_pass`，另外排除被 `--smoke` 截断的、
+`commands.jsonl` 缺失或条数对不上的），排除了谁、为什么都写在 `cmd_stats/SUMMARY.md` 里。
+自动那次失败了不影响重放结果，手动重跑 `python3 cmd_stats.py runs/<时间戳>`；口径见 `RUNBOOK.md` §5.5。
 
 **唯一的硬标准是 `patch_identical=true`。** `rc_match`、耗时这些都允许有出入
 （已知有 4 类不可消除的差异），口径见 `RUNBOOK.md` §5。
@@ -261,6 +266,8 @@ build_arm.sh       从本地基座重建 task 镜像
 preflight.sh       环境预检（**建出至少一个镜像之后**再跑，见 §4）
 run_batch.py       批量重放 driver
 replay.py          单条重放器（只用 python 标准库）
+cmd_stats.py       命令类型 × 次数/耗时统计（run_batch 收尾自动调，也可手动跑）
+summarize_replay.py  命令分类器（cmd_stats.py 要 import 它）
 ```
 
 **辅助**

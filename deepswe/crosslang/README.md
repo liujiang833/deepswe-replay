@@ -67,18 +67,21 @@ bash check_sources.sh
 113 条 trial 对应 **113 个镜像**，一个 task 一条 trial 一个镜像。
 
 ```bash
-bash build_arm.sh --list python      # 只看会怎么改写 Dockerfile，不构建
-bash build_arm.sh python             # 真建
+bash build_arm.sh --trials-dir full_trials --list python      # 只看会怎么改写 Dockerfile，不构建
+bash build_arm.sh --trials-dir full_trials python             # 真建
 ```
+
+⚠️ **`--trials-dir full_trials` 是仓库 clone 里的写法**（113 条在这个子目录）；
+解包后的 bundle 里 trial 平铺在包根目录，**去掉这个参数**（给了会报「--trials-dir 不是目录」）。
 
 **指定建哪些** —— 语言名、trial 目录名前缀、`all` 都行，且可并列多个：
 
 ```bash
-bash build_arm.sh typescript                      # 该语言全部 35 条
-bash build_arm.sh true-myth                       # 前缀匹配，单条
-bash build_arm.sh koota                           # 前缀匹配，一批（koota 有 5 条）
-bash build_arm.sh true-myth koota-query vitest    # 并列多个
-bash build_arm.sh all                             # 全建，按依赖从少到多排序
+bash build_arm.sh --trials-dir full_trials typescript                      # 该语言全部 34 条
+bash build_arm.sh --trials-dir full_trials true-myth                       # 前缀匹配，单条
+bash build_arm.sh --trials-dir full_trials koota                           # 前缀匹配，一批（koota 有 5 条）
+bash build_arm.sh --trials-dir full_trials true-myth koota-query vitest    # 并列多个
+bash build_arm.sh --trials-dir full_trials all                             # 全建，按依赖从少到多排序
 ```
 
 失败的条目会在结尾列出来，按同样的前缀单独重试即可。已存在的镜像会跳过
@@ -87,8 +90,8 @@ bash build_arm.sh all                             # 全建，按依赖从少到�
 **内网环境的两个常用开关：**
 
 ```bash
-bash build_arm.sh --proxy http://proxy:port python          # 构建期代理
-bash build_arm.sh --ca-cert corp-ca.crt python              # 内网 TLS 中间人的 CA
+bash build_arm.sh --trials-dir full_trials --proxy http://proxy:port python    # 构建期代理
+bash build_arm.sh --trials-dir full_trials --ca-cert corp-ca.crt python        # 内网 TLS 中间人的 CA
 ```
 
 CA 不知道从哪来就跑 `bash get_ca_cert.sh`（会抠出来并验证可用）；
@@ -112,10 +115,12 @@ bash preflight.sh --metrics      # 要采性能指标时才加：连 cgroup 一�
 ## 5. 重放
 
 ```bash
-python3 run_batch.py --smoke 5 --skip-missing      # 冒烟：每条只跑前 5 条命令
-python3 run_batch.py --skip-missing --keep-going   # 正式跑
+python3 run_batch.py --trials-dir full_trials --smoke 5 --skip-missing      # 冒烟：每条只跑前 5 条命令
+python3 run_batch.py --trials-dir full_trials --skip-missing --keep-going   # 正式跑
 ```
 
+- `--trials-dir full_trials` —— **仓库 clone 里必须给**：113 条在这个子目录，不给只扫 `crosslang/` 根下那几条。
+  解包后的 bundle 里 trial 平铺在包根目录，去掉它（给了反而报「--trials-dir 不是目录」）
 - `--skip-missing` —— 镜像还没建好的自动跳过，而不是整批拒绝启动。**边建边跑靠它。**
 - `--keep-going` —— 某条失败后继续跑剩下的（默认遇错即停）
 - `--only python,go` —— 只跑指定语言
@@ -124,8 +129,11 @@ python3 run_batch.py --skip-missing --keep-going   # 正式跑
 `run_batch.py` 的 `--only` 只认语言，不认 trial 名。真要精确跑单条就直接调重放器：
 
 ```bash
-python3 replay.py <trial 目录> <trial 目录>/task.json -o /tmp/one
+python3 ../replay.py full_trials/<trial> full_trials/<trial>/task.json -o /tmp/one
 ```
+
+（这是仓库 clone 里在 `crosslang/` 下的写法，`replay.py` 在上一层。bundle 里 `replay.py` 和 trial 都在包根目录：
+`python3 replay.py <trial> <trial>/task.json -o /tmp/one`。）
 
 ## 6. 读结果
 
@@ -232,7 +240,7 @@ done
 两个 host 的 `total` 接近 → 瓶颈是代理本身，**换源白搭**；npmmirror 明显低才开：
 
 ```bash
-bash build_arm.sh --registry https://registry.npmmirror.com typescript
+bash build_arm.sh --trials-dir full_trials --registry https://registry.npmmirror.com typescript
 ```
 
 ---
@@ -292,6 +300,6 @@ task.json          任务定义（含 task.toml 与 environment/Dockerfile）
 replay/            重放产物落在这里（本版包内为空）
 ```
 
-> **bundle 必须在开发机上打好再拷过来，不能在服务器上 clone 仓库重打。**
-> `trajectory.json` 与 `model.patch` 体量大且可复现，被 `.gitignore` 排除在版本库外，
-> 新 clone 的仓库里没有这两个文件。
+> **clone 仓库也能直接跑全量。** `full_trials/` 下 113 条的 `trajectory.json` 与 `model.patch` 已入库，
+> clone 完在 `crosslang/` 下带 `--trials-dir full_trials` 即可（见 §3、§5）。
+> `.gitignore` 只排除 `crosslang/` 根下那几条旧 trial 的这两个文件。

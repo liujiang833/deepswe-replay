@@ -83,9 +83,20 @@ BUILD_ENV=()
 #     抱怨「不是数字」。抱怨的是格式，真问题是**构建目标没了**，报错必须点破。
 # 「这个值其实是个构建目标」的判断不靠猜：语言名是固定的几个，trial 则直接拿 $HERE
 # 下的目录核对（目标本来就按前缀匹配，所以这里也用前缀）。
+# 给了 --trials-dir 时还要核对那个根目录。但它可能写在出错的参数**之后**
+# （`-j adaptix --trials-dir full_trials`），主循环走到 need_val 时还不知道，
+# 所以先把 "$@" 预扫一遍；相对路径的解释与下方 TRIALS_ROOT 一致。
+PRESCAN_ROOT=""; _prev=""
+for _a in "$@"; do
+  if [ "$_prev" = "--trials-dir" ] && [ -n "$_a" ]; then
+    case "$_a" in /*) PRESCAN_ROOT="$_a" ;; *) PRESCAN_ROOT="$HERE/$_a" ;; esac
+  fi
+  _prev="$_a"
+done
 looks_like_target() {
   case "$1" in python|go|javascript|typescript|rust|all) return 0 ;; esac
-  compgen -G "$HERE/$1*/meta.json" >/dev/null 2>&1
+  compgen -G "$HERE/$1*/meta.json" >/dev/null 2>&1 && return 0
+  [ -n "$PRESCAN_ROOT" ] && compgen -G "$PRESCAN_ROOT/$1*/meta.json" >/dev/null 2>&1
 }
 need_val() {                        # 用法：need_val <参数名> "$@"
   local opt="$1"; shift

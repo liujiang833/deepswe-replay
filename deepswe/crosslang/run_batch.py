@@ -896,9 +896,12 @@ def main():
             # 逗号会被当成一个目标名，直接报「认不出目标」。
             # （反过来 run_batch.py 自己的 --only 才吃逗号，两者口径不同，别混。）
             langs = " ".join(sorted({t["lang"] for t in missing}))
+            # 用户给了 --trials-dir 就原样带上：两个脚本同目录，相对路径都按脚本所在目录解释，
+            # 不带的话 build_arm.sh 只看得见根下那几条，全量集的语言目标会解析错。
+            td = f"--trials-dir {args.trials_dir} " if args.trials_dir else ""
             print(f"\n缺 {len(missing)} 个镜像。目标环境通常拉不到 registry，用本地基座重建：")
-            print(f"  bash build_arm.sh --ca-cert <内网CA.crt> {langs}")
-            print(f"或先跑已建好的部分：  python3 run_batch.py --skip-missing")
+            print(f"  bash build_arm.sh {td}--ca-cert <内网CA.crt> {langs}")
+            print(f"或先跑已建好的部分：  python3 run_batch.py {td}--skip-missing")
         return 1
     print("\n预检通过 ✅")
 

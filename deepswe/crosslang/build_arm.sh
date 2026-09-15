@@ -535,7 +535,7 @@ build_one() {
   [ ${#SELECTED[@]} -gt 6 ] && printf '[%d/%d] ' "$I" "${#SELECTED[@]}"
 
   # 从 task.json 里取出 Dockerfile 与目标 tag，并做架构 / 证书改写
-  python3 - "$HERE/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" \
+  python3 - "$TRIALS_ROOT/$dir/task.json" "$work" "$BASE" "${BASE_ARCH:-}" \
            "$([ -n "$CA_CERT" ] && basename "$CA_CERT" || echo '')" "$INSECURE" \
            "$REGISTRY" "$GOPROXY" "$GOSUMDB" "$GODEBUG" "$GOMAXPROCS" \
            "${BUILD_ENV_KEYS[*]+${BUILD_ENV_KEYS[*]}}" <<'PY'

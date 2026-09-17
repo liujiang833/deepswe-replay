@@ -509,6 +509,11 @@ def main():
             quad, ipc, r3 = compute_topdown(agg, slots, mode)
 
             cyc = agg.get("cpu_cycles", 0)
+
+            # 无数据的 step（cycles=0）跳过不打印——通常是 perf 启动前的间隙
+            if quad is None or cyc <= 0:
+                continue
+
             # 取第一条非哨兵命令做展示
             head_cmd = ""
             for c in cmds:
@@ -517,19 +522,14 @@ def main():
                     head_cmd = cmd_str[:60]
                     break
 
-            if quad is None:
-                print(f"  {si:>4d}  {len(cmds):>4d}  {step_wall:>7.2f}s  "
-                      f"{'(no data)':>12s}  "
-                      f"{'--':>6s} {'--':>6s} {'--':>6s} {'--':>6s}  {'--':>5s}  {head_cmd}")
-            else:
-                ret = quad["Retiring"] * 100
-                bad = quad["BadSpec"] * 100
-                fe = quad["FrontendBound"] * 100
-                be = quad["BackendBound"] * 100
-                ipc_s = f"{ipc:.2f}" if ipc else "--"
-                print(f"  {si:>4d}  {len(cmds):>4d}  {step_wall:>7.2f}s  "
-                      f"{int(cyc):>12,d}  "
-                      f"{ret:>5.1f}% {bad:>5.1f}% {fe:>5.1f}% {be:>5.1f}%  {ipc_s:>5s}  {head_cmd}")
+            ret = quad["Retiring"] * 100
+            bad = quad["BadSpec"] * 100
+            fe = quad["FrontendBound"] * 100
+            be = quad["BackendBound"] * 100
+            ipc_s = f"{ipc:.2f}" if ipc else "--"
+            print(f"  {si:>4d}  {len(cmds):>4d}  {step_wall:>7.2f}s  "
+                  f"{int(cyc):>12,d}  "
+                  f"{ret:>5.1f}% {bad:>5.1f}% {fe:>5.1f}% {be:>5.1f}%  {ipc_s:>5s}  {head_cmd}")
 
             step_results.append({
                 "step": si,
@@ -543,7 +543,94 @@ def main():
                 "commands": [c.get("cmd_stripped", "")[:200] for c in cmds],
             })
 
-    # ── 自检 ──
+    # ── 按命令类别聚类 ──
+    if step_results:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "summarize_replay",
+                pathlib.Path(__file__).resolve().parent.parent / "summarize_replay.py")
+            sr = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(sr)
+            classify = sr.classify_command
+            CATS = sr.CATS
+        except Exception:
+            classify = None
+            CATS = None
+
+    if step_results and classify:
+        print()
+        print("── 按命令类别聚类 ──────────────────────────────────────────")
+        # 每个类别累加 cycles + 加权四象限
+        cat_data = {}  # cat -> {cycles, wall_s, n_steps, sum_quad: {k: cyc_weighted}}
+        for s in step_results:
+            counts = s.get("counts", {})
+            td = s.get("topdown")
+            if not td:
+                continue
+            cyc = counts.get("cpu_cycles", 0)
+            if cyc <= 0:
+                continue
+            # 用这个 step 的所有命令的主类别做归类
+            # 一个 step 可能有多个命令，取 cycles 最大的那条命令的类别
+            # （但 step 级别的 topdown 是合并的，所以用第一条命令的类别即可）
+            cmds_in_step = s.get("commands", [])
+            cat = "其他"
+            for cmd_str in cmds_in_step:
+                if cmd_str:
+                    try:
+                        c = classify(cmd_str)
+                        cat = c[0]
+                    except Exception:
+                        pass
+                    break
+
+            d = cat_data.setdefault(cat, {
+                "cycles": 0, "wall_s": 0, "n_steps": 0,
+                "Retiring": 0, "BadSpec": 0, "FrontendBound": 0, "BackendBound": 0,
+            })
+            d["cycles"] += cyc
+            d["wall_s"] += s.get("wall_s", 0)
+            d["n_steps"] += 1
+            for k in ("Retiring", "BadSpec", "FrontendBound", "BackendBound"):
+                d[k] += td.get(k, 0) * cyc
+
+        # 打印：按 cycles 降序
+        sorted_cats = sorted(cat_data.items(), key=lambda x: x[1]["cycles"], reverse=True)
+        total_cyc = sum(d["cycles"] for _, d in sorted_cats)
+        print(f"  {'类别':<8s}  {'steps':>5s}  {'wall_s':>7s}  {'cycles':>12s}  "
+              f"{'占比':>6s}  {'Ret%':>6s} {'Bad%':>6s} {'FE%':>6s} {'BE%':>6s}  {'IPC':>5s}")
+        print(f"  {'----':<8s}  {'-----':>5s}  {'-------':>7s}  {'------------':>12s}  "
+              f"{'------':>6s}  {'------':>6s} {'------':>6s} {'------':>6s} {'------':>6s}  {'-----':>5s}")
+        for cat, d in sorted_cats:
+            cyc = d["cycles"]
+            pct = 100.0 * cyc / total_cyc if total_cyc else 0
+            ret = 100 * d["Retiring"] / cyc
+            bad = 100 * d["BadSpec"] / cyc
+            fe = 100 * d["FrontendBound"] / cyc
+            be = 100 * d["BackendBound"] / cyc
+            ipc = (d["Retiring"] * cyc / (cyc * slots)) * slots if slots else 0
+            # IPC = op_retired / cpu_cycles，但聚类层没有 op_retired 单独计数
+            # 用 Retiring * slots 近似（Retiring = op_retired / (cyc * slots) → op_retired = Retiring * cyc * slots）
+            ipc_val = (d["Retiring"] / cyc) * slots if cyc else 0
+            print(f"  {cat:<8s}  {d['n_steps']:>5d}  {d['wall_s']:>7.1f}s  "
+                  f"{int(cyc):>12,d}  {pct:>5.1f}%  "
+                  f"{ret:>5.1f}% {bad:>5.1f}% {fe:>5.1f}% {be:>5.1f}%  {ipc_val:>5.2f}")
+        print(f"  {'合计':<8s}  {sum(d['n_steps'] for _, d in sorted_cats):>5d}  "
+              f"{sum(d['wall_s'] for _, d in sorted_cats):>7.1f}s  "
+              f"{int(total_cyc):>12,d}  100.0%")
+
+        # 保存到结果
+        for cat, d in sorted_cats:
+            d["pct_cycles"] = 100.0 * d["cycles"] / total_cyc if total_cyc else 0
+            d["Retiring"] /= d["cycles"] if d["cycles"] else 1
+            d["BadSpec"] /= d["cycles"] if d["cycles"] else 1
+            d["FrontendBound"] /= d["cycles"] if d["cycles"] else 1
+            d["BackendBound"] /= d["cycles"] if d["cycles"] else 1
+            d["ipc"] = (d["Retiring"]) * slots
+        cat_results = [{"cat": cat, **d} for cat, d in sorted_cats]
+    else:
+        cat_results = []
     print()
     print("── 自检（聚合级）──────────────────────────────────────────")
     if agg_quad is not None:
@@ -616,6 +703,7 @@ def main():
             "ipc": round(agg_ipc, 4) if agg_ipc else None,
         },
         "steps": step_results,
+        "by_category": cat_results,
     }
 
     out_path = pathlib.Path(args.json_out) if args.json_out else perf_path.parent / "topdown_steps.json"

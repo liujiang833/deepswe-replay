@@ -13,11 +13,11 @@ replay.py 的每个 step 上，算出 per-step 的四象限。
   replay.py verdict.json             →  t_start_mono（命令循环起点的 monotonic）
   perf_start_mono.txt                →  perf 启动时的 monotonic
 
-  对齐：interval 时间戳是绝对 CLOCK_MONOTONIC（从 boot 开始的大数）
+  对齐：interval 时间戳是相对 perf 启动的偏移（从 0 开始的小数）
         step 的 abs_start_s 是相对 t_start 的偏移（从 0 开始的小数）
-        → step 在 interval 域的窗口 = [t_start_mono + abs_start_s,
-                                      t_start_mono + abs_start_s + wall_s]
-        t_start_mono 来自 verdict.json，和 interval 时间戳同域（都是 CLOCK_MONOTONIC）
+        → step 在 perf 域的窗口 = [abs_start_s + offset, abs_start_s + offset + wall_s]
+        offset = t_start_mono - perf_start_mono（两者都是绝对 CLOCK_MONOTONIC，
+        差值就是 perf 启动到命令循环开始的时差）
 
   归并：对每个 step，把窗口内的 interval 各事件计数求和 → 算 topdown
         同时把全部 interval 求和 → 整条 trial 的聚合 topdown（交叉校验）
@@ -32,9 +32,8 @@ replay.py 的每个 step 上，算出 per-step 的四象限。
                               abs_start=0  wall=0.015   abs_start=0.015 wall=0.02
 
   offset = t_start_mono - perf_start_mono > 0（perf 先启动，replay 后跑命令）
-  仅用于诊断 perf 是否覆盖了命令循环；归并用的是 t_start_mono 本身
-  step0 绝对窗口 = [t_start_mono + 0, t_start_mono + 0.015]
-  step1 绝对窗口 = [t_start_mono + 0.015, t_start_mono + 0.035]
+  step0 perf 域窗口 = [0+offset, 0.015+offset]
+  step1 perf 域窗口 = [0.015+offset, 0.035+offset]
 """
 
 import argparse
@@ -411,10 +410,10 @@ def main():
         if perf_start_mono > t_start_mono:
             print(f" ⚠️  perf 在 t_start 之后启动——前几条命令可能没有 interval 覆盖")
     else:
-        offset = None
+        offset = 0.0
         t_start_mono = None
         print(" ⚠️  缺少时间锚点（verdict.json 的 t_start_mono 或 perf_start_mono.txt），")
-        print("    per-step 归并将无法对齐——检查 replay.py 版本和文件路径。")
+        print("    offset 按 0 处理——per-step 归并可能偏移。检查 replay.py 版本和文件路径。")
 
     # ── 读 commands.jsonl ──
     commands = []
@@ -475,9 +474,8 @@ def main():
         cmd_ends = [c.get("abs_start_s", 0) + c.get("wall_s", 0) for c in commands
                      if c.get("abs_start_s") is not None and c.get("wall_s") is not None]
         if cmd_starts and cmd_ends:
-            tsm = t_start_mono or 0.0
-            print(f"  [diag] step 绝对 mono 范围: [{min(cmd_starts) + tsm:.3f}, {max(cmd_ends) + tsm:.3f}]s"
-                  f"（abs_start [{min(cmd_starts):.3f}, {max(cmd_ends):.3f}] + t_start_mono {tsm:.3f}）")
+            print(f"  [diag] step perf 域范围: [{min(cmd_starts) + offset:.3f}, {max(cmd_ends) + offset:.3f}]s"
+                  f"（abs_start [{min(cmd_starts):.3f}, {max(cmd_ends):.3f}] + offset {offset:+.3f}）")
 
         print()
         print("── per-step topdown ────────────────────────────────────────")
@@ -503,8 +501,8 @@ def main():
             if not starts or not ends:
                 continue
 
-            step_lo = min(starts) + (t_start_mono or 0.0)
-            step_hi = max(ends) + (t_start_mono or 0.0)
+            step_lo = min(starts) + offset
+            step_hi = max(ends) + offset
             step_wall = max(ends) - min(starts)
 
             agg = aggregate_window(intervals, times_sorted, step_lo, step_hi)

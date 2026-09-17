@@ -22,6 +22,7 @@
 #   bash topdown_trial.sh <trial目录> --limit 5      # 只重放前 5 条命令，冒烟用
 #   bash topdown_trial.sh <trial目录> --no-metrics   # 关掉 replay.py 自己那套 cgroup 指标
 #   bash topdown_trial.sh <trial目录> --cmd-timeout 30   # 透传给 replay.py 的单命令超时
+#   bash topdown_trial.sh <trial目录> --per-step       # per-step topdown（perf stat -I 10 + 事后按 step 归并）
 #
 # 批量：不要自己写循环。`python3 run_batch.py --topdown` 就是对本脚本逐条调用
 # （它负责排程、跳过没建镜像的、汇总四象限），perf 那套逻辑只有这里这一份。
@@ -37,7 +38,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$HERE/topdown.conf"
 
-TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""
+TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""; PER_STEP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--outdir) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; OUTDIR="$2"; shift 2 ;;
@@ -47,13 +48,14 @@ while [ $# -gt 0 ]; do
     # 改走本脚本之后如果这个值传不下去，同一批里 topdown 的那几条就换了口径，
     # 耗时和 rc_match 都不再能跟历史批次比 —— 而且这种偏差在报告里完全看不出来。
     --cmd-timeout) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; CMD_TIMEOUT="$2"; shift 2 ;;
+    --per-step)  PER_STEP=1; shift ;;
     --no-metrics) NO_METRICS=1; shift ;;
     -h|--help)   sed -n '2,/^set -[eu]/p' "$0" | sed '$d'; exit 0 ;;
     -*)          echo "❌ 未知参数: $1"; exit 1 ;;
     *)           TRIAL="$1"; shift ;;
   esac
 done
-[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N] [--cmd-timeout N] [--no-metrics]"; exit 1; }
+[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N] [--cmd-timeout N] [--no-metrics] [--per-step]"; exit 1; }
 [ -d "$TRIAL" ] || { echo "❌ trial 目录不存在: $TRIAL"; exit 1; }
 TRIAL="$(cd "$TRIAL" && pwd)"
 TNAME="$(basename "$TRIAL")"
@@ -252,7 +254,11 @@ SUDO="sudo"
 if [ "$(id -u)" = 0 ]; then SUDO=""; fi
 
 echo "=============================================================="
-echo " ARM topdown 采集（整条 trial 聚合）  $(date -u +%FT%TZ)"
+if [ "$PER_STEP" = 1 ]; then
+  echo " ARM topdown 采集（per-step · interval 10ms）  $(date -u +%FT%TZ)"
+else
+  echo " ARM topdown 采集（整条 trial 聚合）  $(date -u +%FT%TZ)"
+fi
 echo "=============================================================="
 echo "  trial      $TNAME"
 echo "  replay.py  $REPLAY"
@@ -494,9 +500,24 @@ echo "  绝对路径    $CGABS（cgroup $CGVER，由 $PROCCG 推出，不猜 dri
 # tail --pid=$RPID -f /dev/null 只是个「跟着 replay 一起活」的空壳子进程：
 # perf 采的是 -a -G 系统级 + cgroup 过滤，跟这个子进程本身的负载无关，
 # 它唯一的作用是给 perf 一个准确的结束时刻。
+#
+# --per-step 模式：加 -I 10（每 10ms 打印一组计数器增量），事后用
+# topdown_steps.py 按 step 时间窗口归并。需要在 perf 启动前记录
+# perf_start_mono，在 replay 的 verdict.json 里读 t_start_mono，
+# 两者之差就是时钟对齐的常数偏移。
 echo
 echo "── 采集中 ──────────────────────────────────────────────────"
-echo "  $SUDO perf stat -a ${OUTOPT[*]} -o $PERFOUT -e '<事件组>' -G $CG -- tail --pid=$RPID -f /dev/null"
+PERF_INTERVAL_OPT=()
+PERF_START_MONO=""
+if [ "$PER_STEP" = 1 ]; then
+  PERF_INTERVAL_OPT=(-I 10)
+  PERF_START_MONO=$(python3 -c "import time; print(f'{time.monotonic():.6f}')")
+  echo "$PERF_START_MONO" > "$TD/perf_start_mono.txt"
+  echo "  $SUDO perf stat -a -I 10 ${OUTOPT[*]} -o $PERFOUT -e '<事件组>' -G $CG -- tail --pid=$RPID -f /dev/null"
+  echo "  perf_start_mono = $PERF_START_MONO（写入 $TD/perf_start_mono.txt）"
+else
+  echo "  $SUDO perf stat -a ${OUTOPT[*]} -o $PERFOUT -e '<事件组>' -G $CG -- tail --pid=$RPID -f /dev/null"
+fi
 echo "  （重放跑完 perf 自动收尾；进度看 tail -f $RLOG）"
 echo
 PERF_RC=0
@@ -509,7 +530,8 @@ PERF_RC=0
 #   这个报错信息完全没提「参数顺序」，不翻 man page 很难联想到，
 #   所以这行的顺序不要「顺手整理」成看着更顺眼的样子。
 #   （上面那行 echo 打给用户看的命令必须和这里**逐字一致**，否则排查时会把人带偏。）
-$SUDO perf stat -a "${OUTOPT[@]}" -o "$PERFOUT" \
+#   -I 10 也必须排在 -e 前面：它是全局选项，不是事件属性。
+$SUDO perf stat -a "${PERF_INTERVAL_OPT[@]}" "${OUTOPT[@]}" -o "$PERFOUT" \
       -e "$EVSPEC" -G "$CG" -- tail --pid="$RPID" -f /dev/null 2>"$TD/perf.stderr" || PERF_RC=$?
 
 # ── 6. 收重放的退出码 ──────────────────────────────────────────
@@ -551,17 +573,34 @@ if [ ! -s "$PERFOUT" ]; then
   exit 1
 fi
 PRC=0
-python3 "$HERE/topdown_parse.py" "$PERFOUT" --conf "$CONF" --slots "$SLOTS" \
-        --json-out "$TD/topdown.json" \
-        --title "ARM L1 Topdown · $TNAME（整条 trial 聚合）" || PRC=$?
+if [ "$PER_STEP" = 1 ]; then
+  CMDS_JSONL="$OUTDIR/$TNAME/commands.jsonl"
+  python3 "$HERE/topdown_steps.py" "$PERFOUT" \
+          --conf "$CONF" --slots "$SLOTS" \
+          --commands "$CMDS_JSONL" \
+          --verdict "$VERDICT" \
+          --perf-start-mono "$TD/perf_start_mono.txt" \
+          --json-out "$TD/topdown_steps.json" \
+          --title "ARM L1 Topdown (per-step) · $TNAME" || PRC=$?
+else
+  python3 "$HERE/topdown_parse.py" "$PERFOUT" --conf "$CONF" --slots "$SLOTS" \
+          --json-out "$TD/topdown.json" \
+          --title "ARM L1 Topdown · $TNAME（整条 trial 聚合）" || PRC=$?
+fi
 write_status "$PRC"
 
 echo
 echo "── 覆盖范围提醒 ────────────────────────────────────────────"
-echo "  这组数覆盖的是**整条 trial**：容器启动 + 全部重放命令 + 收尾 git diff。"
-echo "  sidecar（${CNAME}-sink）是独立 cgroup，天然不在内。"
-echo "  短命令里 timeout + /bin/sh 的进程启动与动态链接开销**也算在里面**，"
-echo "  详见 TOPDOWN.md「短命令的数据有效性」一节。"
+if [ "$PER_STEP" = 1 ]; then
+  echo "  per-step 模式：每 10ms 一个 interval，按 step 时间窗口归并。"
+  echo "  step 边界误差 ≤ 10ms（一个 interval）。短 step（<100ms）的 topdown"
+  echo "  可能因计数不足而不稳定——看 topdown_steps.json 的 cycles 列判断可信度。"
+else
+  echo "  这组数覆盖的是**整条 trial**：容器启动 + 全部重放命令 + 收尾 git diff。"
+  echo "  sidecar（${CNAME}-sink）是独立 cgroup，天然不在内。"
+  echo "  短命令里 timeout + /bin/sh 的进程启动与动态链接开销**也算在里面**，"
+  echo "  详见 TOPDOWN.md「短命令的数据有效性」一节。"
+fi
 
 # 重放没过 / 自检没过，都要让退出码带出来，便于串到脚本里
 [ "$RRC" = 0 ] || exit "$RRC"

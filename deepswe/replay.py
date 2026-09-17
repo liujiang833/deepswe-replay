@@ -460,6 +460,7 @@ def load_trace(traj):
                     gap = None
             items.append({
                 "cmd": tc["arguments"].get("command", ""),
+                "step": si,
                 "trace_rc": int(m.group(1)) if m else None,
                 "sentinel": "action was not executed" in content,
                 "trace_timed_out": "timed out after" in content,
@@ -705,8 +706,8 @@ def main():
             # timeout 命令：TERM 超时退 124；-k 之后被 KILL 退 137
             timed_out = rc in (124, 137)
 
-            rec = {"i": i, "rc": rc, "timed_out": timed_out, "trace_rc": it["trace_rc"],
-                   "wall_s": round(dt, 4), "outer_timeout": outer,
+            rec = {"i": i, "step": it.get("step"), "rc": rc, "timed_out": timed_out, "trace_rc": it["trace_rc"],
+                   "wall_s": round(dt, 4), "abs_start_s": round(t0 - t_start, 4), "outer_timeout": outer,
                    "stdout_bytes": len(so), "stderr_bytes": len(se),
                    "user_usec": d("user_usec"), "system_usec": d("system_usec"),
                    "usage_usec": d("usage_usec"),
@@ -741,6 +742,7 @@ def main():
                    "n_replayed": len(recs),
                    "replayed_patch_bytes": len(replayed),
                    "metrics_collected": not args.no_metrics,
+                   "t_start_mono": round(t_start, 6),
                    # 跨机对比时这些是解释性能差异的前提，必须随判定一起落盘
                    "host": {"kernel": os.uname().release,
                             "cgroup_dir": str(cg.path) if cg.path else None,

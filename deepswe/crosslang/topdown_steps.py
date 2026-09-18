@@ -543,113 +543,7 @@ def main():
                 "commands": [c.get("cmd_stripped", "")[:200] for c in cmds],
             })
 
-    # ── topdown 向量聚类（L∞ 贪心，约束 10%）──
-    # 每个 step 的四象限是一个 4 维向量 (Ret, Bad, FE, BE)。
-    # 贪心聚类：按 cycles 降序处理，尝试加入已有 cluster（加入后该 cluster
-    # 内任意两点的任意单维差 < 10%），不行就新建。自然找到最少的 cluster 数。
-    CLUSTER_THRESHOLD = 0.10  # 10%
-    cat_results = []
-    valid_steps = [s for s in step_results if s.get("topdown") and s.get("counts", {}).get("cpu_cycles", 0) > 0]
-    if len(valid_steps) >= 2:
-        # 按 cycles 降序——重要的 step 先聚类，作为各 cluster 的锚点
-        valid_steps.sort(key=lambda s: s["counts"].get("cpu_cycles", 0), reverse=True)
-        clusters = []  # 每个 cluster: {members: [step...], vecs: [(r,b,f,be)...]}
-        for s in valid_steps:
-            td = s["topdown"]
-            vec = (td["Retiring"], td["BadSpec"], td["FrontendBound"], td["BackendBound"])
-            placed = False
-            for cl in clusters:
-                # 检查加入后该 cluster 内任意两点的任意单维差是否 < 10%
-                all_vecs = cl["vecs"] + [vec]
-                max_spread = 0.0
-                for d in range(4):
-                    vals = [v[d] for v in all_vecs]
-                    spread = max(vals) - min(vals)
-                    if spread > max_spread:
-                        max_spread = spread
-                if max_spread < CLUSTER_THRESHOLD:
-                    cl["members"].append(s)
-                    cl["vecs"].append(vec)
-                    placed = True
-                    break
-            if not placed:
-                clusters.append({"members": [s], "vecs": [vec]})
-
-        # 按 cluster 总 cycles 降序
-        for cl in clusters:
-            cl["cycles"] = sum(m["counts"].get("cpu_cycles", 0) for m in cl["members"])
-            cl["wall_s"] = sum(m.get("wall_s", 0) for m in cl["members"])
-        clusters.sort(key=lambda c: c["cycles"], reverse=True)
-        total_cyc = sum(cl["cycles"] for cl in clusters)
-
-        print()
-        print(f"── topdown 向量聚类（L∞ 阈值 {CLUSTER_THRESHOLD*100:.0f}%，{len(clusters)} 个 cluster）──")
-        print(f"  {'cluster':>7s}  {'steps':>5s}  {'wall_s':>7s}  {'cycles':>12s}  "
-              f"{'占比':>6s}  {'Ret%':>6s} {'Bad%':>6s} {'FE%':>6s} {'BE%':>6s}  {'spread':>6s}  代表命令")
-        print(f"  {'-------':>7s}  {'-----':>5s}  {'-------':>7s}  {'------------':>12s}  "
-              f"{'------':>6s}  {'------':>6s} {'------':>6s} {'------':>6s} {'------':>6s}  {'------':>6s}  --------")
-        for ci, cl in enumerate(clusters):
-            n = len(cl["members"])
-            # cycles 加权平均四象限
-            ret_w = sum(v[0] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            bad_w = sum(v[1] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            fe_w = sum(v[2] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            be_w = sum(v[3] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            ret = 100 * ret_w / cl["cycles"]
-            bad = 100 * bad_w / cl["cycles"]
-            fe = 100 * fe_w / cl["cycles"]
-            be = 100 * be_w / cl["cycles"]
-            pct = 100.0 * cl["cycles"] / total_cyc if total_cyc else 0
-            # cluster 内最大单维 spread
-            max_spread = 0.0
-            for d in range(4):
-                vals = [v[d] for v in cl["vecs"]]
-                spread = max(vals) - min(vals)
-                if spread > max_spread:
-                    max_spread = spread
-            spread_s = f"{max_spread*100:.1f}%"
-            # 代表命令：cycles 最大的成员
-            rep = max(cl["members"], key=lambda m: m["counts"].get("cpu_cycles", 0))
-            head_cmd = ""
-            for cmd_str in rep.get("commands", []):
-                if cmd_str:
-                    head_cmd = cmd_str[:50]
-                    break
-            print(f"  C{ci+1:<6d}  {n:>5d}  {cl['wall_s']:>7.1f}s  "
-                  f"{int(cl['cycles']):>12,d}  {pct:>5.1f}%  "
-                  f"{ret:>5.1f}% {bad:>5.1f}% {fe:>5.1f}% {be:>5.1f}%  {spread_s:>6s}  {head_cmd}")
-
-        print(f"  {'合计':>7s}  {sum(len(cl['members']) for cl in clusters):>5d}  "
-              f"{sum(cl['wall_s'] for cl in clusters):>7.1f}s  "
-              f"{int(total_cyc):>12,d}  100.0%")
-
-        # 保存到 JSON
-        for ci, cl in enumerate(clusters):
-            ret_w = sum(v[0] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            bad_w = sum(v[1] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            fe_w = sum(v[2] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            be_w = sum(v[3] * m["counts"].get("cpu_cycles", 0) for v, m in zip(cl["vecs"], cl["members"]))
-            max_spread = 0.0
-            for d in range(4):
-                vals = [v[d] for v in cl["vecs"]]
-                spread = max(vals) - min(vals)
-                if spread > max_spread:
-                    max_spread = spread
-            cat_results.append({
-                "cluster": ci + 1,
-                "n_steps": len(cl["members"]),
-                "wall_s": round(cl["wall_s"], 4),
-                "cycles": int(cl["cycles"]),
-                "pct_cycles": round(100.0 * cl["cycles"] / total_cyc, 2) if total_cyc else 0,
-                "Retiring": round(100 * ret_w / cl["cycles"], 4),
-                "BadSpec": round(100 * bad_w / cl["cycles"], 4),
-                "FrontendBound": round(100 * fe_w / cl["cycles"], 4),
-                "BackendBound": round(100 * be_w / cl["cycles"], 4),
-                "max_spread": round(max_spread, 4),
-                "step_ids": [m["step"] for m in cl["members"]],
-            })
-    print()
-    print("── 自检（聚合级）──────────────────────────────────────────")
+    # ── 落盘（只保存原始 step 数据，聚类由 topdown_cluster.py 做多级分析）──
     if agg_quad is not None:
         ok = True
 
@@ -720,7 +614,6 @@ def main():
             "ipc": round(agg_ipc, 4) if agg_ipc else None,
         },
         "steps": step_results,
-        "by_cluster": cat_results,
     }
 
     out_path = pathlib.Path(args.json_out) if args.json_out else perf_path.parent / "topdown_steps.json"

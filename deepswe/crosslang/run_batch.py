@@ -561,6 +561,8 @@ def run_one(idx, t, n_total, replay, out, args, stream, topdown=None):
                "-o", str(out), "--cmd-timeout", str(args.cmd_timeout)]
         if args.smoke:
             cmd += ["--limit", str(args.smoke)]
+        if args.per_step:
+            cmd += ["--per-step"]
         # --metrics 默认是关的，所以这里默认就会透传 --no-metrics 下去。
         # 这不是顺手：目标机是 cgroup v1，replay.py 那套指标只认 v2 的
         # cpu.stat / memory.current，不关掉它整条采集在启动时就报
@@ -666,6 +668,9 @@ def main():
                          "perf 逻辑不在这里重写）。**强制串行，与 --jobs > 1 互斥且报错退出**："
                          "多个 perf stat -a 会话抢的是同一批物理计数器。"
                          "topdown 采废不影响这条 trial 的重放结论，两者正交")
+    ap.add_argument("--per-step", action="store_true",
+                    help="配合 --topdown：每条 trial 产出 per-step topdown（perf stat -I 10），"
+                         "事后用 topdown_cluster.py 做多级聚类（per-trial / per-language / all）")
     ap.add_argument("--per-lang", type=int, default=0, metavar="N",
                     help="每种语言只抽 N 条跑（只在镜像已建好的里面挑）。"
                          "某语言一条都没建好就贡献 0 条，不报错。可与 --only 叠加")

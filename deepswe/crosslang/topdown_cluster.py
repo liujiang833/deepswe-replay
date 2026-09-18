@@ -28,13 +28,25 @@ import sys
 CLUSTER_THRESHOLD_DEFAULT = 0.10
 LANG_ORDER = ["python", "go", "rust", "typescript", "javascript"]
 
-# 语言推断：从 trial 名（如 go-foo__abc123）的第一个 segment 取
-def trial_lang(name):
+# 语言推断：优先从 trial 目录里的 meta.json 读 language 字段；
+# 没有就退回从 trial 名猜（go-foo__abc → go）。
+def trial_lang(name, tdir=None):
+    if tdir is not None:
+        meta = tdir / "meta.json"
+        if not meta.exists():
+            meta = tdir / ".." / "meta.json"
+        if meta.exists():
+            try:
+                m = json.loads(meta.read_text(encoding="utf-8"))
+                lang = m.get("language", "")
+                if lang:
+                    return lang
+            except Exception:
+                pass
     parts = name.split("-")
     for p in parts:
         if p in LANG_ORDER:
             return p
-    # 试 __ 分割的第一段
     first = name.split("__", 1)[0]
     for lang in LANG_ORDER:
         if first.startswith(lang):
@@ -42,11 +54,14 @@ def trial_lang(name):
     return "unknown"
 
 
-def load_steps(topdown_out):
+def load_steps(topdown_out, trials_dir=None):
     """扫描 topdown_out/<trial>/topdown/topdown_steps.json，收集所有 step。
 
     返回 list of dict，每个 dict 是一个 step 加上 trial 元信息：
       {trial, lang, step, n_cmds, wall_s, cycles, vec: (r,b,f,be), commands}
+
+    trials_dir 指向 trial 源目录（如 full_trials），从那里的 <trial>/meta.json
+    读 language 字段。不指定时从 trial 名猜，大部分非 go-/python- 开头的会变 unknown。
     """
     steps = []
     topdown_out = pathlib.Path(topdown_out)
@@ -65,7 +80,18 @@ def load_steps(topdown_out):
         except Exception:
             continue
         trial = tdir.name
-        lang = trial_lang(trial)
+        # 优先从 trials_dir 的 meta.json 读语言
+        lang = "unknown"
+        if trials_dir is not None:
+            meta_path = trials_dir / trial / "meta.json"
+            if meta_path.exists():
+                try:
+                    m = json.loads(meta_path.read_text(encoding="utf-8"))
+                    lang = m.get("language", "unknown")
+                except Exception:
+                    pass
+        if lang == "unknown":
+            lang = trial_lang(trial, tdir)
         for s in data.get("steps", []):
             td = s.get("topdown")
             counts = s.get("counts", {})
@@ -201,9 +227,13 @@ def main():
                     help="只做某一级（默认 all-full = 三级全做）")
     ap.add_argument("--json-out", default="", help="机读结果落盘路径")
     ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
+    ap.add_argument("--trials-dir", default="",
+                    help="trial 源目录（如 full_trials），从 meta.json 读语言；"
+                         "不指定时从 trial 名猜，大部分会变 unknown")
     args = ap.parse_args()
 
-    steps = load_steps(args.topdown_out)
+    trials_dir = pathlib.Path(args.trials_dir) if args.trials_dir else None
+    steps = load_steps(args.topdown_out, trials_dir)
     if not steps:
         print(f"❌ 在 {args.topdown_out} 下没找到任何 topdown_steps.json")
         return 1

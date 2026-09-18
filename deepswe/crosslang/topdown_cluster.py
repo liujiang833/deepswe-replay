@@ -227,12 +227,15 @@ def main():
                     help="只做某一级（默认 all-full = 三级全做）")
     ap.add_argument("--json-out", default="", help="机读结果落盘路径")
     ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
-    ap.add_argument("--trials-dir", default="",
-                    help="trial 源目录（如 full_trials），从 meta.json 读语言；"
-                         "不指定时从 trial 名猜，大部分会变 unknown")
+    ap.add_argument("--trials-dir", default="full_trials",
+                    help="trial 源目录（默认 full_trials），从 <trial>/meta.json 读语言")
     args = ap.parse_args()
 
-    trials_dir = pathlib.Path(args.trials_dir) if args.trials_dir else None
+    here = pathlib.Path(__file__).resolve().parent
+    trials_dir = pathlib.Path(args.trials_dir)
+    if not trials_dir.is_absolute():
+        trials_dir = here / trials_dir
+    trials_dir = trials_dir if trials_dir.is_dir() else None
     steps = load_steps(args.topdown_out, trials_dir)
     if not steps:
         print(f"❌ 在 {args.topdown_out} 下没找到任何 topdown_steps.json")

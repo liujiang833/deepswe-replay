@@ -860,6 +860,23 @@ def main():
               f"并发度已收敛到 1。\n"
               f"  实际是串行跑，不会有争抢，指标口径干净 —— 照常采集，不拦。\n")
 
+    # ── round-robin 跨语言重排：避免没跑完时缺某些语言 ──────────────────
+    # 原 load_trials 按 (LANG_ORDER, name) 排，python 全跑完才轮到 go。
+    # 如果只跑了 60%，typescript 和 javascript 可能一条没碰到。
+    # 重排成 round-robin：每轮从各语言 pool 各取一条，保证跑一半时每种语言都覆盖到。
+    if len(trials) > 1:
+        pools = {}
+        for t in trials:
+            pools.setdefault(t["lang"], []).append(t)
+        # 各语言内部保持原顺序（按命令数/名字），跨语言交错
+        rr = []
+        max_pool = max(len(p) for p in pools.values()) if pools else 0
+        for i in range(max_pool):
+            for lang in sorted(pools.keys(), key=lambda l: LANG_ORDER.index(l) if l in LANG_ORDER else 99):
+                if i < len(pools[lang]):
+                    rr.append(pools[lang][i])
+        trials = rr
+
     print("=" * 78)
     print(f"bundle    {HERE}")
     print(f"replay.py {replay}")

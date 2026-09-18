@@ -217,6 +217,37 @@ def print_clusters(clusters, total_cyc, title):
           f"{int(total_cyc):>12,d}  100.0%")
 
 
+CSV_FIELDS = [
+    "scope", "trial", "lang", "cluster", "n_steps", "wall_s", "cycles",
+    "pct_cycles", "Retiring", "BadSpec", "FrontendBound", "BackendBound",
+    "max_spread", "n_trials", "rep_cmd",
+]
+
+
+def write_csv(rows, path):
+    import csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            r = dict(r)
+            r["n_trials"] = len(r.get("trials", []))
+            r["trial"] = "; ".join(r.get("trials", [])) if r.get("trials") else ""
+            w.writerow(r)
+
+
+def cluster_to_csv_rows(clusters, total_cyc, scope, trial="", lang=""):
+    rows = []
+    for ci, cl in enumerate(clusters):
+        s = summarize_cluster(cl, total_cyc, ci + 1)
+        s["scope"] = scope
+        s["trial"] = trial
+        s["lang"] = lang
+        rows.append(s)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="扫描 topdown_out 下所有 trial 的 topdown_steps.json，三级聚类")
@@ -226,6 +257,9 @@ def main():
     ap.add_argument("--level", choices=("trial", "language", "all", "all-full"), default="all-full",
                     help="只做某一级（默认 all-full = 三级全做）")
     ap.add_argument("--json-out", default="", help="机读结果落盘路径")
+    ap.add_argument("--csv-dir", default="",
+                    help="CSV 输出目录（默认 <topdown_out>/clusters/），"
+                         "产出 per_trial.csv / per_language.csv / all_trials.csv")
     ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
     ap.add_argument("--trials-dir", default="full_trials",
                     help="trial 源目录（默认 full_trials），从 <trial>/meta.json 读语言")
@@ -270,6 +304,8 @@ def main():
     }
 
     # ── Level 1: per-trial ──
+    csv_dir = pathlib.Path(args.csv_dir) if args.csv_dir else pathlib.Path(args.topdown_out) / "clusters"
+    trial_csv_rows = []
     if args.level in ("trial", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
@@ -283,14 +319,23 @@ def main():
         trial_clusters = {}
         for trial in sorted(trials_map.keys()):
             t_steps = trials_map[trial]
+            lang = t_steps[0]["lang"] if t_steps else ""
             clusters = cluster(t_steps, args.threshold)
             total_cyc = sum(cl["cycles"] for cl in clusters)
             print_clusters(clusters, total_cyc, f"trial={trial}（{len(t_steps)} steps）")
             trial_clusters[trial] = [summarize_cluster(cl, total_cyc, ci + 1)
                                      for ci, cl in enumerate(clusters)]
+            trial_csv_rows.extend(cluster_to_csv_rows(
+                clusters, total_cyc, "per-trial", trial=trial, lang=lang))
         result["per_trial"] = trial_clusters
 
+        if trial_csv_rows:
+            p = csv_dir / "per_trial.csv"
+            write_csv(trial_csv_rows, p)
+            print(f"  CSV  {p}")
+
     # ── Level 2: per-language ──
+    lang_csv_rows = []
     if args.level in ("language", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
@@ -309,9 +354,17 @@ def main():
             print_clusters(clusters, total_cyc, f"lang={lang}（{len(l_steps)} steps, {len(set(s['trial'] for s in l_steps))} trials）")
             lang_clusters[lang] = [summarize_cluster(cl, total_cyc, ci + 1)
                                    for ci, cl in enumerate(clusters)]
+            lang_csv_rows.extend(cluster_to_csv_rows(
+                clusters, total_cyc, "per-language", lang=lang))
         result["per_language"] = lang_clusters
 
+        if lang_csv_rows:
+            p = csv_dir / "per_language.csv"
+            write_csv(lang_csv_rows, p)
+            print(f"  CSV  {p}")
+
     # ── Level 3: all-trials ──
+    all_csv_rows = []
     if args.level in ("all", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
@@ -323,6 +376,12 @@ def main():
         print_clusters(clusters, total_cyc, f"all-trials（{len(steps)} steps）")
         result["all_trials"] = [summarize_cluster(cl, total_cyc, ci + 1)
                                 for ci, cl in enumerate(clusters)]
+        all_csv_rows = cluster_to_csv_rows(clusters, total_cyc, "all-trials")
+
+        if all_csv_rows:
+            p = csv_dir / "all_trials.csv"
+            write_csv(all_csv_rows, p)
+            print(f"  CSV  {p}")
 
     # ── 落盘 ──
     out_path = pathlib.Path(args.json_out) if args.json_out \

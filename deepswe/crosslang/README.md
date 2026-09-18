@@ -158,6 +158,75 @@ python3 ../replay.py full_trials/<trial> full_trials/<trial>/task.json -o /tmp/o
 
 ---
 
+## 7. ARM Topdown 微架构分析
+
+### 7.1 整条 trial 聚合 topdown
+
+每条 trial 采一次 ARM L1 topdown 四象限（Retiring / BadSpec / FrontendBound / BackendBound），
+覆盖整条 trial 的 PMU 计数。
+
+```bash
+# 先验 PMU 可用性
+bash probe_pmu.sh
+
+# 批量采（串行，跳过没镜像的）
+python3 run_batch.py --trials-dir full_trials --topdown --skip-missing --no-metrics
+
+# 每种语言抽 1 条先看横向
+python3 run_batch.py --trials-dir full_trials --topdown --per-lang 1 --pick lightest --skip-missing --no-metrics
+```
+
+### 7.2 Per-step topdown（10ms interval + 事后按 step 归并）
+
+加 `--per-step` 让 `topdown_trial.sh` 用 `perf stat -I 10`（每 10ms 一组精确计数），
+事后按 step 时间窗口归并，得到 per-step 的四象限。
+
+```bash
+# 批量采集 per-step 数据
+python3 run_batch.py --trials-dir full_trials --topdown --per-step \
+       --skip-missing --no-metrics
+
+# 每种语言抽 1 条快速验证
+python3 run_batch.py --trials-dir full_trials --topdown --per-step \
+       --per-lang 1 --pick lightest --skip-missing --no-metrics
+
+# 单条 trial 手动跑
+bash topdown_trial.sh full_trials/<trial> --per-step --no-metrics
+```
+
+每条 trial 产出 `<out>/<trial>/topdown/topdown_steps.json`，含每个 step 的四象限向量。
+
+### 7.3 三级聚类分析
+
+收集完 per-step 数据后，用 `topdown_cluster.py` 做三级聚类：
+
+- **Level 1 per-trial**：每个 trial 内部独立聚类
+- **Level 2 per-language**：同语言的 step 合并后聚类
+- **Level 3 all-trials**：全部 step 合并后聚类
+
+聚类方法：L∞ 贪心——每个 step 的四象限 `(Ret, Bad, FE, BE)` 作为 4 维向量，
+按 cycles 降序处理，尝试加入已有 cluster（加入后任意两点任意单维差 < 阈值），
+不行就新建，自然找到最少的 cluster 数。
+
+```bash
+# 三级全做（默认阈值 10%）
+python3 topdown_cluster.py <out_dir>/
+
+# 收紧阈值
+python3 topdown_cluster.py <out_dir>/ --threshold 0.08
+
+# 只做 all-trials 级
+python3 topdown_cluster.py <out_dir>/ --level all
+
+# 只看某语言
+python3 topdown_cluster.py <out_dir>/ --only-lang go
+```
+
+输出 `topdown_cluster.json`，含三个层级各自的 cluster 列表，每个 cluster 记录：
+steps 数 / wall_s / cycles / 占比 / cycles 加权四象限 / max_spread / 成员 trial 列表 / 代表命令。
+
+---
+
 ## 规模与预算
 
 | 语言 | trial 数 | 命令数 |
@@ -394,6 +463,12 @@ run_batch.py       批量重放 driver
 replay.py          单条重放器（只用 python 标准库）
 cmd_stats.py       命令类型 × 次数/耗时统计（run_batch 收尾自动调，也可手动跑）
 summarize_replay.py  命令分类器（cmd_stats.py 要 import 它）
+topdown_trial.sh   单条 trial 的 ARM topdown 采集（perf stat -a -G，支持 --per-step）
+topdown_parse.py   把 perf stat 输出算成 ARM L1 topdown 四象限 + 自检
+topdown_steps.py   per-step topdown：解析 perf stat -I interval，按 step 归并
+topdown_cluster.py 三级聚类（per-trial / per-language / all-trials），L∞ 贪心
+topdown.conf       PMU 事件号 + SLOTS 配置
+probe_pmu.sh       PMU 可用性探测（采 topdown 之前先跑）
 ```
 
 **辅助**

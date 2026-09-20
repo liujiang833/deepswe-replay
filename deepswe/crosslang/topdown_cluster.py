@@ -45,13 +45,13 @@ CLUSTER_HEADERS = [
     "cluster_id", "scope", "trial", "lang", "cluster#", "n_steps",
     "wall_s", "cycles", "pct_cycles",
     "Retiring%", "BadSpec%", "FrontendBound%", "BackendBound%",
-    "max_spread", "n_trials", "rep_cmd",
+    "max_spread", "n_trials", "rep_cmd", "rep_trial", "rep_step",
 ]
 CLUSTER_KEYS = [
     "cluster_id", "scope", "trial", "lang", "cluster", "n_steps",
     "wall_s", "cycles", "pct_cycles",
     "Retiring", "BadSpec", "FrontendBound", "BackendBound",
-    "max_spread", "n_trials", "rep_cmd",
+    "max_spread", "n_trials", "rep_cmd", "rep_trial", "rep_step",
 ]
 
 STEP_HEADERS = [
@@ -194,11 +194,12 @@ def summarize_cluster(cl, total_cyc, ci):
     """一个 cluster -> 可打印 + 可 JSON 的 dict。"""
     n = len(cl["members"])
     cyc = cl["cycles"]
-    # cycles 加权平均四象限
+    # cycles 加权平均四象限 = cycles 加权 centroid
     ret_w = sum(v[0] * m["cycles"] for v, m in zip(cl["vecs"], cl["members"]))
     bad_w = sum(v[1] * m["cycles"] for v, m in zip(cl["vecs"], cl["members"]))
     fe_w = sum(v[2] * m["cycles"] for v, m in zip(cl["vecs"], cl["members"]))
     be_w = sum(v[3] * m["cycles"] for v, m in zip(cl["vecs"], cl["members"]))
+    centroid = (ret_w / cyc, bad_w / cyc, fe_w / cyc, be_w / cyc) if cyc else (0,0,0,0)
     # max spread
     max_spread = 0.0
     for d in range(4):
@@ -206,8 +207,9 @@ def summarize_cluster(cl, total_cyc, ci):
         spread = max(vals) - min(vals)
         if spread > max_spread:
             max_spread = spread
-    # 代表命令
-    rep = max(cl["members"], key=lambda m: m["cycles"])
+    # 代表 step：离 cycles 加权 centroid 最近（L∞）的那条
+    rep = min(cl["members"], key=lambda m: max(
+        abs(m["vec"][d] - centroid[d]) for d in range(4)))
     head_cmd = ""
     for cmd_str in rep.get("commands", []):
         if cmd_str:
@@ -227,6 +229,8 @@ def summarize_cluster(cl, total_cyc, ci):
         "trials": sorted(set(m["trial"] for m in cl["members"])),
         "langs": sorted(set(m["lang"] for m in cl["members"])),
         "rep_cmd": head_cmd,
+        "rep_trial": rep["trial"],
+        "rep_step": rep["step"],
     }
 
 

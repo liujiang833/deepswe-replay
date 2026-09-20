@@ -42,6 +42,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 
 # 复用 topdown_parse.py 的事件定义、配置解析、计数器值解析
@@ -52,6 +53,41 @@ from topdown_parse import (
 )
 
 INTERVAL_DEFAULT_MS = 10
+
+# ── sleep 解析 ──────────────────────────────────────────────────────────────
+_SLEEP_RE = re.compile(r'\bsleep\s+(\d+(?:\.\d+)?)')
+_SEPARATORS = ('&&', '||', ';', '&')
+
+
+def parse_sleep(cmd_str):
+    r"""从命令字符串中解析 sleep 时长（秒）。
+
+    返回 (leading_sleep, total_sleep)：
+      - leading_sleep: 命令开头（第一个分隔符之前）的 sleep 时长
+      - total_sleep:   命令中所有 sleep 的总时长
+
+    例：
+      "sleep 28 && cat xxx"     → (28, 28)
+      "cat xxx && sleep 5"      → (0, 5)
+      "sleep 10; do_work; sleep 5" → (10, 15)
+      "echo hi"                 → (0, 0)
+    """
+    if not cmd_str:
+        return 0.0, 0.0
+    total = sum(float(m.group(1)) for m in _SLEEP_RE.finditer(cmd_str))
+    if total == 0:
+        return 0.0, 0.0
+    # 找第一个分隔符位置
+    first_sep = len(cmd_str)
+    for sep in _SEPARATORS:
+        idx = cmd_str.find(sep)
+        if 0 <= idx < first_sep:
+            first_sep = idx
+    # 第一个分隔符之前的部分里找 sleep
+    prefix = cmd_str[:first_sep]
+    m = _SLEEP_RE.search(prefix)
+    leading = float(m.group(1)) if m else 0.0
+    return leading, total
 
 
 # ── interval 解析 ──────────────────────────────────────────────────────────
@@ -492,18 +528,38 @@ def main():
                 continue
             steps_map.setdefault(si, []).append(cmd)
 
+        total_sleep_deducted = 0.0
         for si in sorted(steps_map.keys()):
             cmds = steps_map[si]
-            # step 的时间范围：最早命令的 abs_start_s ~ 最晚命令的 abs_start_s + wall_s
-            starts = [c.get("abs_start_s", 0) for c in cmds if c.get("abs_start_s") is not None]
-            ends = [c.get("abs_start_s", 0) + c.get("wall_s", 0) for c in cmds
-                     if c.get("abs_start_s") is not None and c.get("wall_s") is not None]
-            if not starts or not ends:
+            # 每条命令扣除 sleep 时长：leading_sleep 推后起点，trailing_sleep 提前终点
+            eff_starts = []
+            eff_ends = []
+            step_sleep = 0.0
+            for c in cmds:
+                if c.get("abs_start_s") is None or c.get("wall_s") is None:
+                    continue
+                cmd_str = c.get("cmd_stripped") or c.get("cmd", "")
+                leading, total = parse_sleep(cmd_str)
+                trailing = total - leading
+                step_sleep += total
+                s = c["abs_start_s"] + leading
+                e = c["abs_start_s"] + c["wall_s"] - trailing
+                if e > s:  # 扣完 sleep 后还有有效时间
+                    eff_starts.append(s)
+                    eff_ends.append(e)
+                elif total > 0:
+                    # 整条命令都是 sleep——跳过（不贡献 perf 窗口）
+                    pass
+                else:
+                    eff_starts.append(s)
+                    eff_ends.append(e)
+            if not eff_starts or not eff_ends:
                 continue
 
-            step_lo = min(starts) + offset
-            step_hi = max(ends) + offset
-            step_wall = max(ends) - min(starts)
+            step_lo = min(eff_starts) + offset
+            step_hi = max(eff_ends) + offset
+            step_wall = max(eff_ends) - min(eff_starts)
+            total_sleep_deducted += step_sleep
 
             agg = aggregate_window(intervals, times_sorted, step_lo, step_hi)
             quad, ipc, r3 = compute_topdown(agg, slots, mode)
@@ -527,14 +583,16 @@ def main():
             fe = quad["FrontendBound"] * 100
             be = quad["BackendBound"] * 100
             ipc_s = f"{ipc:.2f}" if ipc else "--"
+            sleep_tag = f" (-{step_sleep:.0f}s sleep)" if step_sleep > 0.5 else ""
             print(f"  {si:>4d}  {len(cmds):>4d}  {step_wall:>7.2f}s  "
                   f"{int(cyc):>12,d}  "
-                  f"{ret:>5.1f}% {bad:>5.1f}% {fe:>5.1f}% {be:>5.1f}%  {ipc_s:>5s}  {head_cmd}")
+                  f"{ret:>5.1f}% {bad:>5.1f}% {fe:>5.1f}% {be:>5.1f}%  {ipc_s:>5s}  {head_cmd}{sleep_tag}")
 
             step_results.append({
                 "step": si,
                 "n_cmds": len(cmds),
                 "wall_s": round(step_wall, 4),
+                "sleep_s": round(step_sleep, 4) if step_sleep > 0 else 0,
                 "t_start_perf": round(step_lo, 4),
                 "t_end_perf": round(step_hi, 4),
                 "counts": {k: int(v) if v == int(v) else v for k, v in agg.items()},
@@ -542,6 +600,9 @@ def main():
                 "ipc": round(ipc, 4) if ipc else None,
                 "commands": [c.get("cmd_stripped", "")[:200] for c in cmds],
             })
+
+        if total_sleep_deducted > 0.5:
+            print(f"  （已从 perf 窗口扣除 sleep 共 {total_sleep_deducted:.1f}s）")
 
     # ── 落盘（只保存原始 step 数据，聚类由 topdown_cluster.py 做多级分析）──
     if agg_quad is not None:

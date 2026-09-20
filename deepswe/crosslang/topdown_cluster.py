@@ -55,12 +55,12 @@ CLUSTER_KEYS = [
 ]
 
 STEP_HEADERS = [
-    "trial", "lang", "step", "n_cmds", "wall_s", "cycles",
+    "trial", "lang", "step", "n_cmds", "wall_s", "sleep_s", "cycles",
     "Retiring%", "BadSpec%", "FrontendBound%", "BackendBound%",
     "commands", "per_trial_cid", "per_lang_cid", "all_cid",
 ]
 STEP_KEYS = [
-    "trial", "lang", "step", "n_cmds", "wall_s", "cycles",
+    "trial", "lang", "step", "n_cmds", "wall_s", "sleep_s", "cycles",
     "Retiring", "BadSpec", "FrontendBound", "BackendBound",
     "commands", "per_trial_cid", "per_lang_cid", "all_cid",
 ]
@@ -142,6 +142,7 @@ def load_steps(topdown_out, trials_dir=None):
                 "step": s.get("step"),
                 "n_cmds": s.get("n_cmds", 0),
                 "wall_s": s.get("wall_s", 0),
+                "sleep_s": s.get("sleep_s", 0),
                 "cycles": cyc,
                 "vec": (td["Retiring"], td["BadSpec"],
                         td["FrontendBound"], td["BackendBound"]),
@@ -301,6 +302,7 @@ def build_step_rows(steps, trial_cid, lang_cid, all_cid):
             "step": s["step"],
             "n_cmds": s["n_cmds"],
             "wall_s": s["wall_s"],
+            "sleep_s": s.get("sleep_s", 0),
             "cycles": s["cycles"],
             "Retiring": round(s["vec"][0] * 100, 2),
             "BadSpec": round(s["vec"][1] * 100, 2),

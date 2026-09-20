@@ -109,15 +109,19 @@ def regen_step_data(tdir, here):
     if not perf.exists():
         perf = td / "perf.csv"
     if not perf.exists():
+        print(f"  ⚠️ 跳过 {tdir.name}：无 perf.json/perf.csv")
         return False
     psm = td / "perf_start_mono.txt"
     if not psm.exists():
+        print(f"  ⚠️ 跳过 {tdir.name}：无 perf_start_mono.txt（非 per-step 模式采集？）")
         return False
     cmds = tdir / "commands.jsonl"
     if not cmds.exists():
+        print(f"  ⚠️ 跳过 {tdir.name}：无 commands.jsonl")
         return False
     verdict = tdir / "verdict.json"
     if not verdict.exists():
+        print(f"  ⚠️ 跳过 {tdir.name}：无 verdict.json")
         return False
 
     out_json = td / STEPS_JSON_NAME
@@ -136,9 +140,16 @@ def regen_step_data(tdir, here):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
-            print(f"  ⚠️ topdown_steps.py 失败 ({tdir.name}): {r.stderr[:200]}")
+            # topdown_steps.py 的错误信息可能在 stdout 或 stderr
+            err = (r.stderr or r.stdout or "").strip()[-500:]
+            print(f"  ⚠️ topdown_steps.py 失败 ({tdir.name}, rc={r.returncode}):")
+            for line in err.splitlines()[-8:]:
+                print(f"     {line}")
             return False
         return out_json.exists()
+    except subprocess.TimeoutExpired:
+        print(f"  ⚠️ topdown_steps.py 超时 ({tdir.name}, 120s)")
+        return False
     except Exception as e:
         print(f"  ⚠️ topdown_steps.py 异常 ({tdir.name}): {e}")
         return False

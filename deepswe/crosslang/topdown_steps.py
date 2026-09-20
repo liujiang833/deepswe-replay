@@ -355,7 +355,7 @@ def main():
     ap.add_argument("--perf-start-mono", default="", help="perf_start_mono.txt 路径")
     ap.add_argument("--interval-ms", type=int, default=INTERVAL_DEFAULT_MS,
                     help="perf -I 的间隔（ms），默认 10")
-    ap.add_argument("--json-out", default="", help="机读结果落盘路径")
+    ap.add_argument("--json-out", default="", help="机读结果落盘路径（默认 <perf_out 同目录>/topdown_steps_cleaned.json）")
     ap.add_argument("--title", default="ARM L1 Topdown (per-step)", help="打印标题")
     args = ap.parse_args()
 
@@ -678,7 +678,7 @@ def main():
         "steps": step_results,
     }
 
-    out_path = pathlib.Path(args.json_out) if args.json_out else perf_path.parent / "topdown_steps.json"
+    out_path = pathlib.Path(args.json_out) if args.json_out else perf_path.parent / "topdown_steps_cleaned.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                         encoding="utf-8")

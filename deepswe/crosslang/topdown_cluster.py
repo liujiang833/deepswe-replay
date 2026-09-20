@@ -92,11 +92,66 @@ def trial_lang(name, tdir=None):
     return "unknown"
 
 
-def load_steps(topdown_out, trials_dir=None):
-    """扫描 topdown_out/<trial>/topdown/topdown_steps.json，收集所有 step。
+STEPS_JSON_NAME = "topdown_steps_cleaned.json"
+
+
+def regen_step_data(tdir, here):
+    """对单个 trial 目录调用 topdown_steps.py 生成 topdown_steps_cleaned.json。
+
+    需要 tdir/topdown/ 下有 perf.json/perf.csv + perf_start_mono.txt，
+    以及 tdir/ 下有 commands.jsonl + verdict.json。
+    返回 True 成功，False 失败（缺文件或 topdown_steps.py 报错）。
+    """
+    import subprocess
+
+    td = tdir / "topdown"
+    perf = td / "perf.json"
+    if not perf.exists():
+        perf = td / "perf.csv"
+    if not perf.exists():
+        return False
+    psm = td / "perf_start_mono.txt"
+    if not psm.exists():
+        return False
+    cmds = tdir / "commands.jsonl"
+    if not cmds.exists():
+        return False
+    verdict = tdir / "verdict.json"
+    if not verdict.exists():
+        return False
+
+    out_json = td / STEPS_JSON_NAME
+    steps_py = here / "topdown_steps.py"
+    conf = here / "topdown.conf"
+    cmd = [
+        sys.executable, str(steps_py), str(perf),
+        "--conf", str(conf),
+        "--slots", "auto",
+        "--commands", str(cmds),
+        "--verdict", str(verdict),
+        "--perf-start-mono", str(psm),
+        "--json-out", str(out_json),
+        "--title", f"ARM L1 Topdown (per-step) · {tdir.name}",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"  ⚠️ topdown_steps.py 失败 ({tdir.name}): {r.stderr[:200]}")
+            return False
+        return out_json.exists()
+    except Exception as e:
+        print(f"  ⚠️ topdown_steps.py 异常 ({tdir.name}): {e}")
+        return False
+
+
+def load_steps(topdown_out, trials_dir=None, regen=False):
+    """扫描 topdown_out/<trial>/topdown/topdown_steps_cleaned.json，收集所有 step。
+
+    如果某 trial 缺 cleaned.json 但有 perf 数据，自动调用 topdown_steps.py 生成。
+    regen=True 时强制重新生成所有 cleaned.json。
 
     返回 list of dict，每个 dict 是一个 step 加上 trial 元信息：
-      {trial, lang, step, n_cmds, wall_s, cycles, vec: (r,b,f,be), commands}
+      {trial, lang, step, n_cmds, wall_s, sleep_s, cycles, vec: (r,b,f,be), commands}
 
     trials_dir 指向 trial 源目录（如 full_trials），从那里的 <trial>/meta.json
     读 language 字段。不指定时从 trial 名猜，大部分非 go-/python- 开头的会变 unknown。
@@ -107,12 +162,23 @@ def load_steps(topdown_out, trials_dir=None):
         print(f"❌ 不是目录: {topdown_out}")
         return steps
 
+    here = pathlib.Path(__file__).resolve().parent
+    regen_count = 0
     for tdir in sorted(topdown_out.iterdir()):
         if not tdir.is_dir():
             continue
-        jf = tdir / "topdown" / "topdown_steps.json"
+        jf = tdir / "topdown" / STEPS_JSON_NAME
+        if not jf.exists() or regen:
+            if regen_step_data(tdir, here):
+                regen_count += 1
+            elif regen:
+                pass  # regen 模式下失败也不跳过已有数据
         if not jf.exists():
-            continue
+            # 也检查旧版 topdown_steps.json（兼容未重跑的 trial）
+            old = tdir / "topdown" / "topdown_steps.json"
+            if not old.exists():
+                continue
+            jf = old
         try:
             data = json.loads(jf.read_text(encoding="utf-8"))
         except Exception:
@@ -385,6 +451,8 @@ def main():
     ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
     ap.add_argument("--trials-dir", default="full_trials",
                     help="trial 源目录（默认 full_trials），从 <trial>/meta.json 读语言")
+    ap.add_argument("--regen-steps", action="store_true",
+                    help="强制重新生成所有 trial 的 topdown_steps_cleaned.json（调用 topdown_steps.py）")
     args = ap.parse_args()
 
     here = pathlib.Path(__file__).resolve().parent
@@ -392,7 +460,7 @@ def main():
     if not trials_dir.is_absolute():
         trials_dir = here / trials_dir
     trials_dir = trials_dir if trials_dir.is_dir() else None
-    steps = load_steps(args.topdown_out, trials_dir)
+    steps = load_steps(args.topdown_out, trials_dir, regen=args.regen_steps)
     if not steps:
         print(f"❌ 在 {args.topdown_out} 下没找到任何 topdown_steps.json")
         return 1

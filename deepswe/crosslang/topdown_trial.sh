@@ -580,7 +580,7 @@ if [ "$PER_STEP" = 1 ]; then
           --commands "$CMDS_JSONL" \
           --verdict "$VERDICT" \
           --perf-start-mono "$TD/perf_start_mono.txt" \
-          --json-out "$TD/topdown_steps.json" \
+          --json-out "$TD/topdown_steps_cleaned.json" \
           --title "ARM L1 Topdown (per-step) · $TNAME" || PRC=$?
 else
   python3 "$HERE/topdown_parse.py" "$PERFOUT" --conf "$CONF" --slots "$SLOTS" \

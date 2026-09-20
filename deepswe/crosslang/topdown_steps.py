@@ -540,11 +540,12 @@ def main():
                     continue
                 cmd_str = c.get("cmd_stripped") or c.get("cmd", "")
                 leading, total = parse_sleep(cmd_str)
-                trailing = total - leading
                 step_sleep += total
+                # 只扣 leading sleep（推后起点），不扣 trailing
+                # trailing sleep 背景可能有 nohup 后台 CPU 活动，扣除会丢数据
                 s = c["abs_start_s"] + leading
-                e = c["abs_start_s"] + c["wall_s"] - trailing
-                if e > s:  # 扣完 sleep 后还有有效时间
+                e = c["abs_start_s"] + c["wall_s"]
+                if e > s:
                     eff_starts.append(s)
                     eff_ends.append(e)
                 elif total > 0:

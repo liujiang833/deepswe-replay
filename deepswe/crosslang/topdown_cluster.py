@@ -310,50 +310,57 @@ def build_step_rows(steps, trial_cid, lang_cid, all_cid):
     return rows
 
 
-def write_excel(xlsx_path, trial_rows, lang_rows, all_rows, step_rows):
-    """写 Excel，4 个 sheet：per_trial / per_language / all_trials / steps。"""
-    import openpyxl
+def _write_sheet(ws, headers, keys, rows):
+    """填充一个 worksheet：表头 + 数据行 + 冻结首行 + 自动列宽。"""
+    import openpyxl  # noqa: F401
     from openpyxl.styles import Font, PatternFill, Alignment
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
 
     bold = Font(bold=True)
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
                               fill_type="solid")
+    for ci, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font = bold
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    for ri, r in enumerate(rows, 2):
+        for ci, k in enumerate(keys, 1):
+            v = r.get(k, "")
+            if isinstance(v, list):
+                v = "; ".join(str(x) for x in v)
+            ws.cell(row=ri, column=ci, value=v)
+    ws.freeze_panes = "A2"
+    for col in ws.columns:
+        letter = col[0].column_letter
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        ws.column_dimensions[letter].width = min(max_len + 2, 60)
 
-    def write_sheet(name, headers, keys, rows):
-        ws = wb.create_sheet(name)
-        for ci, h in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=ci, value=h)
-            cell.font = bold
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center")
-        for ri, r in enumerate(rows, 2):
-            for ci, k in enumerate(keys, 1):
-                v = r.get(k, "")
-                if isinstance(v, list):
-                    v = "; ".join(str(x) for x in v)
-                ws.cell(row=ri, column=ci, value=v)
-        ws.freeze_panes = "A2"
-        # 自动列宽
-        for col in ws.columns:
-            letter = col[0].column_letter
-            max_len = max(len(str(cell.value or "")) for cell in col)
-            ws.column_dimensions[letter].width = min(max_len + 2, 60)
-        return ws
 
-    if trial_rows:
-        write_sheet("per_trial", CLUSTER_HEADERS, CLUSTER_KEYS, trial_rows)
-    if lang_rows:
-        write_sheet("per_language", CLUSTER_HEADERS, CLUSTER_KEYS, lang_rows)
-    if all_rows:
-        write_sheet("all_trials", CLUSTER_HEADERS, CLUSTER_KEYS, all_rows)
-    if step_rows:
-        write_sheet("steps", STEP_HEADERS, STEP_KEYS, step_rows)
+def write_excel(xlsx_dir, trial_rows, lang_rows, all_rows, step_rows):
+    """写 4 个独立 Excel 文件到 xlsx_dir：
+    per_trial.xlsx / per_language.xlsx / all_trials.xlsx / steps.xlsx
+    """
+    import openpyxl
 
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(xlsx_path))
+    xlsx_dir = pathlib.Path(xlsx_dir)
+    xlsx_dir.mkdir(parents=True, exist_ok=True)
+
+    files = [
+        ("per_trial.xlsx", trial_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
+        ("per_language.xlsx", lang_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
+        ("all_trials.xlsx", all_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
+        ("steps.xlsx", step_rows, STEP_HEADERS, STEP_KEYS),
+    ]
+    for fname, rows, headers, keys in files:
+        if not rows:
+            continue
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = fname.replace(".xlsx", "")
+        _write_sheet(ws, headers, keys, rows)
+        p = xlsx_dir / fname
+        wb.save(str(p))
+        print(f"  Excel  {p}")
 
 
 def main():
@@ -365,8 +372,10 @@ def main():
     ap.add_argument("--level", choices=("trial", "language", "all", "all-full"), default="all-full",
                     help="只做某一级（默认 all-full = 三级全做）")
     ap.add_argument("--json-out", default="", help="机读结果落盘路径")
-    ap.add_argument("--xlsx-out", default="",
-                    help="Excel 输出路径（默认 <topdown_out>/topdown_clusters.xlsx）")
+    ap.add_argument("--xlsx-dir", default="",
+                    help="Excel 输出目录（默认 <topdown_out>/clusters/），"
+                         "产出 per_trial.xlsx / per_language.xlsx / "
+                         "all_trials.xlsx / steps.xlsx")
     ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
     ap.add_argument("--trials-dir", default="full_trials",
                     help="trial 源目录（默认 full_trials），从 <trial>/meta.json 读语言")
@@ -486,11 +495,10 @@ def main():
         all_cid_map = build_step_cid_map(clusters, "all")
 
     # ── Excel 输出 ──
-    xlsx_path = pathlib.Path(args.xlsx_out) if args.xlsx_out \
-        else pathlib.Path(args.topdown_out) / "topdown_clusters.xlsx"
+    xlsx_dir = pathlib.Path(args.xlsx_dir) if args.xlsx_dir \
+        else pathlib.Path(args.topdown_out) / "clusters"
     step_rows = build_step_rows(steps, trial_cid_map, lang_cid_map, all_cid_map)
-    write_excel(xlsx_path, trial_rows, lang_rows, all_rows, step_rows)
-    print(f"\n  Excel  {xlsx_path}")
+    write_excel(xlsx_dir, trial_rows, lang_rows, all_rows, step_rows)
 
     # ── JSON 落盘 ──
     out_path = pathlib.Path(args.json_out) if args.json_out \

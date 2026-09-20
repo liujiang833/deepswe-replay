@@ -342,6 +342,33 @@ def run_checks(vals, quad, ipc, slots, mode, pcnt_min=None):
     return checks
 
 
+def _read_slots_from_sysfs(conf):
+    """从 /sys/bus/event_source/devices/<PMU>/caps/slots 读 SLOTS。
+
+    PMU 取 conf 的 PMU=，留空则自动探测（ls | grep armv8 取第一个）。
+    caps/slots 是十六进制（如 0x8），需要 int(x, 0) 解析。
+    读不到返回 None。
+    """
+    evsrc = pathlib.Path("/sys/bus/event_source/devices")
+    pmu = (conf.get("PMU") or "").strip()
+    if not pmu:
+        try:
+            for d in evsrc.iterdir():
+                if d.name.startswith("armv8"):
+                    pmu = d.name
+                    break
+        except OSError:
+            return None
+    if not pmu:
+        return None
+    caps = evsrc / pmu / "caps" / "slots"
+    try:
+        raw = caps.read_text().strip()
+        return int(raw, 0)
+    except (OSError, ValueError):
+        return None
+
+
 # ── 主流程 ─────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
@@ -376,7 +403,7 @@ def main():
     extras = extra_events(conf)
     names = [n for _, n, _ in wanted] + [n for n, _ in extras]
 
-    # SLOTS
+    # SLOTS：命令行 > conf > sysfs caps/slots
     slots_raw = (args.slots or conf.get("SLOTS") or "").strip()
     slots = None
     if slots_raw:
@@ -386,7 +413,13 @@ def main():
             print(f"❌ SLOTS 值无法解析: {slots_raw!r}")
             return 1
     if slots is None or slots <= 0:
-        print("❌ SLOTS 未知：topdown.conf 里是空的，命令行也没给 --slots")
+        # fallback：从 sysfs 读（和 topdown_trial.sh 同一套逻辑）
+        slots = _read_slots_from_sysfs(conf)
+        if slots:
+            print(f"  SLOTS 从 sysfs 读出 = {slots}")
+    if slots is None or slots <= 0:
+        print("❌ SLOTS 未知：topdown.conf 里是空的，命令行也没给 --slots，sysfs 也读不到")
+        print("   请在 topdown.conf 里填 SLOTS=<目标核的 issue slot 数>（查 TRM）")
         return 1
 
     # ── 读 perf interval 输出 ──

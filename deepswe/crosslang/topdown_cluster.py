@@ -11,10 +11,21 @@
 （加入后该 cluster 内任意两点的任意单维差 < 阈值），不行就新建。
 自然找到最少的 cluster 数。
 
+输出：
+  - stdout 表格（不变）
+  - topdown_cluster.json（机读）
+  - topdown_clusters.xlsx（Excel，含 4 个 sheet）
+      per_trial    : 每个 trial 的 cluster 摘要
+      per_language : 每个语言的 cluster 摘要
+      all_trials   : 全部 step 的 cluster 摘要
+      steps        : 全量 step 表（含 per_trial_cid / per_lang_cid / all_cid）
+
+  每个 cluster 有唯一 ID（如 go-foo__abc#C1, go#C1, all#C1），
+  通过 steps sheet 的 *_cid 列可按 cluster ID 过滤查看该 cluster 包含的 step/指令。
+
 用法：
   python3 topdown_cluster.py topdown_out/                    # 三级全做
-  python3 topdown_cluster.py topdown_out/ --threshold 0.08   # 收紧到 8%
-  python3 topdown_cluster.py topdown_out/ --json-out cluster.json
+  python3 topdown_cluster.py topdown_out/ --threshold 0.08  # 收紧到 8%
   python3 topdown_cluster.py topdown_out/ --level all        # 只做 all-trials
 """
 
@@ -27,6 +38,33 @@ import sys
 
 CLUSTER_THRESHOLD_DEFAULT = 0.10
 LANG_ORDER = ["python", "go", "rust", "typescript", "javascript"]
+
+# ── Excel sheet 定义 ──
+
+CLUSTER_HEADERS = [
+    "cluster_id", "scope", "trial", "lang", "cluster#", "n_steps",
+    "wall_s", "cycles", "pct_cycles",
+    "Retiring%", "BadSpec%", "FrontendBound%", "BackendBound%",
+    "max_spread", "n_trials", "rep_cmd",
+]
+CLUSTER_KEYS = [
+    "cluster_id", "scope", "trial", "lang", "cluster", "n_steps",
+    "wall_s", "cycles", "pct_cycles",
+    "Retiring", "BadSpec", "FrontendBound", "BackendBound",
+    "max_spread", "n_trials", "rep_cmd",
+]
+
+STEP_HEADERS = [
+    "trial", "lang", "step", "n_cmds", "wall_s", "cycles",
+    "Retiring%", "BadSpec%", "FrontendBound%", "BackendBound%",
+    "commands", "per_trial_cid", "per_lang_cid", "all_cid",
+]
+STEP_KEYS = [
+    "trial", "lang", "step", "n_cmds", "wall_s", "cycles",
+    "Retiring", "BadSpec", "FrontendBound", "BackendBound",
+    "commands", "per_trial_cid", "per_lang_cid", "all_cid",
+]
+
 
 # 语言推断：优先从 trial 目录里的 meta.json 读 language 字段；
 # 没有就退回从 trial 名猜（go-foo__abc → go）。
@@ -217,35 +255,105 @@ def print_clusters(clusters, total_cyc, title):
           f"{int(total_cyc):>12,d}  100.0%")
 
 
-CSV_FIELDS = [
-    "scope", "trial", "lang", "cluster", "n_steps", "wall_s", "cycles",
-    "pct_cycles", "Retiring", "BadSpec", "FrontendBound", "BackendBound",
-    "max_spread", "n_trials", "rep_cmd",
-]
+# ── Excel 输出 ──
 
-
-def write_csv(rows, path):
-    import csv
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            r = dict(r)
-            r["n_trials"] = len(r.get("trials", []))
-            r["trial"] = "; ".join(r.get("trials", [])) if r.get("trials") else ""
-            w.writerow(r)
-
-
-def cluster_to_csv_rows(clusters, total_cyc, scope, trial="", lang=""):
+def cluster_to_rows(clusters, total_cyc, scope, trial="", lang=""):
+    """生成 cluster 摘要行，每行带唯一 cluster_id。"""
     rows = []
     for ci, cl in enumerate(clusters):
         s = summarize_cluster(cl, total_cyc, ci + 1)
+        if scope == "per-trial":
+            s["cluster_id"] = f"{trial}#C{ci + 1}"
+        elif scope == "per-language":
+            s["cluster_id"] = f"{lang}#C{ci + 1}"
+        else:
+            s["cluster_id"] = f"all#C{ci + 1}"
         s["scope"] = scope
         s["trial"] = trial
         s["lang"] = lang
+        s["n_trials"] = len(s.get("trials", []))
         rows.append(s)
     return rows
+
+
+def build_step_cid_map(clusters, prefix):
+    """从 raw clusters 构建 (trial, step) -> cluster_id 映射。"""
+    cid_map = {}
+    for ci, cl in enumerate(clusters):
+        cid = f"{prefix}#C{ci + 1}"
+        for m in cl["members"]:
+            cid_map[(m["trial"], m["step"])] = cid
+    return cid_map
+
+
+def build_step_rows(steps, trial_cid, lang_cid, all_cid):
+    """构建全量 step 行，含三级 cluster ID。"""
+    rows = []
+    for s in steps:
+        key = (s["trial"], s["step"])
+        rows.append({
+            "trial": s["trial"],
+            "lang": s["lang"],
+            "step": s["step"],
+            "n_cmds": s["n_cmds"],
+            "wall_s": s["wall_s"],
+            "cycles": s["cycles"],
+            "Retiring": round(s["vec"][0] * 100, 2),
+            "BadSpec": round(s["vec"][1] * 100, 2),
+            "FrontendBound": round(s["vec"][2] * 100, 2),
+            "BackendBound": round(s["vec"][3] * 100, 2),
+            "commands": "; ".join(s.get("commands", [])),
+            "per_trial_cid": trial_cid.get(key, ""),
+            "per_lang_cid": lang_cid.get(key, ""),
+            "all_cid": all_cid.get(key, ""),
+        })
+    return rows
+
+
+def write_excel(xlsx_path, trial_rows, lang_rows, all_rows, step_rows):
+    """写 Excel，4 个 sheet：per_trial / per_language / all_trials / steps。"""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    bold = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
+                              fill_type="solid")
+
+    def write_sheet(name, headers, keys, rows):
+        ws = wb.create_sheet(name)
+        for ci, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.font = bold
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+        for ri, r in enumerate(rows, 2):
+            for ci, k in enumerate(keys, 1):
+                v = r.get(k, "")
+                if isinstance(v, list):
+                    v = "; ".join(str(x) for x in v)
+                ws.cell(row=ri, column=ci, value=v)
+        ws.freeze_panes = "A2"
+        # 自动列宽
+        for col in ws.columns:
+            letter = col[0].column_letter
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            ws.column_dimensions[letter].width = min(max_len + 2, 60)
+        return ws
+
+    if trial_rows:
+        write_sheet("per_trial", CLUSTER_HEADERS, CLUSTER_KEYS, trial_rows)
+    if lang_rows:
+        write_sheet("per_language", CLUSTER_HEADERS, CLUSTER_KEYS, lang_rows)
+    if all_rows:
+        write_sheet("all_trials", CLUSTER_HEADERS, CLUSTER_KEYS, all_rows)
+    if step_rows:
+        write_sheet("steps", STEP_HEADERS, STEP_KEYS, step_rows)
+
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(xlsx_path))
 
 
 def main():
@@ -257,9 +365,8 @@ def main():
     ap.add_argument("--level", choices=("trial", "language", "all", "all-full"), default="all-full",
                     help="只做某一级（默认 all-full = 三级全做）")
     ap.add_argument("--json-out", default="", help="机读结果落盘路径")
-    ap.add_argument("--csv-dir", default="",
-                    help="CSV 输出目录（默认 <topdown_out>/clusters/），"
-                         "产出 per_trial.csv / per_language.csv / all_trials.csv")
+    ap.add_argument("--xlsx-out", default="",
+                    help="Excel 输出路径（默认 <topdown_out>/topdown_clusters.xlsx）")
     ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
     ap.add_argument("--trials-dir", default="full_trials",
                     help="trial 源目录（默认 full_trials），从 <trial>/meta.json 读语言")
@@ -303,9 +410,13 @@ def main():
         "lang_counts": lang_counts,
     }
 
+    # 用于构建 steps sheet 的 cluster ID 映射
+    trial_cid_map = {}
+    lang_cid_map = {}
+    all_cid_map = {}
+
     # ── Level 1: per-trial ──
-    csv_dir = pathlib.Path(args.csv_dir) if args.csv_dir else pathlib.Path(args.topdown_out) / "clusters"
-    trial_csv_rows = []
+    trial_rows = []
     if args.level in ("trial", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
@@ -325,17 +436,14 @@ def main():
             print_clusters(clusters, total_cyc, f"trial={trial}（{len(t_steps)} steps）")
             trial_clusters[trial] = [summarize_cluster(cl, total_cyc, ci + 1)
                                      for ci, cl in enumerate(clusters)]
-            trial_csv_rows.extend(cluster_to_csv_rows(
+            trial_rows.extend(cluster_to_rows(
                 clusters, total_cyc, "per-trial", trial=trial, lang=lang))
+            # 记录 step → trial cluster ID
+            trial_cid_map.update(build_step_cid_map(clusters, trial))
         result["per_trial"] = trial_clusters
 
-        if trial_csv_rows:
-            p = csv_dir / "per_trial.csv"
-            write_csv(trial_csv_rows, p)
-            print(f"  CSV  {p}")
-
     # ── Level 2: per-language ──
-    lang_csv_rows = []
+    lang_rows = []
     if args.level in ("language", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
@@ -354,17 +462,14 @@ def main():
             print_clusters(clusters, total_cyc, f"lang={lang}（{len(l_steps)} steps, {len(set(s['trial'] for s in l_steps))} trials）")
             lang_clusters[lang] = [summarize_cluster(cl, total_cyc, ci + 1)
                                    for ci, cl in enumerate(clusters)]
-            lang_csv_rows.extend(cluster_to_csv_rows(
+            lang_rows.extend(cluster_to_rows(
                 clusters, total_cyc, "per-language", lang=lang))
+            # 记录 step → lang cluster ID
+            lang_cid_map.update(build_step_cid_map(clusters, lang))
         result["per_language"] = lang_clusters
 
-        if lang_csv_rows:
-            p = csv_dir / "per_language.csv"
-            write_csv(lang_csv_rows, p)
-            print(f"  CSV  {p}")
-
     # ── Level 3: all-trials ──
-    all_csv_rows = []
+    all_rows = []
     if args.level in ("all", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
@@ -376,20 +481,23 @@ def main():
         print_clusters(clusters, total_cyc, f"all-trials（{len(steps)} steps）")
         result["all_trials"] = [summarize_cluster(cl, total_cyc, ci + 1)
                                 for ci, cl in enumerate(clusters)]
-        all_csv_rows = cluster_to_csv_rows(clusters, total_cyc, "all-trials")
+        all_rows = cluster_to_rows(clusters, total_cyc, "all-trials")
+        # 记录 step → all cluster ID
+        all_cid_map = build_step_cid_map(clusters, "all")
 
-        if all_csv_rows:
-            p = csv_dir / "all_trials.csv"
-            write_csv(all_csv_rows, p)
-            print(f"  CSV  {p}")
+    # ── Excel 输出 ──
+    xlsx_path = pathlib.Path(args.xlsx_out) if args.xlsx_out \
+        else pathlib.Path(args.topdown_out) / "topdown_clusters.xlsx"
+    step_rows = build_step_rows(steps, trial_cid_map, lang_cid_map, all_cid_map)
+    write_excel(xlsx_path, trial_rows, lang_rows, all_rows, step_rows)
+    print(f"\n  Excel  {xlsx_path}")
 
-    # ── 落盘 ──
+    # ── JSON 落盘 ──
     out_path = pathlib.Path(args.json_out) if args.json_out \
         else pathlib.Path(args.topdown_out) / "topdown_cluster.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                         encoding="utf-8")
-    print()
     print(f"  机读结果  {out_path}")
     return 0
 

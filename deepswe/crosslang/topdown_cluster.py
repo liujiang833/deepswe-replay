@@ -130,7 +130,6 @@ def regen_step_data(tdir, here):
     cmd = [
         sys.executable, str(steps_py), str(perf),
         "--conf", str(conf),
-        "--slots", "auto",
         "--commands", str(cmds),
         "--verdict", str(verdict),
         "--perf-start-mono", str(psm),

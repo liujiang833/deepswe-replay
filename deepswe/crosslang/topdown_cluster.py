@@ -464,8 +464,20 @@ def build_step_rows(steps, trial_cid, lang_cid, tool_cid, all_cid):
     return rows
 
 
-def _write_sheet(ws, headers, keys, rows):
-    """填充一个 worksheet：表头 + 数据行 + 冻结首行 + 自动列宽。"""
+# ── 累计 wall_s 着色阈值 ──
+CUMUL_COLORS = [
+    (0.80, "C6EFCE"),  # 绿 — 80%
+    (0.85, "FFEB9C"),  # 黄 — 85%
+    (0.90, "FFD966"),  # 橙 — 90%
+    (0.95, "F4B084"),  # 红 — 95%
+]
+
+
+def _write_sheet(ws, headers, keys, rows, mark_cumul=False):
+    """填充一个 worksheet：表头 + 数据行 + 冻结首行 + 自动列宽。
+
+    mark_cumul=True 时对 cluster 表按累计 wall_s 标记 80/85/90/95% 的行。
+    """
     import openpyxl  # noqa: F401
     from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -483,6 +495,24 @@ def _write_sheet(ws, headers, keys, rows):
             if isinstance(v, list):
                 v = "; ".join(str(x) for x in v)
             ws.cell(row=ri, column=ci, value=v)
+
+    # ── 累计 wall_s 着色（仅 cluster 表）──
+    if mark_cumul and "wall_s" in keys:
+        total_wall = sum(r.get("wall_s", 0) for r in rows)
+        if total_wall > 0:
+            cumul = 0.0
+            crossed = set()
+            for ri, r in enumerate(rows, 2):
+                cumul += r.get("wall_s", 0)
+                pct = cumul / total_wall
+                for threshold, color in CUMUL_COLORS:
+                    if pct >= threshold and threshold not in crossed:
+                        crossed.add(threshold)
+                        fill = PatternFill(start_color=color, end_color=color,
+                                           fill_type="solid")
+                        for ci in range(1, len(headers) + 1):
+                            ws.cell(row=ri, column=ci).fill = fill
+
     ws.freeze_panes = "A2"
     for col in ws.columns:
         letter = col[0].column_letter
@@ -500,19 +530,19 @@ def write_excel(xlsx_dir, trial_rows, lang_rows, tool_rows, all_rows, step_rows)
     xlsx_dir.mkdir(parents=True, exist_ok=True)
 
     files = [
-        ("per_trial.xlsx", trial_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
-        ("per_language.xlsx", lang_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
-        ("per_tool_type.xlsx", tool_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
-        ("all_trials.xlsx", all_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
-        ("steps.xlsx", step_rows, STEP_HEADERS, STEP_KEYS),
+        ("per_trial.xlsx", trial_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
+        ("per_language.xlsx", lang_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
+        ("per_tool_type.xlsx", tool_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
+        ("all_trials.xlsx", all_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
+        ("steps.xlsx", step_rows, STEP_HEADERS, STEP_KEYS, False),
     ]
-    for fname, rows, headers, keys in files:
+    for fname, rows, headers, keys, mark_cumul in files:
         if not rows:
             continue
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = fname.replace(".xlsx", "")
-        _write_sheet(ws, headers, keys, rows)
+        _write_sheet(ws, headers, keys, rows, mark_cumul=mark_cumul)
         p = xlsx_dir / fname
         wb.save(str(p))
         print(f"  Excel  {p}")

@@ -34,7 +34,7 @@ import os
 import pathlib
 import sys
 
-CLUSTER_THRESHOLD_DEFAULT = 0.10
+CLUSTER_THRESHOLD_DEFAULT = 0.05
 LANG_ORDER = ["python", "go", "rust", "typescript", "javascript"]
 
 # ── 导入命令分类器 ──
@@ -293,44 +293,107 @@ def load_steps(topdown_out, trials_dir=None, regen=False):
     return steps
 
 
-def cluster(steps, threshold):
-    """L∞ 贪心聚类。
+def _kmeans(X, k, n_init=10, max_iter=300, seed=42):
+    """标准 k-means（L2 距离），k-means++ 初始化，n_init 次重启取最优。
 
-    每个 step 的 vec 是 4 维 (Ret, Bad, FE, BE)。
-    按 cycles 降序处理，尝试加入已有 cluster（加入后任意两点任意单维差 < threshold）。
-    返回 list of cluster dict。
+    返回 labels (int array, len=n)。
+    """
+    import numpy as np
+    rng = np.random.RandomState(seed)
+    n = X.shape[0]
+    if k == 1:
+        return np.zeros(n, dtype=int)
+    if k >= n:
+        return np.arange(n, dtype=int)
+
+    best_labels = None
+    best_inertia = float("inf")
+    for _ in range(n_init):
+        # k-means++ 初始化
+        centers = [X[rng.randint(n)]]
+        for _ in range(1, k):
+            d2 = np.min([np.sum((X - c) ** 2, axis=1) for c in centers], axis=0)
+            probs = d2 / d2.sum()
+            idx = rng.choice(n, p=probs)
+            centers.append(X[idx])
+        centers = np.array(centers)
+
+        # Lloyd 迭代
+        labels = np.zeros(n, dtype=int)
+        for _ in range(max_iter):
+            # 分配：每个点到最近 centroid（L2）
+            dists = np.sqrt(((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))
+            new_labels = dists.argmin(axis=1)
+            if np.array_equal(new_labels, labels):
+                break
+            labels = new_labels
+            # 更新 centroid
+            for j in range(k):
+                mask = labels == j
+                if mask.any():
+                    centers[j] = X[mask].mean(axis=0)
+
+        inertia = sum(((X[labels == j] - centers[j]) ** 2).sum()
+                       for j in range(k) if (labels == j).any())
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels.copy()
+
+    return best_labels
+
+
+def _check_spread(X, labels, k, threshold):
+    """检查所有 cluster 内任意两点任意单维差 < threshold（L∞ spread）。
+
+    返回 True 如果所有 cluster 都满足。
+    """
+    for i in range(k):
+        pts = X[labels == i]
+        if len(pts) <= 1:
+            continue
+        for d in range(X.shape[1]):
+            spread = pts[:, d].max() - pts[:, d].min()
+            if spread >= threshold:
+                return False
+    return True
+
+
+def cluster(steps, threshold):
+    """K-means 暴力搜索：找最小的 k 使得每个 cluster 内 L∞ spread < threshold。
+
+    对 k=1,2,...,n 依次运行标准 k-means（L2 距离，k-means++ 初始化），
+    检查是否所有 cluster 的任意两点任意单维差 < threshold。
+    返回第一个满足条件的 k 的聚类结果。
+
+    k-means 用 L2 距离做聚类，验证用 L∞ spread 做 stopping criterion。
     """
     if not steps:
         return []
 
-    ordered = sorted(steps, key=lambda s: s["cycles"], reverse=True)
-    clusters = []
-    for s in ordered:
-        vec = s["vec"]
-        placed = False
-        for cl in clusters:
-            # 检查加入后该 cluster 内任意两点的任意单维差 < threshold
-            all_vecs = cl["vecs"] + [vec]
-            ok = True
-            for d in range(4):
-                vals = [v[d] for v in all_vecs]
-                if max(vals) - min(vals) >= threshold:
-                    ok = False
-                    break
-            if ok:
-                cl["members"].append(s)
-                cl["vecs"].append(vec)
-                placed = True
-                break
-        if not placed:
-            clusters.append({"members": [s], "vecs": [vec]})
+    import numpy as np
+    n = len(steps)
+    X = np.array([s["vec"] for s in steps], dtype=float)
 
-    # 按 cluster 总 wall_s 降序（越靠上越重要）
-    for cl in clusters:
-        cl["cycles"] = sum(m["cycles"] for m in cl["members"])
-        cl["wall_s"] = sum(m["wall_s"] for m in cl["members"])
-    clusters.sort(key=lambda c: c["wall_s"], reverse=True)
-    return clusters
+    for k in range(1, n + 1):
+        labels = _kmeans(X, k)
+
+        if _check_spread(X, labels, k, threshold):
+            # 找到最小有效 k
+            clusters = []
+            for i in range(k):
+                mask = labels == i
+                members = [steps[j] for j in range(n) if labels[j] == i]
+                if not members:
+                    continue
+                cl = {"members": members, "vecs": [m["vec"] for m in members]}
+                cl["cycles"] = sum(m["cycles"] for m in members)
+                cl["wall_s"] = sum(m["wall_s"] for m in members)
+                clusters.append(cl)
+            clusters.sort(key=lambda c: c["wall_s"], reverse=True)
+            return clusters
+
+    # 理论上 k=n 时每个点自成一类，spread=0，必满足
+    return []
 
 
 def summarize_cluster(cl, total_cyc, ci):

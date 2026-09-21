@@ -208,25 +208,37 @@ def load_steps(topdown_out, trials_dir=None, regen=False):
         return steps
 
     here = pathlib.Path(__file__).resolve().parent
-    regen_count = 0
+    n_trials = 0          # trial 目录总数
+    n_cleaned = 0         # 有 cleaned.json 的（含新生成的）
+    n_regen_ok = 0        # 本次新生成成功的
+    n_old = 0             # 回退到旧版 topdown_steps.json 的
+    n_skip = 0            # 完全没有 step 数据的
+    n_skip_no_steps = 0   # 有 JSON 但 steps 为空或全被过滤的
     for tdir in sorted(topdown_out.iterdir()):
         if not tdir.is_dir():
             continue
+        n_trials += 1
         jf = tdir / "topdown" / STEPS_JSON_NAME
+        was_missing = not jf.exists()
         if not jf.exists() or regen:
             if regen_step_data(tdir, here):
-                regen_count += 1
+                n_regen_ok += 1
             elif regen:
                 pass  # regen 模式下失败也不跳过已有数据
         if not jf.exists():
             # 也检查旧版 topdown_steps.json（兼容未重跑的 trial）
             old = tdir / "topdown" / "topdown_steps.json"
             if not old.exists():
+                n_skip += 1
                 continue
             jf = old
+            n_old += 1
+        else:
+            n_cleaned += 1
         try:
             data = json.loads(jf.read_text(encoding="utf-8"))
         except Exception:
+            n_skip += 1
             continue
         trial = tdir.name
         # 优先从 trials_dir 的 meta.json 读语言
@@ -241,6 +253,7 @@ def load_steps(topdown_out, trials_dir=None, regen=False):
                     pass
         if lang == "unknown":
             lang = trial_lang(trial, tdir)
+        trial_steps_before = len(steps)
         for s in data.get("steps", []):
             td = s.get("topdown")
             counts = s.get("counts", {})
@@ -260,6 +273,23 @@ def load_steps(topdown_out, trials_dir=None, regen=False):
                         td["FrontendBound"], td["BackendBound"]),
                 "commands": s.get("commands", []),
             })
+        added = len(steps) - trial_steps_before
+        if added == 0:
+            n_skip_no_steps += 1
+
+    # ── 诊断输出 ──
+    print()
+    print("── step 加载诊断 ──────────────────────────────────────────")
+    print(f"  trial 目录总数     {n_trials}")
+    print(f"  cleaned.json 已有  {n_cleaned}（含本次新生成 {n_regen_ok}）")
+    print(f"  回退旧版 .json     {n_old}")
+    print(f"  无 step 数据跳过   {n_skip}")
+    print(f"  有 JSON 但 step 空 {n_skip_no_steps}")
+    print(f"  实际加载 step 数   {len(steps)}")
+    total_wall = sum(s["wall_s"] for s in steps)
+    total_sleep = sum(s.get("sleep_s", 0) for s in steps)
+    print(f"  wall_s 合计        {total_wall:.1f}s（sleep 扣除 {total_sleep:.1f}s）")
+    print("───────────────────────────────────────────────────────────")
     return steps
 
 

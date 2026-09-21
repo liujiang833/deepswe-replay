@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""扫描 topdown_out 下所有 trial 的 topdown_steps.json，三级聚类。
+"""扫描 topdown_out 下所有 trial 的 topdown_steps_cleaned.json，四级聚类。
 
-三级：
-  per-trial   : 每个 trial 内部独立聚类
-  per-language: 同语言的 trial 的 step 合并后聚类
-  all-trials  : 全部 step 合并后聚类
+层级：
+  L3  per-trial    : 每个 trial 内部独立聚类
+  L2  per-language : 同语言的 step 合并后聚类
+  L2  per-tool-type: 同 program（git/grep/go test/…）的 step 合并后聚类
+  L1  all-trials   : 全部 step 合并后聚类
 
 聚类方法：L∞ 贪心——按 cycles 降序处理，尝试加入已有 cluster
 （加入后该 cluster 内任意两点的任意单维差 < 阈值），不行就新建。
-自然找到最少的 cluster 数。
 
 输出：
-  - stdout 表格（不变）
+  - stdout 表格
   - topdown_cluster.json（机读）
-  - topdown_clusters.xlsx（Excel，含 4 个 sheet）
-      per_trial    : 每个 trial 的 cluster 摘要
-      per_language : 每个语言的 cluster 摘要
-      all_trials   : 全部 step 的 cluster 摘要
-      steps        : 全量 step 表（含 per_trial_cid / per_lang_cid / all_cid）
-
-  每个 cluster 有唯一 ID（如 go-foo__abc#C1, go#C1, all#C1），
-  通过 steps sheet 的 *_cid 列可按 cluster ID 过滤查看该 cluster 包含的 step/指令。
+  - clusters/ 目录下 5 个 Excel 文件：
+      per_trial.xlsx     per_language.xlsx   per_tool_type.xlsx
+      all_trials.xlsx    steps.xlsx
+  每个 cluster 有唯一 ID（如 trial#C1 / go#C1 / go test#C1 / all#C1），
+  steps.xlsx 含 per_trial_cid / per_lang_cid / per_tool_cid / all_cid 四列，
+  可按 cluster ID 过滤查看该 cluster 包含的 step 和指令。
 
 用法：
-  python3 topdown_cluster.py topdown_out/                    # 三级全做
+  python3 topdown_cluster.py topdown_out/                    # 四级全做
   python3 topdown_cluster.py topdown_out/ --threshold 0.08  # 收紧到 8%
-  python3 topdown_cluster.py topdown_out/ --level all        # 只做 all-trials
+  python3 topdown_cluster.py topdown_out/ --level tool       # 只做 per-tool-type
 """
 
 import argparse
@@ -39,30 +37,35 @@ import sys
 CLUSTER_THRESHOLD_DEFAULT = 0.10
 LANG_ORDER = ["python", "go", "rust", "typescript", "javascript"]
 
+# ── 导入命令分类器 ──
+here = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(here.parent))
+import summarize_replay as sr
+
 # ── Excel sheet 定义 ──
 
 CLUSTER_HEADERS = [
-    "cluster_id", "scope", "trial", "lang", "cluster#", "n_steps",
+    "cluster_id", "scope", "trial", "lang", "program", "cluster#", "n_steps",
     "wall_s", "cycles", "pct_cycles",
     "Retiring%", "BadSpec%", "FrontendBound%", "BackendBound%",
     "max_spread", "n_trials", "rep_cmd", "rep_trial", "rep_step",
 ]
 CLUSTER_KEYS = [
-    "cluster_id", "scope", "trial", "lang", "cluster", "n_steps",
+    "cluster_id", "scope", "trial", "lang", "program", "cluster", "n_steps",
     "wall_s", "cycles", "pct_cycles",
     "Retiring", "BadSpec", "FrontendBound", "BackendBound",
     "max_spread", "n_trials", "rep_cmd", "rep_trial", "rep_step",
 ]
 
 STEP_HEADERS = [
-    "trial", "lang", "step", "n_cmds", "wall_s", "sleep_s", "cycles",
+    "trial", "lang", "program", "step", "n_cmds", "wall_s", "sleep_s", "cycles",
     "Retiring%", "BadSpec%", "FrontendBound%", "BackendBound%",
-    "commands", "per_trial_cid", "per_lang_cid", "all_cid",
+    "commands", "per_trial_cid", "per_lang_cid", "per_tool_cid", "all_cid",
 ]
 STEP_KEYS = [
-    "trial", "lang", "step", "n_cmds", "wall_s", "sleep_s", "cycles",
+    "trial", "lang", "program", "step", "n_cmds", "wall_s", "sleep_s", "cycles",
     "Retiring", "BadSpec", "FrontendBound", "BackendBound",
-    "commands", "per_trial_cid", "per_lang_cid", "all_cid",
+    "commands", "per_trial_cid", "per_lang_cid", "per_tool_cid", "all_cid",
 ]
 
 
@@ -93,6 +96,38 @@ def trial_lang(name, tdir=None):
 
 
 STEPS_JSON_NAME = "topdown_steps_cleaned.json"
+
+
+def step_program(commands):
+    """从 step 的命令列表推断 program 字段。
+
+    多条命令时取优先级最高的（跑测试 > 写文件 > 搜索 > 版本控制 > 读文件 > 其他），
+    用该条命令的 program 字段（如 go test / cargo build / grep / git / python）。
+    空命令或无法分类返回 "unknown"。
+    """
+    if not commands:
+        return "unknown"
+    best_prog = None
+    best_rank = len(sr.PRIORITY)
+    for cmd in commands:
+        if not cmd or not cmd.strip():
+            continue
+        try:
+            c = sr.classify_command_full(cmd)
+        except Exception:
+            continue
+        prog = c.get("program")
+        if not prog:
+            continue
+        cat = c.get("cat", sr.OTHER)
+        try:
+            r = sr.PRIORITY.index(cat)
+        except ValueError:
+            r = len(sr.PRIORITY)
+        if r < best_rank:
+            best_rank = r
+            best_prog = prog
+    return best_prog or "unknown"
 
 
 def regen_step_data(tdir, here):
@@ -215,6 +250,7 @@ def load_steps(topdown_out, trials_dir=None, regen=False):
             steps.append({
                 "trial": trial,
                 "lang": lang,
+                "program": step_program(s.get("commands", [])),
                 "step": s.get("step"),
                 "n_cmds": s.get("n_cmds", 0),
                 "wall_s": s.get("wall_s", 0),
@@ -338,7 +374,7 @@ def print_clusters(clusters, total_cyc, title):
 
 # ── Excel 输出 ──
 
-def cluster_to_rows(clusters, total_cyc, scope, trial="", lang=""):
+def cluster_to_rows(clusters, total_cyc, scope, trial="", lang="", program=""):
     """生成 cluster 摘要行，每行带唯一 cluster_id。"""
     rows = []
     for ci, cl in enumerate(clusters):
@@ -347,11 +383,14 @@ def cluster_to_rows(clusters, total_cyc, scope, trial="", lang=""):
             s["cluster_id"] = f"{trial}#C{ci + 1}"
         elif scope == "per-language":
             s["cluster_id"] = f"{lang}#C{ci + 1}"
+        elif scope == "per-tool-type":
+            s["cluster_id"] = f"{program}#C{ci + 1}"
         else:
             s["cluster_id"] = f"all#C{ci + 1}"
         s["scope"] = scope
         s["trial"] = trial
         s["lang"] = lang
+        s["program"] = program
         s["n_trials"] = len(s.get("trials", []))
         rows.append(s)
     return rows
@@ -367,14 +406,15 @@ def build_step_cid_map(clusters, prefix):
     return cid_map
 
 
-def build_step_rows(steps, trial_cid, lang_cid, all_cid):
-    """构建全量 step 行，含三级 cluster ID。"""
+def build_step_rows(steps, trial_cid, lang_cid, tool_cid, all_cid):
+    """构建全量 step 行，含四级 cluster ID。"""
     rows = []
     for s in steps:
         key = (s["trial"], s["step"])
         rows.append({
             "trial": s["trial"],
             "lang": s["lang"],
+            "program": s.get("program", "unknown"),
             "step": s["step"],
             "n_cmds": s["n_cmds"],
             "wall_s": s["wall_s"],
@@ -387,6 +427,7 @@ def build_step_rows(steps, trial_cid, lang_cid, all_cid):
             "commands": "; ".join(s.get("commands", [])),
             "per_trial_cid": trial_cid.get(key, ""),
             "per_lang_cid": lang_cid.get(key, ""),
+            "per_tool_cid": tool_cid.get(key, ""),
             "all_cid": all_cid.get(key, ""),
         })
     return rows
@@ -418,9 +459,9 @@ def _write_sheet(ws, headers, keys, rows):
         ws.column_dimensions[letter].width = min(max_len + 2, 60)
 
 
-def write_excel(xlsx_dir, trial_rows, lang_rows, all_rows, step_rows):
-    """写 4 个独立 Excel 文件到 xlsx_dir：
-    per_trial.xlsx / per_language.xlsx / all_trials.xlsx / steps.xlsx
+def write_excel(xlsx_dir, trial_rows, lang_rows, tool_rows, all_rows, step_rows):
+    """写 5 个独立 Excel 文件到 xlsx_dir：
+    per_trial.xlsx / per_language.xlsx / per_tool_type.xlsx / all_trials.xlsx / steps.xlsx
     """
     import openpyxl
 
@@ -430,6 +471,7 @@ def write_excel(xlsx_dir, trial_rows, lang_rows, all_rows, step_rows):
     files = [
         ("per_trial.xlsx", trial_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
         ("per_language.xlsx", lang_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
+        ("per_tool_type.xlsx", tool_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
         ("all_trials.xlsx", all_rows, CLUSTER_HEADERS, CLUSTER_KEYS),
         ("steps.xlsx", step_rows, STEP_HEADERS, STEP_KEYS),
     ]
@@ -451,12 +493,12 @@ def main():
     ap.add_argument("topdown_out", help="topdown_out 目录（含 <trial>/topdown/topdown_steps.json）")
     ap.add_argument("--threshold", type=float, default=CLUSTER_THRESHOLD_DEFAULT,
                     help=f"L∞ 聚类阈值（默认 {CLUSTER_THRESHOLD_DEFAULT} = 10%%）")
-    ap.add_argument("--level", choices=("trial", "language", "all", "all-full"), default="all-full",
-                    help="只做某一级（默认 all-full = 三级全做）")
+    ap.add_argument("--level", choices=("trial", "language", "tool", "all", "all-full"), default="all-full",
+                    help="只做某一级（默认 all-full = 四级全做）")
     ap.add_argument("--json-out", default="", help="机读结果落盘路径")
     ap.add_argument("--xlsx-dir", default="",
                     help="Excel 输出目录（默认 <topdown_out>/clusters/），"
-                         "产出 per_trial.xlsx / per_language.xlsx / "
+                         "产出 per_trial.xlsx / per_language.xlsx / per_tool_type.xlsx / "
                          "all_trials.xlsx / steps.xlsx")
     ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
     ap.add_argument("--trials-dir", default="full_trials",
@@ -485,12 +527,19 @@ def main():
     lang_counts = {}
     for s in steps:
         lang_counts[s["lang"]] = lang_counts.get(s["lang"], 0) + 1
+    # program 分布
+    prog_counts = {}
+    for s in steps:
+        prog_counts[s["program"]] = prog_counts.get(s["program"], 0) + 1
 
     print("=" * 78)
     print(f" topdown 向量聚类（L∞ 阈值 {args.threshold*100:.0f}%）")
     print(f" 数据来源   {args.topdown_out}")
     print(f" step 总数   {len(steps)}")
     print(f" 语言分布   {lang_counts}")
+    print(f" program 分布（{len(prog_counts)} 种）:")
+    for prog, cnt in sorted(prog_counts.items(), key=lambda x: -x[1]):
+        print(f"   {prog:30s} {cnt:5d}")
     print(f" 阈值       任意两点任意单维差 < {args.threshold*100:.0f}%")
     print("=" * 78)
 
@@ -501,11 +550,13 @@ def main():
         "threshold": args.threshold,
         "n_steps": len(steps),
         "lang_counts": lang_counts,
+        "program_counts": prog_counts,
     }
 
     # 用于构建 steps sheet 的 cluster ID 映射
     trial_cid_map = {}
     lang_cid_map = {}
+    tool_cid_map = {}
     all_cid_map = {}
 
     # ── Level 1: per-trial ──
@@ -561,12 +612,37 @@ def main():
             lang_cid_map.update(build_step_cid_map(clusters, lang))
         result["per_language"] = lang_clusters
 
-    # ── Level 3: all-trials ──
+    # ── Level 2b: per-tool-type ──
+    tool_rows = []
+    if args.level in ("tool", "all-full"):
+        print()
+        print("═══════════════════════════════════════════════════════════")
+        print(" Level 2: per-tool-type（同 program 的 step 合并后聚类）")
+        print("═══════════════════════════════════════════════════════════")
+
+        tool_map = {}
+        for s in steps:
+            tool_map.setdefault(s["program"], []).append(s)
+
+        tool_clusters = {}
+        for prog in sorted(tool_map.keys()):
+            p_steps = tool_map[prog]
+            clusters = cluster(p_steps, args.threshold)
+            total_cyc = sum(cl["cycles"] for cl in clusters)
+            print_clusters(clusters, total_cyc, f"tool={prog}（{len(p_steps)} steps, {len(set(s['trial'] for s in p_steps))} trials）")
+            tool_clusters[prog] = [summarize_cluster(cl, total_cyc, ci + 1)
+                                    for ci, cl in enumerate(clusters)]
+            tool_rows.extend(cluster_to_rows(
+                clusters, total_cyc, "per-tool-type", program=prog))
+            tool_cid_map.update(build_step_cid_map(clusters, prog))
+        result["per_tool_type"] = tool_clusters
+
+    # ── Level 1: all-trials ──
     all_rows = []
     if args.level in ("all", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
-        print(" Level 3: all-trials（全部 step 合并后聚类）")
+        print(" Level 1: all-trials（全部 step 合并后聚类）")
         print("═══════════════════════════════════════════════════════════")
 
         clusters = cluster(steps, args.threshold)
@@ -581,8 +657,8 @@ def main():
     # ── Excel 输出 ──
     xlsx_dir = pathlib.Path(args.xlsx_dir) if args.xlsx_dir \
         else pathlib.Path(args.topdown_out) / "clusters"
-    step_rows = build_step_rows(steps, trial_cid_map, lang_cid_map, all_cid_map)
-    write_excel(xlsx_dir, trial_rows, lang_rows, all_rows, step_rows)
+    step_rows = build_step_rows(steps, trial_cid_map, lang_cid_map, tool_cid_map, all_cid_map)
+    write_excel(xlsx_dir, trial_rows, lang_rows, tool_rows, all_rows, step_rows)
 
     # ── JSON 落盘 ──
     out_path = pathlib.Path(args.json_out) if args.json_out \

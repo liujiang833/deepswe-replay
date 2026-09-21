@@ -325,11 +325,11 @@ def cluster(steps, threshold):
         if not placed:
             clusters.append({"members": [s], "vecs": [vec]})
 
-    # 按 cluster 总 cycles 降序
+    # 按 cluster 总 wall_s 降序（越靠上越重要）
     for cl in clusters:
         cl["cycles"] = sum(m["cycles"] for m in cl["members"])
         cl["wall_s"] = sum(m["wall_s"] for m in cl["members"])
-    clusters.sort(key=lambda c: c["cycles"], reverse=True)
+    clusters.sort(key=lambda c: c["wall_s"], reverse=True)
     return clusters
 
 
@@ -460,6 +460,7 @@ def build_step_rows(steps, trial_cid, lang_cid, tool_cid, all_cid):
             "per_tool_cid": tool_cid.get(key, ""),
             "all_cid": all_cid.get(key, ""),
         })
+    rows.sort(key=lambda r: r["wall_s"], reverse=True)
     return rows
 
 

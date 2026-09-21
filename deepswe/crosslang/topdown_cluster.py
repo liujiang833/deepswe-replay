@@ -313,8 +313,13 @@ def _kmeans(X, k, n_init=10, max_iter=300, seed=42):
         centers = [X[rng.randint(n)]]
         for _ in range(1, k):
             d2 = np.min([np.sum((X - c) ** 2, axis=1) for c in centers], axis=0)
-            probs = d2 / d2.sum()
-            idx = rng.choice(n, p=probs)
+            total = d2.sum()
+            if total == 0:
+                # 所有点与已有 center 重合，随机选一个
+                idx = rng.randint(n)
+            else:
+                probs = d2 / total
+                idx = rng.choice(n, p=probs)
             centers.append(X[idx])
         centers = np.array(centers)
 
@@ -358,27 +363,56 @@ def _check_spread(X, labels, k, threshold):
     return True
 
 
-def cluster(steps, threshold):
+def _kmeans_worker(args):
+    """multiprocessing worker：运行一次 k-means 并检查 spread。
+
+    args = (X_bytes, X_shape, k, threshold, seed)
+    返回 (k, labels_bytes, ok) 或 (k, None, False)
+    """
+    import numpy as np
+    X_bytes, X_shape, k, threshold, seed = args
+    X = np.frombuffer(X_bytes, dtype=np.float64).reshape(X_shape)
+    labels = _kmeans(X, k, seed=seed)
+    ok = _check_spread(X, labels, k, threshold)
+    return (k, labels.tobytes(), ok)
+
+
+def cluster(steps, threshold, n_workers=8):
     """K-means 暴力搜索：找最小的 k 使得每个 cluster 内 L∞ spread < threshold。
 
-    对 k=1,2,...,n 依次运行标准 k-means（L2 距离，k-means++ 初始化），
+    对 k=1,2,...,n 并行运行标准 k-means（L2 距离，k-means++ 初始化），
     检查是否所有 cluster 的任意两点任意单维差 < threshold。
     返回第一个满足条件的 k 的聚类结果。
 
     k-means 用 L2 距离做聚类，验证用 L∞ spread 做 stopping criterion。
+    并行度默认 8（用 8 个核）。
     """
     if not steps:
         return []
 
     import numpy as np
+    from multiprocessing import Pool
+
     n = len(steps)
     X = np.array([s["vec"] for s in steps], dtype=float)
 
-    for k in range(1, n + 1):
-        labels = _kmeans(X, k)
+    # 共享 X 给所有 worker（避免每进程复制大数组）
+    X_bytes = X.tobytes()
+    X_shape = X.shape
 
-        if _check_spread(X, labels, k, threshold):
-            # 找到最小有效 k
+    tasks = [(X_bytes, X_shape, k, threshold, 42 + k) for k in range(1, n + 1)]
+
+    if n <= 8:
+        # 小数据集直接串行，省掉进程开销
+        results = [_kmeans_worker(t) for t in tasks]
+    else:
+        with Pool(min(n_workers, n)) as pool:
+            results = pool.map(_kmeans_worker, tasks)
+
+    # 找最小 k 满足 spread 条件
+    for k, labels_bytes, ok in results:
+        if ok:
+            labels = np.frombuffer(labels_bytes, dtype=int)
             clusters = []
             for i in range(k):
                 mask = labels == i

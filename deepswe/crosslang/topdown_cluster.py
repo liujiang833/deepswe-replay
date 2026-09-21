@@ -663,6 +663,8 @@ def main():
                     help="trial 源目录（默认 full_trials），从 <trial>/meta.json 读语言")
     ap.add_argument("--regen-steps", action="store_true",
                     help="强制重新生成所有 trial 的 topdown_steps_cleaned.json（调用 topdown_steps.py）")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="K-means 暴力搜索并行进程数（默认 8）")
     args = ap.parse_args()
 
     here = pathlib.Path(__file__).resolve().parent
@@ -733,7 +735,7 @@ def main():
         for trial in sorted(trials_map.keys()):
             t_steps = trials_map[trial]
             lang = t_steps[0]["lang"] if t_steps else ""
-            clusters = cluster(t_steps, args.threshold)
+            clusters = cluster(t_steps, args.threshold, n_workers=args.workers)
             total_cyc = sum(cl["cycles"] for cl in clusters)
             print_clusters(clusters, total_cyc, f"trial={trial}（{len(t_steps)} steps）")
             trial_clusters[trial] = [summarize_cluster(cl, total_cyc, ci + 1)
@@ -759,7 +761,7 @@ def main():
         lang_clusters = {}
         for lang in sorted(lang_map.keys()):
             l_steps = lang_map[lang]
-            clusters = cluster(l_steps, args.threshold)
+            clusters = cluster(l_steps, args.threshold, n_workers=args.workers)
             total_cyc = sum(cl["cycles"] for cl in clusters)
             print_clusters(clusters, total_cyc, f"lang={lang}（{len(l_steps)} steps, {len(set(s['trial'] for s in l_steps))} trials）")
             lang_clusters[lang] = [summarize_cluster(cl, total_cyc, ci + 1)
@@ -785,7 +787,7 @@ def main():
         tool_clusters = {}
         for prog in sorted(tool_map.keys()):
             p_steps = tool_map[prog]
-            clusters = cluster(p_steps, args.threshold)
+            clusters = cluster(p_steps, args.threshold, n_workers=args.workers)
             total_cyc = sum(cl["cycles"] for cl in clusters)
             print_clusters(clusters, total_cyc, f"tool={prog}（{len(p_steps)} steps, {len(set(s['trial'] for s in p_steps))} trials）")
             tool_clusters[prog] = [summarize_cluster(cl, total_cyc, ci + 1)
@@ -803,7 +805,7 @@ def main():
         print(" Level 1: all-trials（全部 step 合并后聚类）")
         print("═══════════════════════════════════════════════════════════")
 
-        clusters = cluster(steps, args.threshold)
+        clusters = cluster(steps, args.threshold, n_workers=args.workers)
         total_cyc = sum(cl["cycles"] for cl in clusters)
         print_clusters(clusters, total_cyc, f"all-trials（{len(steps)} steps）")
         result["all_trials"] = [summarize_cluster(cl, total_cyc, ci + 1)

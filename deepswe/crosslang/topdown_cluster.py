@@ -685,6 +685,12 @@ def main():
         # 记录 step → all cluster ID
         all_cid_map = build_step_cid_map(clusters, "all")
 
+    # ── 全局按 wall_s 降序排序（跨 trial / lang / program）──
+    trial_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+    lang_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+    tool_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+    all_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+
     # ── Excel 输出 ──
     xlsx_dir = pathlib.Path(args.xlsx_dir) if args.xlsx_dir \
         else pathlib.Path(args.topdown_out) / "clusters"

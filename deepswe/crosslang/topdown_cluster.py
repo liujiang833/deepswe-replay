@@ -300,46 +300,56 @@ def _kmeans(X, k, n_init=10, max_iter=300, seed=42):
     """
     import numpy as np
     rng = np.random.RandomState(seed)
-    n = X.shape[0]
+    n, d = X.shape
     if k == 1:
         return np.zeros(n, dtype=int)
     if k >= n:
         return np.arange(n, dtype=int)
 
+    X_sq = np.sum(X ** 2, axis=1)  # (n,) 预计算
     best_labels = None
     best_inertia = float("inf")
+
     for _ in range(n_init):
-        # k-means++ 初始化
-        centers = [X[rng.randint(n)]]
-        for _ in range(1, k):
-            d2 = np.min([np.sum((X - c) ** 2, axis=1) for c in centers], axis=0)
-            total = d2.sum()
-            if total == 0:
-                # 所有点与已有 center 重合，随机选一个
-                idx = rng.randint(n)
-            else:
-                probs = d2 / total
-                idx = rng.choice(n, p=probs)
-            centers.append(X[idx])
-        centers = np.array(centers)
+        # k-means++ 初始化（k>100 时用随机初始化，避免 O(n*k²) 瓶颈）
+        if k > 100:
+            idxs = rng.choice(n, size=k, replace=False)
+            centers = X[idxs].copy()
+        else:
+            centers = [X[rng.randint(n)]]
+            for _ in range(1, k):
+                d2 = np.min([np.sum((X - c) ** 2, axis=1) for c in centers], axis=0)
+                total = d2.sum()
+                if total == 0:
+                    idx = rng.randint(n)
+                else:
+                    probs = d2 / total
+                    idx = rng.choice(n, p=probs)
+                centers.append(X[idx])
+            centers = np.array(centers)
 
         # Lloyd 迭代
         labels = np.zeros(n, dtype=int)
         for _ in range(max_iter):
-            # 分配：每个点到最近 centroid（L2）
-            dists = np.sqrt(((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))
-            new_labels = dists.argmin(axis=1)
+            # 分配：||x-c||² = ||x||² - 2x·c + ||c||²  （矩阵乘法，BLAS 加速）
+            C_sq = np.sum(centers ** 2, axis=1)
+            cross = X @ centers.T
+            dists_sq = X_sq[:, None] - 2 * cross + C_sq[None, :]
+            np.maximum(dists_sq, 0, out=dists_sq)  # 消除浮点负值
+            new_labels = dists_sq.argmin(axis=1)
             if np.array_equal(new_labels, labels):
                 break
             labels = new_labels
-            # 更新 centroid
             for j in range(k):
                 mask = labels == j
                 if mask.any():
                     centers[j] = X[mask].mean(axis=0)
 
-        inertia = sum(((X[labels == j] - centers[j]) ** 2).sum()
-                       for j in range(k) if (labels == j).any())
+        inertia = 0.0
+        for j in range(k):
+            mask = labels == j
+            if mask.any():
+                inertia += np.sum((X[mask] - centers[j]) ** 2)
         if inertia < best_inertia:
             best_inertia = inertia
             best_labels = labels.copy()
@@ -348,86 +358,70 @@ def _kmeans(X, k, n_init=10, max_iter=300, seed=42):
 
 
 def _check_spread(X, labels, k, threshold):
-    """检查所有 cluster 内任意两点任意单维差 < threshold（L∞ spread）。
-
-    返回 True 如果所有 cluster 都满足。
-    """
+    """检查所有 cluster 内任意两点任意单维差 < threshold（L∞ spread）。"""
     for i in range(k):
         pts = X[labels == i]
         if len(pts) <= 1:
             continue
         for d in range(X.shape[1]):
-            spread = pts[:, d].max() - pts[:, d].min()
-            if spread >= threshold:
+            if pts[:, d].max() - pts[:, d].min() >= threshold:
                 return False
     return True
 
 
-def _kmeans_worker(args):
-    """multiprocessing worker：运行一次 k-means 并检查 spread。
-
-    args = (X_bytes, X_shape, k, threshold, seed)
-    返回 (k, labels_bytes, ok) 或 (k, None, False)
-    """
-    import numpy as np
-    X_bytes, X_shape, k, threshold, seed = args
-    X = np.frombuffer(X_bytes, dtype=np.float64).reshape(X_shape)
-    labels = _kmeans(X, k, seed=seed)
-    ok = _check_spread(X, labels, k, threshold)
-    return (k, labels.tobytes(), ok)
-
-
 def cluster(steps, threshold, n_workers=8):
-    """K-means 暴力搜索：找最小的 k 使得每个 cluster 内 L∞ spread < threshold。
+    """K-means 二分搜索：找最小的 k 使得每个 cluster 内 L∞ spread < threshold。
 
-    对 k=1,2,...,n 并行运行标准 k-means（L2 距离，k-means++ 初始化），
-    检查是否所有 cluster 的任意两点任意单维差 < threshold。
-    返回第一个满足条件的 k 的聚类结果。
-
-    k-means 用 L2 距离做聚类，验证用 L∞ spread 做 stopping criterion。
-    并行度默认 8（用 8 个核）。
+    二分搜索代替暴力遍历：O(log n) 次 k-means 代替 O(n) 次。
+    搜索阶段 n_init=3（快），最终确认 n_init=10（准）。
+    k>100 时 k-means 用随机初始化代替 k-means++（避免 O(n*k²) 瓶颈）。
     """
     if not steps:
         return []
 
     import numpy as np
-    from multiprocessing import Pool
-
     n = len(steps)
     X = np.array([s["vec"] for s in steps], dtype=float)
 
-    # 共享 X 给所有 worker（避免每进程复制大数组）
-    X_bytes = X.tobytes()
-    X_shape = X.shape
+    if n == 1:
+        cl = {"members": steps, "vecs": [steps[0]["vec"]],
+              "cycles": steps[0]["cycles"], "wall_s": steps[0]["wall_s"]}
+        return [cl]
 
-    tasks = [(X_bytes, X_shape, k, threshold, 42 + k) for k in range(1, n + 1)]
+    # 二分搜索：spread 关于 k 在实践中单调递减
+    lo, hi = 1, n
+    best_k = n
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        # 大 k 时减少迭代次数（每个 cluster 很小，收敛快）
+        mi = 50 if mid > 100 else 300
+        labels = _kmeans(X, mid, n_init=3, max_iter=mi)
+        if _check_spread(X, labels, mid, threshold):
+            best_k = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
 
-    if n <= 8:
-        # 小数据集直接串行，省掉进程开销
-        results = [_kmeans_worker(t) for t in tasks]
-    else:
-        with Pool(min(n_workers, n)) as pool:
-            results = pool.map(_kmeans_worker, tasks)
+    # 最终用 n_init=10 重跑确认（k-means 随机性可能导致不同结果）
+    mi = 50 if best_k > 100 else 300
+    labels = _kmeans(X, best_k, n_init=10, max_iter=mi)
+    while best_k < n and not _check_spread(X, labels, best_k, threshold):
+        best_k += 1
+        mi = 50 if best_k > 100 else 300
+        labels = _kmeans(X, best_k, n_init=10, max_iter=mi)
 
-    # 找最小 k 满足 spread 条件
-    for k, labels_bytes, ok in results:
-        if ok:
-            labels = np.frombuffer(labels_bytes, dtype=int)
-            clusters = []
-            for i in range(k):
-                mask = labels == i
-                members = [steps[j] for j in range(n) if labels[j] == i]
-                if not members:
-                    continue
-                cl = {"members": members, "vecs": [m["vec"] for m in members]}
-                cl["cycles"] = sum(m["cycles"] for m in members)
-                cl["wall_s"] = sum(m["wall_s"] for m in members)
-                clusters.append(cl)
-            clusters.sort(key=lambda c: c["wall_s"], reverse=True)
-            return clusters
-
-    # 理论上 k=n 时每个点自成一类，spread=0，必满足
-    return []
+    clusters = []
+    for i in range(best_k):
+        mask = labels == i
+        members = [steps[j] for j in range(n) if labels[j] == i]
+        if not members:
+            continue
+        cl = {"members": members, "vecs": [m["vec"] for m in members]}
+        cl["cycles"] = sum(m["cycles"] for m in members)
+        cl["wall_s"] = sum(m["wall_s"] for m in members)
+        clusters.append(cl)
+    clusters.sort(key=lambda c: c["wall_s"], reverse=True)
+    return clusters
 
 
 def summarize_cluster(cl, total_cyc, ci):
@@ -623,26 +617,36 @@ def write_excel(xlsx_dir, trial_rows, lang_rows, tool_rows, all_rows, step_rows)
     """
     import openpyxl
 
+def write_cluster_excel(xlsx_dir, fname, rows):
+    """写单个 cluster Excel 文件（带累计 wall_s 着色）。"""
+    import openpyxl
     xlsx_dir = pathlib.Path(xlsx_dir)
     xlsx_dir.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = fname.replace(".xlsx", "")
+    _write_sheet(ws, CLUSTER_HEADERS, CLUSTER_KEYS, rows, mark_cumul=True)
+    p = xlsx_dir / fname
+    wb.save(str(p))
+    print(f"  Excel  {p}")
 
-    files = [
-        ("per_trial.xlsx", trial_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
-        ("per_language.xlsx", lang_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
-        ("per_tool_type.xlsx", tool_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
-        ("all_trials.xlsx", all_rows, CLUSTER_HEADERS, CLUSTER_KEYS, True),
-        ("steps.xlsx", step_rows, STEP_HEADERS, STEP_KEYS, False),
-    ]
-    for fname, rows, headers, keys, mark_cumul in files:
-        if not rows:
-            continue
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = fname.replace(".xlsx", "")
-        _write_sheet(ws, headers, keys, rows, mark_cumul=mark_cumul)
-        p = xlsx_dir / fname
-        wb.save(str(p))
-        print(f"  Excel  {p}")
+
+def write_steps_excel(xlsx_dir, rows):
+    """写 steps Excel 文件。"""
+    import openpyxl
+    xlsx_dir = pathlib.Path(xlsx_dir)
+    xlsx_dir.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "steps"
+    _write_sheet(ws, STEP_HEADERS, STEP_KEYS, rows, mark_cumul=False)
+    p = xlsx_dir / "steps.xlsx"
+    wb.save(str(p))
+    print(f"  Excel  {p}")
 
 
 def main():
@@ -719,12 +723,16 @@ def main():
     tool_cid_map = {}
     all_cid_map = {}
 
+    # ── Excel 输出目录 ──
+    xlsx_dir = pathlib.Path(args.xlsx_dir) if args.xlsx_dir \
+        else pathlib.Path(args.topdown_out) / "clusters"
+
     # ── Level 1: per-trial ──
     trial_rows = []
     if args.level in ("trial", "all-full"):
         print()
         print("═══════════════════════════════════════════════════════════")
-        print(" Level 1: per-trial（每个 trial 内部独立聚类）")
+        print(" Level 3: per-trial（每个 trial 内部独立聚类）")
         print("═══════════════════════════════════════════════════════════")
 
         trials_map = {}
@@ -742,9 +750,10 @@ def main():
                                      for ci, cl in enumerate(clusters)]
             trial_rows.extend(cluster_to_rows(
                 clusters, total_cyc, "per-trial", trial=trial, lang=lang))
-            # 记录 step → trial cluster ID
             trial_cid_map.update(build_step_cid_map(clusters, trial))
         result["per_trial"] = trial_clusters
+        trial_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+        write_cluster_excel(xlsx_dir, "per_trial.xlsx", trial_rows)
 
     # ── Level 2: per-language ──
     lang_rows = []
@@ -768,9 +777,10 @@ def main():
                                    for ci, cl in enumerate(clusters)]
             lang_rows.extend(cluster_to_rows(
                 clusters, total_cyc, "per-language", lang=lang))
-            # 记录 step → lang cluster ID
             lang_cid_map.update(build_step_cid_map(clusters, lang))
         result["per_language"] = lang_clusters
+        lang_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+        write_cluster_excel(xlsx_dir, "per_language.xlsx", lang_rows)
 
     # ── Level 2b: per-tool-type ──
     tool_rows = []
@@ -796,6 +806,8 @@ def main():
                 clusters, total_cyc, "per-tool-type", program=prog))
             tool_cid_map.update(build_step_cid_map(clusters, prog))
         result["per_tool_type"] = tool_clusters
+        tool_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+        write_cluster_excel(xlsx_dir, "per_tool_type.xlsx", tool_rows)
 
     # ── Level 1: all-trials ──
     all_rows = []
@@ -811,20 +823,13 @@ def main():
         result["all_trials"] = [summarize_cluster(cl, total_cyc, ci + 1)
                                 for ci, cl in enumerate(clusters)]
         all_rows = cluster_to_rows(clusters, total_cyc, "all-trials")
-        # 记录 step → all cluster ID
         all_cid_map = build_step_cid_map(clusters, "all")
+        all_rows.sort(key=lambda r: r["wall_s"], reverse=True)
+        write_cluster_excel(xlsx_dir, "all_trials.xlsx", all_rows)
 
-    # ── 全局按 wall_s 降序排序（跨 trial / lang / program）──
-    trial_rows.sort(key=lambda r: r["wall_s"], reverse=True)
-    lang_rows.sort(key=lambda r: r["wall_s"], reverse=True)
-    tool_rows.sort(key=lambda r: r["wall_s"], reverse=True)
-    all_rows.sort(key=lambda r: r["wall_s"], reverse=True)
-
-    # ── Excel 输出 ──
-    xlsx_dir = pathlib.Path(args.xlsx_dir) if args.xlsx_dir \
-        else pathlib.Path(args.topdown_out) / "clusters"
+    # ── steps 表（需要所有级别的 cid map）──
     step_rows = build_step_rows(steps, trial_cid_map, lang_cid_map, tool_cid_map, all_cid_map)
-    write_excel(xlsx_dir, trial_rows, lang_rows, tool_rows, all_rows, step_rows)
+    write_steps_excel(xlsx_dir, step_rows)
 
     # ── JSON 落盘 ──
     out_path = pathlib.Path(args.json_out) if args.json_out \

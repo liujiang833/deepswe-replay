@@ -838,6 +838,15 @@ def main():
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                         encoding="utf-8")
     print(f"  机读结果  {out_path}")
+
+    # ── 保存本次命令行（便于复现）──
+    cmd_path = xlsx_dir / "run_cmd.txt"
+    cmd_path.write_text(
+        f"# {' '.join([__file__] + sys.argv[1:])}\n"
+        f"# generated: {result['generated_utc']}\n"
+        f"# steps: {len(steps)}, threshold: {args.threshold}\n",
+        encoding="utf-8")
+    print(f"  复现命令  {cmd_path}")
     return 0
 
 

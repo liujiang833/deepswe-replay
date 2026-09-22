@@ -220,7 +220,17 @@ python3 topdown_cluster.py <out_dir>/ --level all
 
 # 只看某语言
 python3 topdown_cluster.py <out_dir>/ --only-lang go
+
+# 排除某语言的 benchmark（例如与其他人的 Python 工作去重）
+python3 topdown_cluster.py <out_dir>/ --exclude-lang python
+
+# 一次排除多种语言（也可重复传入 --exclude-lang）
+python3 topdown_cluster.py <out_dir>/ --exclude-lang python,javascript
 ```
+
+`--exclude-lang` 会在聚类前过滤 benchmark，因此屏幕统计、JSON、各级 Excel、
+`steps.xlsx` 和 `tool_summary.xlsx` 都不会包含被排除语言的数据。可选语言限定为
+`python` / `go` / `rust` / `typescript` / `javascript`，传入其他值会在读取数据前报错退出。
 
 输出 `topdown_cluster.json`，含三个层级各自的 cluster 列表，每个 cluster 记录：
 steps 数 / wall_s / cycles / 占比 / cycles 加权四象限 / max_spread / 成员 trial 列表 / 代表命令。

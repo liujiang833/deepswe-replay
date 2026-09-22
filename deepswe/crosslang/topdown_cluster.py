@@ -25,6 +25,7 @@
   python3 topdown_cluster.py topdown_out/                    # 四级全做
   python3 topdown_cluster.py topdown_out/ --threshold 0.08  # 收紧到 8%
   python3 topdown_cluster.py topdown_out/ --level tool       # 只做 per-tool-type
+  python3 topdown_cluster.py topdown_out/ --exclude-lang python  # 排除 Python benchmark
 """
 
 import argparse
@@ -96,6 +97,18 @@ def trial_lang(name, tdir=None):
 
 
 STEPS_JSON_NAME = "topdown_steps_cleaned.json"
+
+
+def parse_languages(values):
+    """解析可重复、可逗号分隔的语言参数，返回小写 set。"""
+    languages = set()
+    for value in values:
+        languages.update(
+            language.strip().casefold()
+            for language in value.split(",")
+            if language.strip()
+        )
+    return languages
 
 
 def step_program(commands):
@@ -783,7 +796,14 @@ def main():
                     help="Excel 输出目录（默认 <topdown_out>/clusters/），"
                          "产出 per_trial.xlsx / per_language.xlsx / per_tool_type.xlsx / "
                          "all_trials.xlsx / steps.xlsx")
-    ap.add_argument("--only-lang", default="", help="只看某语言（per-language 和 all-trials 都过滤）")
+    lang_filter = ap.add_mutually_exclusive_group()
+    lang_filter.add_argument(
+        "--only-lang", default="",
+        help="只看某语言（所有聚类层级和导出都过滤）")
+    lang_filter.add_argument(
+        "--exclude-lang", action="append", default=[], metavar="LANG[,LANG...]",
+        help="排除指定语言的 benchmark（可选 python/go/rust/typescript/"
+             "javascript；可逗号分隔或重复传入）")
     ap.add_argument("--trials-dir", default="full_trials",
                     help="trial 源目录（默认 full_trials），从 <trial>/meta.json 读语言")
     ap.add_argument("--regen-steps", action="store_true",
@@ -791,6 +811,21 @@ def main():
     ap.add_argument("--workers", type=int, default=8,
                     help="K-means 暴力搜索并行进程数（默认 8）")
     args = ap.parse_args()
+
+    # 在扫描（以及 --regen-steps 可能引发的重生成）之前拒绝无效语言。
+    excluded_languages = parse_languages(args.exclude_lang)
+    invalid_languages = excluded_languages - set(LANG_ORDER)
+    if invalid_languages:
+        ap.error(
+            "--exclude-lang 包含不支持的语言: "
+            f"{', '.join(sorted(invalid_languages))}；"
+            f"可选值: {', '.join(LANG_ORDER)}"
+        )
+    if args.exclude_lang and not excluded_languages:
+        ap.error(
+            "--exclude-lang 不能为空；"
+            f"可选值: {', '.join(LANG_ORDER)}"
+        )
 
     here = pathlib.Path(__file__).resolve().parent
     trials_dir = pathlib.Path(args.trials_dir)
@@ -803,9 +838,27 @@ def main():
         return 1
 
     if args.only_lang:
-        steps = [s for s in steps if s["lang"] == args.only_lang]
+        wanted_lang = args.only_lang.casefold()
+        steps = [s for s in steps if str(s["lang"]).casefold() == wanted_lang]
         if not steps:
             print(f"❌ 没有语言为 {args.only_lang} 的 step")
+            return 1
+
+    if excluded_languages:
+        before_steps = len(steps)
+        before_trials = {s["trial"] for s in steps}
+        steps = [
+            s for s in steps
+            if str(s["lang"]).casefold() not in excluded_languages
+        ]
+        removed_trials = before_trials - {s["trial"] for s in steps}
+        excluded_display = ", ".join(sorted(excluded_languages))
+        print(
+            f"  语言过滤          排除 {excluded_display}："
+            f"{len(removed_trials)} benchmarks / {before_steps - len(steps)} steps"
+        )
+        if not steps:
+            print(f"❌ 排除语言 {excluded_display} 后没有剩余 step")
             return 1
 
     # 语言分布
@@ -837,6 +890,8 @@ def main():
         "lang_counts": lang_counts,
         "program_counts": prog_counts,
     }
+    if excluded_languages:
+        result["excluded_languages"] = sorted(excluded_languages)
 
     # 用于构建 steps sheet 的 cluster ID 映射
     trial_cid_map = {}

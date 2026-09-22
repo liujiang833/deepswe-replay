@@ -617,6 +617,79 @@ def write_excel(xlsx_dir, trial_rows, lang_rows, tool_rows, all_rows, step_rows)
     """
     import openpyxl
 
+def merge_consecutive_program_rows(rows):
+    """合并 per-tool-type 表中连续同 program 的行。
+
+    合并后：
+    - cluster_id: python#C5 + python#C6 → python#C5_C6
+    - n_steps / wall_s / cycles: 求和
+    - pct_cycles: 重新计算
+    - Retiring/BadSpec/FE/BE: cycles 加权平均
+    - max_spread: 取最大
+    - trials: 取并集
+    - rep_cmd / rep_trial / rep_step: 取 wall_s 最大的那行
+    """
+    if not rows:
+        return rows
+    merged = []
+    i = 0
+    while i < len(rows):
+        group = [rows[i]]
+        j = i + 1
+        while j < len(rows) and rows[j].get("program") == rows[i].get("program"):
+            group.append(rows[j])
+            j += 1
+        if len(group) == 1:
+            merged.append(group[0])
+        else:
+            total_cyc = sum(r["cycles"] for r in group)
+            total_wall = sum(r["wall_s"] for r in group)
+            total_steps = sum(r["n_steps"] for r in group)
+            # cycles 加权四象限
+            ret_w = sum(r["Retiring"] * r["cycles"] for r in group)
+            bad_w = sum(r["BadSpec"] * r["cycles"] for r in group)
+            fe_w = sum(r["FrontendBound"] * r["cycles"] for r in group)
+            be_w = sum(r["BackendBound"] * r["cycles"] for r in group)
+            # cluster_id 合并
+            cids = []
+            for r in group:
+                cid = r["cluster_id"]
+                # 提取 C{n} 部分
+                cnum = cid.rsplit("#C", 1)[-1] if "#C" in cid else cid
+                cids.append(cnum)
+            merged_cid = f"{group[0]['program']}#C{'_C'.join(cids)}"
+            # trials 并集
+            all_trials = set()
+            for r in group:
+                all_trials.update(r.get("trials", []))
+            # 代表 step：取 wall_s 最大的
+            best = max(group, key=lambda r: r["wall_s"])
+            merged.append({
+                "cluster_id": merged_cid,
+                "scope": group[0]["scope"],
+                "trial": "",
+                "lang": "",
+                "program": group[0]["program"],
+                "cluster": merged_cid,
+                "n_steps": total_steps,
+                "wall_s": round(total_wall, 2),
+                "cycles": int(total_cyc),
+                "pct_cycles": round(100.0 * total_cyc / total_cyc, 1),  # 占自身组的比例
+                "Retiring": round(ret_w / total_cyc, 2) if total_cyc else 0,
+                "BadSpec": round(bad_w / total_cyc, 2) if total_cyc else 0,
+                "FrontendBound": round(fe_w / total_cyc, 2) if total_cyc else 0,
+                "BackendBound": round(be_w / total_cyc, 2) if total_cyc else 0,
+                "max_spread": max(r["max_spread"] for r in group),
+                "trials": sorted(all_trials),
+                "n_trials": len(all_trials),
+                "rep_cmd": best["rep_cmd"],
+                "rep_trial": best["rep_trial"],
+                "rep_step": best["rep_step"],
+            })
+        i = j
+    return merged
+
+
 def write_cluster_excel(xlsx_dir, fname, rows):
     """写单个 cluster Excel 文件（带累计 wall_s 着色）。"""
     import openpyxl
@@ -808,6 +881,10 @@ def main():
         result["per_tool_type"] = tool_clusters
         tool_rows.sort(key=lambda r: r["wall_s"], reverse=True)
         write_cluster_excel(xlsx_dir, "per_tool_type.xlsx", tool_rows)
+
+        # 合并连续同 program 的行，写合并版
+        merged_tool_rows = merge_consecutive_program_rows(tool_rows)
+        write_cluster_excel(xlsx_dir, "per_tool_type_merged.xlsx", merged_tool_rows)
 
     # ── Level 1: all-trials ──
     all_rows = []

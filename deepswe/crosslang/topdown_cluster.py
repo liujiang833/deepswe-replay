@@ -725,6 +725,51 @@ def write_steps_excel(xlsx_dir, rows):
     print(f"  Excel  {p}")
 
 
+def write_tool_summary(xlsx_dir, steps):
+    """写工具(program)汇总表到 xlsx_dir/tool_summary.xlsx。"""
+    import openpyxl
+    xlsx_dir = pathlib.Path(xlsx_dir)
+    xlsx_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = {}
+    for s in steps:
+        prog = s.get("program", "unknown")
+        d = stats.setdefault(prog, {"count": 0, "wall_s": 0.0, "cycles": 0,
+                                     "sleep_s": 0.0, "langs": set()})
+        d["count"] += 1
+        d["wall_s"] += s.get("wall_s", 0)
+        d["cycles"] += s.get("cycles", 0)
+        d["sleep_s"] += s.get("sleep_s", 0)
+        d["langs"].add(s.get("lang", "unknown"))
+
+    rows = []
+    for prog, d in stats.items():
+        rows.append({
+            "program": prog,
+            "count": d["count"],
+            "total_wall_s": round(d["wall_s"], 2),
+            "avg_wall_s": round(d["wall_s"] / d["count"], 4) if d["count"] else 0,
+            "total_sleep_s": round(d["sleep_s"], 2),
+            "total_cycles": int(d["cycles"]),
+            "avg_cycles": int(d["cycles"] / d["count"]) if d["count"] else 0,
+            "n_langs": len(d["langs"]),
+            "langs": ", ".join(sorted(d["langs"])),
+        })
+    rows.sort(key=lambda r: r["total_wall_s"], reverse=True)
+
+    headers = ["program", "count", "total_wall_s", "avg_wall_s",
+               "total_sleep_s", "total_cycles", "avg_cycles", "n_langs", "langs"]
+    keys = list(headers)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "tool_summary"
+    _write_sheet(ws, headers, keys, rows, mark_cumul=False)
+    p = xlsx_dir / "tool_summary.xlsx"
+    wb.save(str(p))
+    print(f"  Excel  {p}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="扫描 topdown_out 下所有 trial 的 topdown_steps.json，三级聚类")
@@ -802,6 +847,9 @@ def main():
     # ── Excel 输出目录 ──
     xlsx_dir = pathlib.Path(args.xlsx_dir) if args.xlsx_dir \
         else pathlib.Path(args.topdown_out) / "clusters"
+
+    # ── 工具汇总表（独立于聚类级别，总是输出）──
+    write_tool_summary(xlsx_dir, steps)
 
     # ── Level 1: per-trial ──
     trial_rows = []

@@ -59,11 +59,11 @@
 (Retiring, BadSpec, FrontendBound, BackendBound)
 ```
 
-聚类中心为各成员按 `cycles` 加权得到的质心。代表 step 原则上取与该质心 L∞ 距离最小的成员，即：
+聚类中心为各成员按 `cycles` 加权得到的质心。代表 step 取与该质心 L2 欧式距离最小的成员，即：
 
 ```text
 distance(step, centroid)
-  = max(|Ret-Ret_c|, |Bad-Bad_c|, |FE-FE_c|, |BE-BE_c|)
+  = sqrt((Ret-Ret_c)^2 + (Bad-Bad_c)^2 + (FE-FE_c)^2 + (BE-BE_c)^2)
 ```
 
 因此，若 Excel 中已有可信的 `rep_trial` 和 `rep_step`，直接采用二者指向的 step；不要另行选择耗时最大或 cycles 最大的单条命令代替。
@@ -135,12 +135,12 @@ wall_s DESC, cycles DESC, cluster_id ASC
 条件允许时，对代表负载至少重复运行 3 次，并比较其 Top-Down 四维向量与所属聚类中心：
 
 ```text
-replay_distance = max(|replay[d] - cluster_center[d]|)
+replay_distance = sqrt(sum((replay[d] - cluster_center[d])^2))
 ```
 
 建议验收条件：
 
-- `replay_distance` 不超过原聚类阈值；
+- `replay_distance` 不超过原聚类成员的最大 L2 半径（可预留测量误差容限）；
 - 三次运行的关键指标没有明显漂移；
 - 命令序列、退出状态和主要输出结构与原始记录一致；
 - 代表负载可在目标环境中独立重放。
@@ -154,7 +154,7 @@ replay_distance = max(|replay[d] - cluster_center[d]|)
 - 若把 Excel 每一行视为最终聚类单元，可直接使用该行的 `rep_trial + rep_step`；
 - 若要求“每个原始 clustering 选一个负载”，应拆回 `C1`、`C2`，从未合并的 per-tool 聚类表分别选择，不能让合并行只产生一个负载。
 
-当前生成逻辑下，合并行的代表样本可能来自合并前 `wall_s` 最大的子聚类，而不是对合并后全部成员重新计算得到的质心代表。因此，若合并行将被当作一个新的统计聚类，建议重新基于全部成员计算 cycles 加权质心和最近样本。
+当前生成逻辑会基于合并后的全部成员重新计算 cycles 加权质心，并选择 L2 距离最小的成员作为合并行代表。仍应保留合并前后的 cluster ID 映射，避免将合并行误认为原始 K-means 直接产生的单一聚类。
 
 ## 7. 输出要求
 

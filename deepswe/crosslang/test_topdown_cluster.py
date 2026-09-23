@@ -98,5 +98,61 @@ class LanguageFilterTest(unittest.TestCase):
             self.assertEqual(len(tool_rows), 2)
 
 
+class RepresentativeSelectionTest(unittest.TestCase):
+    @staticmethod
+    def _member(name, vec, wall_s=1.0):
+        return {
+            "trial": name,
+            "lang": "test",
+            "step": 1,
+            "cycles": 1,
+            "wall_s": wall_s,
+            "vec": vec,
+            "commands": [f"echo {name}"],
+        }
+
+    def test_representative_uses_l2_distance_to_weighted_centroid(self):
+        # 质心为 (0.25, 0.25, 0.25, 0.25)。A 的 L2 距离小于 B，
+        # 但 L∞ 距离大于 B；因此这个样例可以防止实现退回旧的 L∞ 口径。
+        points = [
+            ("A", (0.45, 0.25, 0.25, 0.05)),
+            ("B", (0.40, 0.40, 0.10, 0.10)),
+            ("A-opposite", (0.05, 0.25, 0.25, 0.45)),
+            ("B-opposite", (0.10, 0.10, 0.40, 0.40)),
+        ]
+        members = [self._member(name, vec) for name, vec in points]
+        cluster = {
+            "members": members,
+            "vecs": [m["vec"] for m in members],
+            "cycles": 4,
+            "wall_s": 4.0,
+        }
+
+        summary = tc.summarize_cluster(cluster, total_cyc=4, ci=1)
+
+        self.assertEqual(summary["rep_trial"], "A")
+        self.assertEqual(summary["rep_step"], 1)
+
+    def test_merged_row_recomputes_l2_representative_from_all_members(self):
+        a = self._member("A", (0.45, 0.25, 0.25, 0.05))
+        a_opposite = self._member("A-opposite", (0.05, 0.25, 0.25, 0.45))
+        # B 子簇故意给更大的 wall_s：旧逻辑会直接继承它的代表 B。
+        b = self._member("B", (0.40, 0.40, 0.10, 0.10), wall_s=5.0)
+        b_opposite = self._member("B-opposite", (0.10, 0.10, 0.40, 0.40), wall_s=5.0)
+        clusters = [
+            {"members": [a, a_opposite], "vecs": [a["vec"], a_opposite["vec"]],
+             "cycles": 2, "wall_s": 2.0},
+            {"members": [b, b_opposite], "vecs": [b["vec"], b_opposite["vec"]],
+             "cycles": 2, "wall_s": 10.0},
+        ]
+        rows = tc.cluster_to_rows(
+            clusters, total_cyc=4, scope="per-tool-type", program="test-tool")
+
+        merged = tc.merge_consecutive_program_rows(rows)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["rep_trial"], "A")
+
+
 if __name__ == "__main__":
     unittest.main()

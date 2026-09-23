@@ -8,8 +8,9 @@
   L2  per-tool-type: 同 program（git/grep/go test/…）的 step 合并后聚类
   L1  all-trials   : 全部 step 合并后聚类
 
-聚类方法：L∞ 贪心——按 cycles 降序处理，尝试加入已有 cluster
-（加入后该 cluster 内任意两点的任意单维差 < 阈值），不行就新建。
+聚类方法：标准 K-means（L2 欧式距离）。通过二分搜索寻找满足以下条件的最小 k：
+每个 cluster 内任意两点的任意单维差均小于阈值。代表 step 取距离
+cycles 加权质心最近的成员，距离同样使用 L2。
 
 输出：
   - stdout 表格
@@ -454,9 +455,10 @@ def summarize_cluster(cl, total_cyc, ci):
         spread = max(vals) - min(vals)
         if spread > max_spread:
             max_spread = spread
-    # 代表 step：离 cycles 加权 centroid 最近（L∞）的那条
-    rep = min(cl["members"], key=lambda m: max(
-        abs(m["vec"][d] - centroid[d]) for d in range(4)))
+    # 代表 step：离 cycles 加权 centroid 最近（L2 欧式距离）的那条。
+    # argmin 下无需开平方，比较平方欧式距离结果完全相同。
+    rep = min(cl["members"], key=lambda m: sum(
+        (m["vec"][d] - centroid[d]) ** 2 for d in range(4)))
     head_cmd = ""
     for cmd_str in rep.get("commands", []):
         if cmd_str:
@@ -526,6 +528,8 @@ def cluster_to_rows(clusters, total_cyc, scope, trial="", lang="", program=""):
         s["lang"] = lang
         s["program"] = program
         s["n_trials"] = len(s.get("trials", []))
+        # 仅供后续生成 merged 表时重新计算跨子簇质心和 L2 代表点；Excel 不导出此键。
+        s["_members"] = cl["members"]
         rows.append(s)
     return rows
 
@@ -641,9 +645,9 @@ def merge_consecutive_program_rows(rows):
     - n_steps / wall_s / cycles: 求和
     - pct_cycles: 重新计算
     - Retiring/BadSpec/FE/BE: cycles 加权平均
-    - max_spread: 取最大
+    - max_spread: 基于合并后的全部成员重新计算
     - trials: 取并集
-    - rep_cmd / rep_trial / rep_step: 取 wall_s 最大的那行
+    - rep_cmd / rep_trial / rep_step: 取距离合并后 cycles 加权质心最近的成员（L2）
     """
     if not rows:
         return rows
@@ -678,8 +682,17 @@ def merge_consecutive_program_rows(rows):
             all_trials = set()
             for r in group:
                 all_trials.update(r.get("trials", []))
-            # 代表 step：取 wall_s 最大的
-            best = max(group, key=lambda r: r["wall_s"])
+            # 合并行不是简单继承某个子簇的代表点：基于全部原始成员重新计算
+            # cycles 加权质心，并按与普通 cluster 相同的 L2 口径选代表点。
+            members = [m for r in group for m in r.get("_members", [])]
+            if not members:
+                raise ValueError("合并 per-tool cluster 时缺少原始成员，无法按 L2 重算代表点")
+            merged_summary = summarize_cluster({
+                "members": members,
+                "vecs": [m["vec"] for m in members],
+                "cycles": total_cyc,
+                "wall_s": total_wall,
+            }, total_cyc, 1)
             merged.append({
                 "cluster_id": merged_cid,
                 "scope": group[0]["scope"],
@@ -695,12 +708,12 @@ def merge_consecutive_program_rows(rows):
                 "BadSpec": round(bad_w / total_cyc, 2) if total_cyc else 0,
                 "FrontendBound": round(fe_w / total_cyc, 2) if total_cyc else 0,
                 "BackendBound": round(be_w / total_cyc, 2) if total_cyc else 0,
-                "max_spread": max(r["max_spread"] for r in group),
+                "max_spread": merged_summary["max_spread"],
                 "trials": sorted(all_trials),
                 "n_trials": len(all_trials),
-                "rep_cmd": best["rep_cmd"],
-                "rep_trial": best["rep_trial"],
-                "rep_step": best["rep_step"],
+                "rep_cmd": merged_summary["rep_cmd"],
+                "rep_trial": merged_summary["rep_trial"],
+                "rep_step": merged_summary["rep_step"],
             })
         i = j
     return merged
@@ -785,10 +798,10 @@ def write_tool_summary(xlsx_dir, steps):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="扫描 topdown_out 下所有 trial 的 topdown_steps.json，三级聚类")
+        description="扫描 topdown_out 下所有 trial 的 topdown_steps.json，四级 K-means 聚类")
     ap.add_argument("topdown_out", help="topdown_out 目录（含 <trial>/topdown/topdown_steps.json）")
     ap.add_argument("--threshold", type=float, default=CLUSTER_THRESHOLD_DEFAULT,
-                    help=f"L∞ 聚类阈值（默认 {CLUSTER_THRESHOLD_DEFAULT} = 10%%）")
+                    help=f"簇内最大单维跨度阈值（默认 {CLUSTER_THRESHOLD_DEFAULT:.2f} = 5%%）")
     ap.add_argument("--level", choices=("trial", "language", "tool", "all", "all-full"), default="all-full",
                     help="只做某一级（默认 all-full = 四级全做）")
     ap.add_argument("--json-out", default="", help="机读结果落盘路径")
@@ -871,7 +884,7 @@ def main():
         prog_counts[s["program"]] = prog_counts.get(s["program"], 0) + 1
 
     print("=" * 78)
-    print(f" topdown 向量聚类（L∞ 阈值 {args.threshold*100:.0f}%）")
+    print(f" topdown 向量聚类（K-means / L2，最大单维跨度 {args.threshold*100:.0f}%）")
     print(f" 数据来源   {args.topdown_out}")
     print(f" step 总数   {len(steps)}")
     print(f" 语言分布   {lang_counts}")

@@ -197,20 +197,22 @@ bash topdown_trial.sh full_trials/<trial> --per-step --no-metrics
 
 每条 trial 产出 `<out>/<trial>/topdown/topdown_steps.json`，含每个 step 的四象限向量。
 
-### 7.3 三级聚类分析
+### 7.3 四级聚类分析
 
-收集完 per-step 数据后，用 `topdown_cluster.py` 做三级聚类：
+收集完 per-step 数据后，用 `topdown_cluster.py` 做四级聚类：
 
-- **Level 1 per-trial**：每个 trial 内部独立聚类
-- **Level 2 per-language**：同语言的 step 合并后聚类
-- **Level 3 all-trials**：全部 step 合并后聚类
+- **per-trial**：每个 trial 内部独立聚类
+- **per-language**：同语言的 step 合并后聚类
+- **per-tool-type**：同 program 的 step 合并后聚类
+- **all-trials**：全部 step 合并后聚类
 
-聚类方法：L∞ 贪心——每个 step 的四象限 `(Ret, Bad, FE, BE)` 作为 4 维向量，
-按 cycles 降序处理，尝试加入已有 cluster（加入后任意两点任意单维差 < 阈值），
-不行就新建，自然找到最少的 cluster 数。
+聚类方法：每个 step 的四象限 `(Ret, Bad, FE, BE)` 作为 4 维向量，使用标准
+K-means 和 L2 欧式距离进行聚类。程序通过二分搜索寻找满足“每个 cluster 内任意
+两点的任意单维差小于阈值”的最小 k；代表 step 取到 cycles 加权质心 L2 距离
+最小的成员。
 
 ```bash
-# 三级全做（默认阈值 10%）
+# 四级全做（默认最大单维跨度阈值 5%）
 python3 topdown_cluster.py <out_dir>/
 
 # 收紧阈值
@@ -477,7 +479,7 @@ summarize_replay.py  命令分类器（cmd_stats.py 要 import 它）
 topdown_trial.sh   单条 trial 的 ARM topdown 采集（perf stat -a -G，支持 --per-step）
 topdown_parse.py   把 perf stat 输出算成 ARM L1 topdown 四象限 + 自检
 topdown_steps.py   per-step topdown：解析 perf stat -I interval，按 step 归并
-topdown_cluster.py 三级聚类（per-trial / per-language / all-trials），L∞ 贪心
+topdown_cluster.py 四级聚类（per-trial / per-language / per-tool-type / all-trials），K-means / L2
 topdown.conf       PMU 事件号 + SLOTS 配置
 probe_pmu.sh       PMU 可用性探测（采 topdown 之前先跑）
 ```

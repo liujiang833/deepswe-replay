@@ -47,6 +47,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -55,6 +56,25 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 LANG_ORDER = ["python", "go", "rust", "typescript", "javascript"]
+
+
+def write_run_cmd(out, argv=None):
+    """把本轮的可复现命令写到输出目录。
+
+    优先使用 sys.orig_argv，保留实际使用的 Python 解释器和脚本写法；老版本
+    Python 没有它时再退回 sys.executable + sys.argv。argv 参数只供测试使用。
+    """
+    if argv is None:
+        argv = getattr(sys, "orig_argv", None) or [sys.executable, *sys.argv]
+    generated = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cmd_path = pathlib.Path(out) / "run_cmd.txt"
+    cmd_path.write_text(
+        f"# command: {shlex.join([str(x) for x in argv])}\n"
+        f"# cwd: {pathlib.Path.cwd()}\n"
+        f"# generated_utc: {generated}\n",
+        encoding="utf-8",
+    )
+    return cmd_path
 
 # topdown_parse.py 的自检键 → 报告里那一列的短标签。
 # 「是哪一条红了」必须出现在汇总表里，不能只打一个 ❌：C1 红了是「SLOTS 偏小 / 事件号错」，
@@ -935,7 +955,9 @@ def main():
     out = pathlib.Path(args.outdir) if args.outdir else (HERE / "runs" / stamp)
     out.mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(exist_ok=True)
-    print(f"输出      {out}\n")
+    cmd_path = write_run_cmd(out)
+    print(f"输出      {out}")
+    print(f"复现命令  {cmd_path}\n")
 
     if jobs > 1:
         print(f"并发 {jobs} 条：N 条的实时输出会交错成乱码，所以不再流到屏幕，")

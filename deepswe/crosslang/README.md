@@ -143,6 +143,7 @@ python3 ../replay.py full_trials/<trial> full_trials/<trial>/task.json -o /tmp/o
 |---|---|
 | `SUMMARY.md` | 人看的汇总 |
 | `summary.json` | 机器读的汇总 |
+| `run_cmd.txt` | 本轮实际运行命令、工作目录和记录时间，便于复现 |
 | `logs/<trial>.log` | 逐条实时输出，跑的过程中就能 `tail -f` |
 | `<trial>/verdict.json` | 单条判定 |
 | `<trial>/commands.jsonl` | per-command 指标 |

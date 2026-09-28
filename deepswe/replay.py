@@ -18,8 +18,8 @@
   - 本机 5.15 内核没有 memory.peak（6.8 才有），改用后台线程轮询 memory.current，
     取单条命令执行窗口内的最大值作为 mem_peak。
   - 单命令超时交给**容器内**的 timeout 执行（timeout -k 5 <T>），宿主侧只留一个
-    远高于 T 的兜底值防 docker exec 本身挂死。默认 T=30s，对齐原 harness
-    （trace 里的 observation 明写 "timed out after 30 seconds"）。
+    远高于 T 的兜底值防 docker exec 本身挂死。无显式时限时 T=30s；agent 命令
+    自带更长的 timeout 时按该时限延长外层限制，避免提前截断测试。
 
 保真度口径（v3，两处对齐原 harness）：
   - **执行器 `/bin/sh -c`（dash），不是 `bash -lc`**。证据是 trace 侧的 observation：
@@ -70,18 +70,85 @@
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import threading
 import time
 from datetime import datetime
 
 MEM_POLL_S = 0.02      # memory.current 轮询间隔
-OUTER_SLACK_S = 60     # 宿主侧兜底超时 = --cmd-timeout + 该值（正常绝不触发）
+OUTER_SLACK_S = 60     # 宿主侧兜底超时 = 本条命令时限 + 该值（正常绝不触发）
+INNER_TIMEOUT_GRACE_S = 10  # agent 命令里的 timeout 结束后，留给管道和收尾命令
 SINK_PORT = 3128       # sinkhole 代理监听端口（容器 netns 内的 127.0.0.1）
 CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
+
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_-]*)\1")
+DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)([smhd]?)")
+DURATION_MULTIPLIER = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def command_timeout_s(command, default_s):
+    """为命令里的 GNU timeout / go test -timeout 留够时间。
+
+    多个 timeout 可能顺序执行，因此累加时限。这里只分析命令文本，不执行任何内容。
+    here-doc 的正文是写入文件的数据，不是当前 shell 要执行的命令。
+    """
+    lines, pending = [], []
+    for line in command.splitlines(keepends=True):
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        lines.append(line)
+        pending.extend(m.group(2) for m in HEREDOC_RE.finditer(line))
+    try:
+        tokens = shlex.split("".join(lines), comments=True)
+    except ValueError:
+        return default_s  # 无法可靠解析的命令仍按调用方指定的默认时限执行
+
+    durations = []
+    go_test_durations = []
+    for i, token in enumerate(tokens):
+        if token == "go" and i + 1 < len(tokens) and tokens[i + 1] == "test":
+            for j, arg in enumerate(tokens[i + 2:], i + 2):
+                if arg in (";", "&&", "||", "|", "&"):
+                    break
+                value = tokens[j + 1] if arg == "-timeout" and j + 1 < len(tokens) else \
+                    arg[len("-timeout="):] if arg.startswith("-timeout=") else ""
+                match = DURATION_RE.fullmatch(value)
+                if match:
+                    go_test_durations.append(float(match.group(1)) * DURATION_MULTIPLIER[match.group(2)])
+        if token not in ("timeout", "/usr/bin/timeout", "/bin/timeout"):
+            continue
+        j = i + 1
+        while j < len(tokens):
+            option = tokens[j]
+            if option == "--":
+                j += 1
+                break
+            if option in ("-k", "--kill-after", "-s", "--signal"):
+                j += 2
+            elif option in ("--foreground", "--preserve-status", "-v", "--verbose") or \
+                    option.startswith(("--kill-after=", "--signal=", "-k", "-s")):
+                j += 1
+            else:
+                break
+        if j >= len(tokens):
+            continue
+        match = DURATION_RE.fullmatch(tokens[j])
+        if match:
+            durations.append(float(match.group(1)) * DURATION_MULTIPLIER[match.group(2)])
+    if not durations and not go_test_durations:
+        return default_s
+    # 两种超时可能分属顺序执行的命令；保守地累加，避免外层提前截断。
+    explicit_s = sum(durations) + sum(go_test_durations)
+    if explicit_s <= default_s:
+        return default_s
+    return math.ceil(explicit_s + INNER_TIMEOUT_GRACE_S)
 
 # 单条 trial 内部的进度节奏。并发跑时 stdout 不再刷屏，logs/<trial>.log 是唯一的
 # 观察通道，这两个值决定了 `tail -f` 到底能看见多少。
@@ -477,7 +544,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 条命令（冒烟用）")
     ap.add_argument("--keep", action="store_true", help="结束后保留容器")
     ap.add_argument("--cmd-timeout", type=int, default=30,
-                    help="单条命令在容器内的超时秒数，默认 30（对齐原 harness）")
+                    help="单条命令在容器内的默认超时秒数，默认 30；命令自带更长的 timeout 时自动延长")
     ap.add_argument("--interpreter", default="/bin/sh -c",
                     help="执行器 argv（空格分隔），默认 '/bin/sh -c'（dash，对齐原 harness）；"
                          "旧口径是 'bash -lc'")
@@ -495,6 +562,8 @@ def main():
                          "去掉「必须 cgroup v2 且宿主侧目录可读」这条硬约束，"
                          "rootless / 受限环境也能跑。patch_identical 与 rc 比对不受影响")
     args = ap.parse_args()
+    if args.cmd_timeout <= 0:
+        ap.error("--cmd-timeout 必须大于 0")
     interp = args.interpreter.split()
     if not interp:
         ap.error("--interpreter 不能为空")
@@ -536,7 +605,8 @@ def main():
           f"{'on' if allow_net else ('none+403-sinkhole' if use_sink else 'none')}")
     print(f"exec      {' '.join(interp)}")
     print(f"commands  {n_all} 条，跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
-    print(f"timeout   容器内 timeout -k 5 {args.cmd_timeout}（宿主兜底 {args.cmd_timeout + OUTER_SLACK_S}s）")
+    print(f"timeout   默认 {args.cmd_timeout}s；命令显式 timeout 更长时自动延长"
+          f"（宿主兜底另加 {OUTER_SLACK_S}s）")
     print(f"container {name}")
 
     # 镜像必须已在本地：默认不允许 docker run 顺手去 pull
@@ -675,6 +745,7 @@ def main():
         ticker.start()
         for i, it in todo:
             cmd = it["cmd"]
+            cmd_timeout = command_timeout_s(cmd, args.cmd_timeout)
             # 先算好摘要：进度行和 ticker 的静默行引用的是同一个字符串，
             # 两边长得一样，看日志时才对得上是同一条命令。
             head = strip_cd(cmd)[:88].splitlines()
@@ -687,8 +758,8 @@ def main():
             try:
                 p = subprocess.run(
                     ["docker", "exec", "-w", "/app", name,
-                     "timeout", "-k", "5", str(args.cmd_timeout)] + interp + [cmd],
-                    capture_output=True, timeout=args.cmd_timeout + OUTER_SLACK_S)
+                     "timeout", "-k", "5", str(cmd_timeout)] + interp + [cmd],
+                    capture_output=True, timeout=cmd_timeout + OUTER_SLACK_S)
                 rc, so, se, outer = p.returncode, p.stdout, p.stderr, False
             except subprocess.TimeoutExpired as e:
                 rc, so, se, outer = -9, (e.stdout or b""), (e.stderr or b""), True
@@ -707,6 +778,7 @@ def main():
             timed_out = rc in (124, 137)
 
             rec = {"i": i, "step": it.get("step"), "rc": rc, "timed_out": timed_out, "trace_rc": it["trace_rc"],
+                   "cmd_timeout_s": cmd_timeout,
                    "wall_s": round(dt, 4), "abs_start_s": round(t0 - t_start, 4), "outer_timeout": outer,
                    "stdout_bytes": len(so), "stderr_bytes": len(se),
                    "user_usec": d("user_usec"), "system_usec": d("system_usec"),
@@ -736,6 +808,7 @@ def main():
         orig_p = tdir / "model.patch"
         verdict = {"elapsed_s": round(elapsed, 1),
                    "cmd_timeout_s": args.cmd_timeout,
+                   "cmd_timeout_policy": "default_with_explicit_command_timeout",
                    "interpreter": interp,
                    "net_mode": "internet" if allow_net else ("sinkhole403" if use_sink else "none"),
                    "n_cmds_trace": n_all, "n_skipped_sentinel": n_skipped,

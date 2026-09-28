@@ -671,7 +671,7 @@ def main():
                     help="每条只跑前 N 条命令。注意：这会跳过 patch 保真度校验（patch 不完整），"
                          "只用来确认容器能起、cgroup 能读、命令能执行")
     ap.add_argument("--cmd-timeout", type=int, default=30,
-                    help="单条命令超时秒数，默认 30（对齐原 harness，改了就无法与基线对比）")
+                    help="单条命令默认超时秒数，默认 30；命令自带更长 timeout 时自动延长")
     ap.add_argument("-j", "--jobs", default="1", metavar="N",
                     help="并发跑几条，默认 1（串行，与加本选项前完全一致，含实时输出）。"
                          "auto = 按本机 CPU 与可用内存自动定。不设上限：并发高只是变慢或撞 OOM，"
@@ -714,6 +714,8 @@ def main():
                          "并发下「停」= 不再调度新的，已在跑的让它跑完")
     ap.add_argument("--replay", default="", help="replay.py 路径（默认自动定位）")
     args = ap.parse_args()
+    if args.cmd_timeout <= 0:
+        ap.error("--cmd-timeout 必须大于 0")
 
     # --metrics 与 --no-metrics 同时给 = 自相矛盾。不静默挑一个：挑错了的后果是
     # 整批要么白跑（v1 上起不来），要么采了一批没人要的 cgroup 数，都得重来。
@@ -1291,7 +1293,8 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None,
     md = ["# 重放批次汇总", "",
           f"- 时间（UTC）：{datetime.datetime.now(datetime.timezone.utc).isoformat()}",
           f"- 主机：{os.uname().release} / {os.cpu_count()} CPU / cgroup {fstype}",
-          f"- 单命令超时：{args.cmd_timeout}s" + ("（冒烟模式）" if smoke else ""),
+          f"- 单命令默认超时：{args.cmd_timeout}s；显式 timeout 更长时按命令延长"
+          + ("（冒烟模式）" if smoke else ""),
           f"- 并发：{jobs}" + ("（串行，性能数字可比）" if jobs == 1
                               else "（并发，未采指标；墙钟不可与串行批次直接比）"),
           f"- 结果：**{n_ok}/{len(results)} 通过**，总墙钟 {elapsed:.0f}s"]

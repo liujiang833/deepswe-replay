@@ -589,8 +589,10 @@ docker rm -f $(docker ps -aq --filter name=^replay_)
 
 ### 6.5 某条卡住不动
 
-`logs/<trial>.log` 是实时写的，`tail -f` 看。单条命令最长 30s（容器内 `timeout -k 5 30`），
-宿主侧还有 90s 兜底，正常不会真卡死。rust 那条基线里 agent 自己有大量 `sleep 25~29`
+`logs/<trial>.log` 是实时写的，`tail -f` 看。单条命令默认最长 30s；若命令里显式写了
+更长的 GNU `timeout` 或 `go test -timeout`，重放器会按其时限加 10s 收尾时间设置外层限制。
+多个顺序执行的 `timeout` 会累加。宿主侧另加
+60s 兜底，正常不会真卡死。rust 那条基线里 agent 自己有大量 `sleep 25~29`
 在等后台编译，看着像卡住但是正常的。
 
 **注意这一节说的是「重放」卡住。「构建」卡住是另一回事**——`pnpm install` / `npm install`

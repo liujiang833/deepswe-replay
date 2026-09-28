@@ -38,6 +38,17 @@ echo "=============================================================="
 echo
 echo "── 0. 本机 ──────────────────────────────────────────"
 ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64)
+    HOST_DOCKER_ARCH=amd64
+    BASE_CANDIDATES=(mars-base:amd64 mars-base:x86_64 mars-base:latest public.ecr.aws/x8v8d7g8/mars-base:latest) ;;
+  aarch64|arm64)
+    HOST_DOCKER_ARCH=arm64
+    BASE_CANDIDATES=(mars-base:arm64 mars-base:aarch64 mars-base:latest public.ecr.aws/x8v8d7g8/mars-base:latest) ;;
+  *)
+    HOST_DOCKER_ARCH=""
+    BASE_CANDIDATES=() ;;
+esac
 echo "  架构        $ARCH"
 echo "  内核        $(uname -r)"
 if docker version >/dev/null 2>&1; then
@@ -46,20 +57,23 @@ else
   echo "  docker      ❌ 不可用"
 fi
 # 基座必须已在本地：它是 113 个 task 镜像的 FROM
-# 候选顺序与 build_arm.sh 保持一致，命中即停——否则两个脚本可能选到不同的基座
-for tag in mars-base:arm64 mars-base:latest public.ecr.aws/x8v8d7g8/mars-base:latest; do
-  if docker image inspect "$tag" >/dev/null 2>&1; then
-    a=$(docker image inspect "$tag" -f '{{.Architecture}}')
+# 候选顺序和实际架构检查都与 build_arm.sh 保持一致。
+for tag in "${BASE_CANDIDATES[@]}"; do
+  a=$(docker image inspect "$tag" -f '{{.Architecture}}' 2>/dev/null) || continue
+  if [ "$a" = "$HOST_DOCKER_ARCH" ]; then
     s=$(docker image inspect "$tag" -f '{{.Size}}')
     echo "  基座        ✅ $tag  ($a, $((s/1024/1024)) MB)"
     BASE_TAG="$tag"; BASE_ARCH="$a"
     break
   fi
 done
-[ -n "${BASE_TAG:-}" ] || echo "  基座        ❌ 本地没有 mars-base（重建 task 镜像的 FROM）"
-if [ -n "${BASE_ARCH:-}" ] && [ "$BASE_ARCH" = "arm64" ] && [ "$ARCH" != "aarch64" ]; then
-  echo "  ⚠️  基座是 arm64 但本机是 $ARCH —— 没有 qemu binfmt 就跑不起来"
-fi
+[ -n "${BASE_TAG:-}" ] || {
+  if [ -n "$HOST_DOCKER_ARCH" ]; then
+    echo "  基座        ❌ 本地没有 $HOST_DOCKER_ARCH 架构的 mars-base"
+  else
+    echo "  基座        ❌ 不支持自动选择基座：宿主机架构为 $ARCH"
+  fi
+}
 
 echo
 echo "── 1. github.com：113/113 都需要（git clone + 问默认分支）──"

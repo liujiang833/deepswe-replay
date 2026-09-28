@@ -71,6 +71,9 @@ bash build_arm.sh --trials-dir full_trials --list python      # 只看会怎么�
 bash build_arm.sh --trials-dir full_trials python             # 真建
 ```
 
+脚本会根据宿主机的 x86_64 或 aarch64 架构，选用本地对应架构的 `mars-base`；
+会核对镜像实际架构，`latest` 标签指向其他架构时不会误选。也可用 `--base <tag>` 显式指定。
+
 ⚠️ **`--trials-dir full_trials` 是仓库 clone 里的写法**（113 条在这个子目录）；
 解包后的 bundle 里 trial 平铺在包根目录，**去掉这个参数**（给了会报「--trials-dir 不是目录」）。
 

@@ -241,15 +241,34 @@ POLL=1
 # 打印时把 user:pass@ 抹掉——日志会被贴来贴去
 redact() { printf '%s' "$1" | sed -E 's#(//)[^/@]*@#\1***@#'; }
 
-# 自动挑本地基座
+# 自动挑与宿主机同架构的本地基座。latest/ECR 标签可能指向任一架构，
+# 所以即使标签命中，也必须检查镜像自身的 Architecture。
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
+  x86_64|amd64)
+    HOST_DOCKER_ARCH=amd64
+    BASE_CANDIDATES=(mars-base:amd64 mars-base:x86_64 mars-base:latest public.ecr.aws/x8v8d7g8/mars-base:latest) ;;
+  aarch64|arm64)
+    HOST_DOCKER_ARCH=arm64
+    BASE_CANDIDATES=(mars-base:arm64 mars-base:aarch64 mars-base:latest public.ecr.aws/x8v8d7g8/mars-base:latest) ;;
+  *)
+    HOST_DOCKER_ARCH=""
+    BASE_CANDIDATES=() ;;
+esac
 if [ -z "$BASE" ]; then
-  for t in mars-base:arm64 mars-base:latest public.ecr.aws/x8v8d7g8/mars-base:latest; do
-    docker image inspect "$t" >/dev/null 2>&1 && { BASE="$t"; break; }
+  for t in "${BASE_CANDIDATES[@]}"; do
+    arch=$(docker image inspect "$t" -f '{{.Architecture}}' 2>/dev/null) || continue
+    if [ "$arch" = "$HOST_DOCKER_ARCH" ]; then BASE="$t"; break; fi
   done
 fi
 if [ -z "$BASE" ] && [ "$LIST" = 0 ]; then
-  echo "❌ 本地找不到 mars-base（试过 mars-base:arm64 / mars-base:latest / ECR 全名）"
-  echo "   先 docker load 基座，或用 --base 指定 tag。"
+  if [ -z "$HOST_DOCKER_ARCH" ]; then
+    echo "❌ 不支持自动选择基座：宿主机架构为 $HOST_ARCH"
+    echo "   请用 --base 指定本地基座 tag。"
+  else
+    echo "❌ 本地找不到 $HOST_DOCKER_ARCH 架构的 mars-base（已检查架构专用 tag、latest 和 ECR 全名）"
+    echo "   先 docker load 对应架构的基座，或用 --base 指定 tag。"
+  fi
   exit 1
 fi
 BASE_ARCH=""
@@ -303,7 +322,7 @@ echo "=============================================================="
 echo " 从本地基座重建 task 镜像"
 echo "=============================================================="
 echo "  基座        ${BASE:-（未找到）}  ${BASE_ARCH:+($BASE_ARCH)}"
-echo "  本机架构    $(uname -m)"
+echo "  本机架构    $HOST_ARCH"
 if [ ${#SELECTED[@]} -le 6 ]; then
   echo "  待建        ${SELECTED[*]}"
 else

@@ -148,7 +148,7 @@ def main():
     L = []
     A = L.append
     A("# 跨语言容器重放验证（crosslang）\n")
-    A("`deepswe/replay.py` 按 agent trace 在长驻容器内串行重放命令，并以")
+    A("`crosslang/replay.py` 按 agent trace 在长驻容器内串行重放命令，并以")
     A("「容器内 `git diff --binary <base_commit_hash> HEAD` 与下载到的 `model.patch` 逐字节比对」")
     A("作为保真度硬校验。本目录把该流程从 1 条 python task 扩到 5 种语言各 1 条。\n")
 
@@ -256,10 +256,8 @@ def main():
     A("  `/root/.profile` 里没有 `cd`，相对路径命令不受影响。\n")
 
     A("## 已知风险\n")
-    A("- `replay.py` 启动时会 `docker rm -f <容器名>`，容器名由 trial 目录名推导")
-    A("  （`replay_<trial_name>`，截断到 60 字符）。**两个进程同时重放同一条 trial 会静默互杀**——")
-    A("  后启动的那个会把先启动的容器删掉，先启动的那条从此每条命令都失败。")
-    A("  批量化时必须保证同一 trial 只有一个重放进程。\n")
+    A("- 同一 trial 并发重放时，容器名包含 PID 和随机 salt；清理时按本次运行的 Docker label")
+    A("  核对归属。显式指定 `-o` 时，每轮实验仍须使用不同的输出目录。\n")
 
     A("## 命令构成差异（工具链关键词命中次数）\n")
     all_kw = []

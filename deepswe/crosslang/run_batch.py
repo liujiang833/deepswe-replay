@@ -47,6 +47,7 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import shlex
 import statistics
 import subprocess
@@ -965,7 +966,8 @@ def main():
         print("--dry-run：到此为止，未执行重放")
         return 0
 
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # 同一秒启动的两轮实验也必须写入不同目录，避免日志和 verdict 相互覆盖。
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
     out = pathlib.Path(args.outdir) if args.outdir else (HERE / "runs" / stamp)
     out.mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(exist_ok=True)

@@ -1,6 +1,6 @@
 # 跨语言容器重放验证（crosslang）
 
-`deepswe/replay.py` 按 agent trace 在长驻容器内串行重放命令，并以
+`crosslang/replay.py` 按 agent trace 在长驻容器内串行重放命令，并以
 「容器内 `git diff --binary <base_commit_hash> HEAD` 与下载到的 `model.patch` 逐字节比对」
 作为保真度硬校验。本目录把该流程从 1 条 python task 扩到 5 种语言各 1 条。
 
@@ -122,8 +122,8 @@ PATH(-lc) = /root/.bun/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/
   （`replay_<trial_name>`，截断到 60 字符）。**两个进程同时重放同一条 trial 会静默互杀**——
   后启动的那个会把先启动的容器删掉，先启动的那条从此每条命令都失败。
   批量化时必须保证同一 trial 只有一个重放进程。~~
-  **2026-09-07 已修**：容器名改为 `replay_<trial>_<pid>`，且启动前会检测同前缀的存量容器
-  并拒绝启动（`--force` 可越过）。同时不再无条件 `docker rm -f` 别的进程的容器。
+  **2026-09-28 更新**：`crosslang/replay.py` 的容器名改为 `replay_<trial>_<pid>_<salt>`。
+  同一 trial 可以并发重放；清理时核对本次运行的 label。并发实验应使用不同输出目录。
 
 - **本目录的汇总表是修正前口径**（`bash -lc` + `--network=none`），
   而各 trial 的 `replay/verdict.json` 是修正后的最终口径（`/bin/sh -c` + sinkhole403）。

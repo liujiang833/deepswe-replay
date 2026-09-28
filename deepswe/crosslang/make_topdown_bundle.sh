@@ -75,7 +75,7 @@ if [ -z "$TRIALS_DIR" ]; then
   SRC="$HERE/$TRIAL_NAME"
   [ -d "$SRC" ] || { echo "❌ trial 目录不存在: $SRC"; exit 1; }
 fi
-REPLAY="$HERE/../replay.py"
+REPLAY="$HERE/replay.py"
 [ -f "$REPLAY" ] || { echo "❌ 找不到 $REPLAY"; exit 1; }
 # 命令分类器：cmd_stats.py（run_batch 收尾自动调）要 import 它，仓库里和 replay.py 一样在上一层
 CLASSIFIER="$HERE/../summarize_replay.py"
@@ -86,7 +86,7 @@ trap 'rm -rf "$STAGE"' EXIT
 ROOT="$STAGE/deepswe-topdown-bundle"
 mkdir -p "$ROOT"
 
-# 顶层：replay.py 从上一层复制进来，复制后它和 trial 目录同级 ——
+# 顶层：replay.py 从本目录复制进来，复制后它和 trial 目录同级 ——
 # topdown_trial.sh 的 replay.py 定位逻辑（先 ./replay.py，再 ../replay.py）就是为这个布局写的。
 cp "$REPLAY" "$ROOT/"
 # summarize_replay.py 同理：平铺后 cmd_stats.py 先找同级的，再找上一层。

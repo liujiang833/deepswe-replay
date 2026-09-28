@@ -569,16 +569,13 @@ WSL 上实测过这个假阳性：`docker inspect .State.Pid` 给的是 dockerd 
 先 `docker pull`（报错信息里有现成命令）。确实想现拉就加 `--allow-pull`，
 但注意 0.27 MB/s 的实测吞吐。
 
-### 6.3 `发现同 trial 的存量重放容器`
+### 6.3 同一 trial 并发运行
 
-有另一个重放进程在跑，或上次异常退出留了残骸。**这是刻意拦下来的**：旧版本容器名只按
-trial 名推导，两个进程重放同一条会静默互删容器，先启动的那个从此每条命令都失败
-（`INDEX.md`「已知风险」）。现在容器名带 PID，并在启动前检查同前缀存量。
-
-确认无人在用后清理：
-```bash
-docker rm -f $(docker ps -aq --filter name=^replay_)
-```
+现在容器名包含 PID 和随机 salt；同一 trial 的多个重放进程可以同时运行。
+脚本只检查本次的精确容器名，清理时还会核对本次运行的 Docker label。
+`topdown_trial.sh` 会把同一个 salt 传给重放脚本，并只采本次的容器。
+未指定 `-o` 时，`replay.py`、`topdown_trial.sh` 和 `run_batch.py` 都会为每轮运行创建独立输出目录。
+如果并发命令显式指定 `-o`，请为每轮实验使用不同的输出目录，避免结果文件互相覆盖。
 
 ### 6.4 sinkhole 起不来
 

@@ -24,7 +24,7 @@ done
 [ -d "$TRIALS" ] || { echo "trial 目录不存在: $TRIALS"; exit 1; }
 [ -n "$OUT" ] || OUT="$HERE/deepswe-replay-bundle-$(date +%Y%m%d).tar.gz"
 
-REPLAY="$HERE/../replay.py"
+REPLAY="$HERE/replay.py"
 [ -f "$REPLAY" ] || { echo "找不到 $REPLAY"; exit 1; }
 # 命令分类器：cmd_stats.py（run_batch 收尾自动调）要 import 它。仓库里它和 replay.py 一样在上一层。
 CLASSIFIER="$HERE/../summarize_replay.py"
@@ -36,7 +36,7 @@ trap 'rm -rf "$STAGE"' EXIT
 ROOT="$STAGE/deepswe-replay-bundle"
 mkdir -p "$ROOT"
 
-# 顶层：脚本与手册。replay.py / summarize_replay.py 从上一层复制进来，bundle 从此自包含
+# 顶层：脚本与手册。replay.py 使用本目录的并发安全版本，summarize_replay.py 从上一层复制。
 # （平铺后 cmd_stats.py 先找同级的 summarize_replay.py，与 run_batch.py 找 replay.py 同一个顺序）。
 cp "$REPLAY" "$ROOT/"
 cp "$CLASSIFIER" "$ROOT/"

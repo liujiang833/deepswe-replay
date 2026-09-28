@@ -39,7 +39,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$HERE/topdown.conf"
 
-TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""; CPUSET_CPUS=""; PER_STEP=0
+TRIAL=""; OUTDIR=""; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""; CPUSET_CPUS=""; PER_STEP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--outdir) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; OUTDIR="$2"; shift 2 ;;
@@ -62,6 +62,10 @@ done
 TRIAL="$(cd "$TRIAL" && pwd)"
 TNAME="$(basename "$TRIAL")"
 [ -f "$TRIAL/task.json" ] || { echo "❌ 缺 $TRIAL/task.json"; exit 1; }
+CONTAINER_SALT="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
+if [ -z "$OUTDIR" ]; then
+  OUTDIR="$HERE/topdown_out/$(date -u +%Y%m%dT%H%M%SZ)-$CONTAINER_SALT"
+fi
 
 # replay.py 的定位：打包后它和 trial 目录同级（就在本脚本旁边）；
 # 开发机上的 crosslang/ 布局则是上一层。两个都找不到才报错。
@@ -325,7 +329,7 @@ cleanup() {
     done
     if alive "$RPID"; then
       echo "        10s 没退，改 SIGKILL；残留容器请手动清："
-      echo "        docker ps -a --filter name=^replay_ "
+      echo "        docker ps -a --filter 'name=^${EXPECT:-replay_}'"
       kill -KILL "$RPID" 2>/dev/null || true
     fi
   fi
@@ -345,6 +349,8 @@ trap 'echo; echo "  ⚠️  收到 SIGTERM，中止采集"; cleanup; exit 143' T
 
 echo "── 起重放（后台）──────────────────────────────────────────"
 RCMD=(python3 "$REPLAY" "$TRIAL" "$TRIAL/task.json" -o "$OUTDIR")
+# replay.py 的容器名含本次 salt；传给重放，采集时才能精确找到自己的容器。
+RCMD+=(--container-salt "$CONTAINER_SALT")
 if [ -n "$LIMIT" ]; then RCMD+=(--limit "$LIMIT"); fi
 if [ -n "$CMD_TIMEOUT" ]; then RCMD+=(--cmd-timeout "$CMD_TIMEOUT"); fi
 if [ -n "$CPUSET_CPUS" ]; then RCMD+=(--cpuset-cpus "$CPUSET_CPUS"); fi
@@ -372,11 +378,11 @@ set +m
 echo "  PID   $RPID"
 
 # ── 3. 等主容器出现 ────────────────────────────────────────────
-# replay.py 的容器名是 replay_<trial名 sanitize 后前 44 字符>_<它自己的 PID>。
+# replay.py 的容器名是 replay_<trial名 sanitize 后前 44 字符>_<PID>_<salt>。
 # 它是我们 fork 出来的，所以 $RPID 就是它的 os.getpid() —— 名字可以精确算出来，
 # 不用去 docker ps 里猜。这一点很重要：机器上可能同时有别人的重放在跑。
 SAN="$(printf '%s' "$TNAME" | sed 's/[^A-Za-z0-9_.-]/_/g' | cut -c1-44)"
-EXPECT="replay_${SAN}_${RPID}"
+EXPECT="replay_${SAN}_${RPID}_${CONTAINER_SALT}"
 # docker 的 name filter 是**正则**，不是字面量。sanitize 规则允许保留 `.` 和 `-`，
 # 而 `.` 在正则里是通配符 —— trial 名带点时 `^replay_a.b_123$` 会匹上 `replay_axb_123`。
 # 当前这条 trial 名里没有点，但别把正确性押在数据上，过滤用的那份把 `.` 转义掉。
@@ -393,25 +399,12 @@ for i in $(seq 1 60); do
     echo
     echo "  完整日志：$RLOG"
     echo "  最常见的两种：镜像不在本地（先 bash build_arm.sh $TNAME）；"
-    echo "  同 trial 有存量容器占着名字（docker ps -a --filter name=^replay_）。"
+    echo "  请检查镜像、本次容器名和 replay.py 启动错误。"
     exit 1
   fi
   CID="$(docker ps --filter "name=^${EXPECT_RE}$" --format '{{.ID}}' 2>/dev/null | head -1 || true)"
   if [ -n "$CID" ]; then CNAME="$EXPECT"; break; fi
-  # 兜底：万一 replay.py 改了命名规则，退回按前缀找。
-  # **必须排掉 -sink**：那是 403 sinkhole sidecar，独立容器、独立 cgroup，
-  # 采它等于采了个空气（而且会让人误以为「采到了，只是数很小」）。
-  # 这不是理论风险 —— 本机用真容器实测过：同时起主容器和 <名字>-sink 之后，
-  # `docker ps --filter name=^replay_` **先列出的是 -sink**，没有这个 grep，
-  # head -1 拿到的就是 sidecar。（同一次实测也确认了 name=^<全名>$ 这种精确过滤
-  # 不会误命中 -sink，所以上面那条精确路径才是首选。）
-  LINE="$(docker ps --filter "name=^replay_" --format '{{.ID}} {{.Names}}' 2>/dev/null \
-          | grep -v -- '-sink' | head -1 || true)"
-  if [ -n "$LINE" ]; then
-    CID="${LINE%% *}"; CNAME="${LINE#* }"
-    echo "  ⚠️  没等到 $EXPECT，按前缀兜底命中 $CNAME —— 确认这是你要采的那个"
-    break
-  fi
+  # 不能按 replay_ 前缀兜底：同 trial 并发时那会采到另一轮的 cgroup。
   sleep 1
   if [ $((i % 10)) = 0 ]; then echo "  … 等了 ${i}s"; fi
 done

@@ -135,10 +135,10 @@ python3 run_batch.py --trials-dir full_trials --skip-missing --keep-going   # �
 `run_batch.py` 的 `--only` 只认语言，不认 trial 名。真要精确跑单条就直接调重放器：
 
 ```bash
-python3 ../replay.py full_trials/<trial> full_trials/<trial>/task.json -o /tmp/one
+python3 replay.py full_trials/<trial> full_trials/<trial>/task.json -o /tmp/one
 ```
 
-（这是仓库 clone 里在 `crosslang/` 下的写法，`replay.py` 在上一层。bundle 里 `replay.py` 和 trial 都在包根目录：
+（这是仓库 clone 里在 `crosslang/` 下的写法。bundle 里 `replay.py` 和 trial 都在包根目录：
 `python3 replay.py <trial> <trial>/task.json -o /tmp/one`。）
 
 ## 6. 读结果

@@ -226,6 +226,20 @@ def strip_cd(c):
     return re.sub(r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*cd\s+\S+\s*&&\s*", "", c.strip())
 
 
+def cpuset_ids(spec):
+    """把 Docker CPU 列表（如 0,2-3）展开为逻辑 CPU 编号集合。"""
+    if not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", spec):
+        raise ValueError("CPU 列表格式应为 0,2 或 0-1")
+    ids = set()
+    for part in spec.split(","):
+        first, sep, last = part.partition("-")
+        start, end = int(first), int(last) if sep else int(first)
+        if end < start:
+            raise ValueError("CPU 范围的终点不能小于起点")
+        ids.update(range(start, end + 1))
+    return ids
+
+
 def cgroup_fstype():
     """`/sys/fs/cgroup` 的文件系统类型。v2 统一层级是 `cgroup2fs`。"""
     r = sh(["stat", "-fc", "%T", str(CGROUP_ROOT)])
@@ -545,6 +559,8 @@ def main():
     ap.add_argument("--keep", action="store_true", help="结束后保留容器")
     ap.add_argument("--cmd-timeout", type=int, default=30,
                     help="单条命令在容器内的默认超时秒数，默认 30；命令自带更长的 timeout 时自动延长")
+    ap.add_argument("--cpuset-cpus", default="", metavar="LIST",
+                    help="把重放容器固定到指定逻辑 CPU，如 0,2 或 0-1；仍保留 task.toml 的 CPU 配额")
     ap.add_argument("--interpreter", default="/bin/sh -c",
                     help="执行器 argv（空格分隔），默认 '/bin/sh -c'（dash，对齐原 harness）；"
                          "旧口径是 'bash -lc'")
@@ -564,6 +580,11 @@ def main():
     args = ap.parse_args()
     if args.cmd_timeout <= 0:
         ap.error("--cmd-timeout 必须大于 0")
+    if args.cpuset_cpus:
+        try:
+            cpuset_ids(args.cpuset_cpus)
+        except ValueError as exc:
+            ap.error(f"--cpuset-cpus: {exc}")
     interp = args.interpreter.split()
     if not interp:
         ap.error("--interpreter 不能为空")
@@ -605,6 +626,7 @@ def main():
           f"{'on' if allow_net else ('none+403-sinkhole' if use_sink else 'none')}")
     print(f"exec      {' '.join(interp)}")
     print(f"commands  {n_all} 条，跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
+    print(f"cpuset    {args.cpuset_cpus or '不绑核'}")
     print(f"timeout   默认 {args.cmd_timeout}s；命令显式 timeout 更长时自动延长"
           f"（宿主兜底另加 {OUTER_SLACK_S}s）")
     print(f"container {name}")
@@ -641,6 +663,8 @@ def main():
 
     run = ["docker", "run", "-d", "--name", name,
            f"--cpus={cpus}", f"--memory={mem_mb}m", f"--memory-swap={mem_mb}m"]
+    if args.cpuset_cpus:
+        run += [f"--cpuset-cpus={args.cpuset_cpus}"]
     if not allow_net:
         run += ["--network=none"]
     if use_sink:
@@ -682,6 +706,21 @@ def main():
             # 那种情况下容器以 Created 状态留在那儿。
             print("容器启动失败:", r.stderr.decode()[:400])
             return 1
+
+        actual_cpuset = None
+        if args.cpuset_cpus:
+            affinity = sh(["docker", "exec", name, "python3", "-c",
+                           "import os; print(','.join(map(str, sorted(os.sched_getaffinity(0)))))"])
+            actual_cpuset = affinity.stdout.decode().strip()
+            try:
+                matches = affinity.returncode == 0 and cpuset_ids(actual_cpuset) == cpuset_ids(args.cpuset_cpus)
+            except ValueError:
+                matches = False
+            if not matches:
+                print(f"CPU 绑核未生效：请求 {args.cpuset_cpus}，容器内实际 "
+                      f"{actual_cpuset or affinity.stderr.decode()[:200] or '无法读取'}")
+                return 1
+            print(f"cpuset    容器内已核对：{actual_cpuset}")
 
         sink_cg = None
         if use_sink:
@@ -821,6 +860,7 @@ def main():
                             "cgroup_dir": str(cg.path) if cg.path else None,
                             "cgroup_discovery": cg.how,
                             "cgroup_has_io": cg.has_io,
+                            "cpuset_cpus": actual_cpuset,
                             "nproc": os.cpu_count(),
                             "image": image}}
         if sink_cg:

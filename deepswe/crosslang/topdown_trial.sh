@@ -22,6 +22,7 @@
 #   bash topdown_trial.sh <trial目录> --limit 5      # 只重放前 5 条命令，冒烟用
 #   bash topdown_trial.sh <trial目录> --no-metrics   # 关掉 replay.py 自己那套 cgroup 指标
 #   bash topdown_trial.sh <trial目录> --cmd-timeout 30   # 透传给 replay.py 的单命令超时
+#   bash topdown_trial.sh <trial目录> --cpuset-cpus 0,2  # 固定重放容器的逻辑 CPU
 #   bash topdown_trial.sh <trial目录> --per-step       # per-step topdown（perf stat -I 10 + 事后按 step 归并）
 #
 # 批量：不要自己写循环。`python3 run_batch.py --topdown` 就是对本脚本逐条调用
@@ -38,7 +39,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$HERE/topdown.conf"
 
-TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""; PER_STEP=0
+TRIAL=""; OUTDIR="$HERE/topdown_out"; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""; CPUSET_CPUS=""; PER_STEP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--outdir) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; OUTDIR="$2"; shift 2 ;;
@@ -48,6 +49,7 @@ while [ $# -gt 0 ]; do
     # 改走本脚本之后如果这个值传不下去，同一批里 topdown 的那几条就换了口径，
     # 耗时和 rc_match 都不再能跟历史批次比 —— 而且这种偏差在报告里完全看不出来。
     --cmd-timeout) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; CMD_TIMEOUT="$2"; shift 2 ;;
+    --cpuset-cpus) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; CPUSET_CPUS="$2"; shift 2 ;;
     --per-step)  PER_STEP=1; shift ;;
     --no-metrics) NO_METRICS=1; shift ;;
     -h|--help)   sed -n '2,/^set -[eu]/p' "$0" | sed '$d'; exit 0 ;;
@@ -55,7 +57,7 @@ while [ $# -gt 0 ]; do
     *)           TRIAL="$1"; shift ;;
   esac
 done
-[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N] [--cmd-timeout N] [--no-metrics] [--per-step]"; exit 1; }
+[ -n "$TRIAL" ] || { echo "❌ 用法: bash topdown_trial.sh <trial目录> [-o 输出目录] [--limit N] [--cmd-timeout N] [--cpuset-cpus LIST] [--no-metrics] [--per-step]"; exit 1; }
 [ -d "$TRIAL" ] || { echo "❌ trial 目录不存在: $TRIAL"; exit 1; }
 TRIAL="$(cd "$TRIAL" && pwd)"
 TNAME="$(basename "$TRIAL")"
@@ -285,6 +287,9 @@ fi
 if [ -n "$CMD_TIMEOUT" ]; then
   echo "  单命令超时   ${CMD_TIMEOUT}s（透传给 replay.py）"
 fi
+if [ -n "$CPUSET_CPUS" ]; then
+  echo "  CPU 绑核     $CPUSET_CPUS（透传给 replay.py）"
+fi
 echo
 
 # ── 2. 后台起重放 ──────────────────────────────────────────────
@@ -342,6 +347,7 @@ echo "── 起重放（后台）───────────────�
 RCMD=(python3 "$REPLAY" "$TRIAL" "$TRIAL/task.json" -o "$OUTDIR")
 if [ -n "$LIMIT" ]; then RCMD+=(--limit "$LIMIT"); fi
 if [ -n "$CMD_TIMEOUT" ]; then RCMD+=(--cmd-timeout "$CMD_TIMEOUT"); fi
+if [ -n "$CPUSET_CPUS" ]; then RCMD+=(--cpuset-cpus "$CPUSET_CPUS"); fi
 # replay.py 的 cgroup 指标和本脚本的 PMU 采集互不相干，关掉不影响四象限
 if [ "$NO_METRICS" = 1 ]; then RCMD+=(--no-metrics); fi
 echo "  ${RCMD[*]}"

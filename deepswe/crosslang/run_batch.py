@@ -579,6 +579,8 @@ def run_one(idx, t, n_total, replay, out, args, stream, topdown=None):
     if topdown is not None:
         cmd = ["bash", str(topdown), str(t["dir"]),
                "-o", str(out), "--cmd-timeout", str(args.cmd_timeout)]
+        if args.cpuset_cpus:
+            cmd += ["--cpuset-cpus", args.cpuset_cpus]
         if args.smoke:
             cmd += ["--limit", str(args.smoke)]
         if args.per_step:
@@ -592,6 +594,8 @@ def run_one(idx, t, n_total, replay, out, args, stream, topdown=None):
     else:
         cmd = [sys.executable, str(replay), str(t["dir"]), str(t["dir"] / "task.json"),
                "-o", str(out), "--cmd-timeout", str(args.cmd_timeout)]
+        if args.cpuset_cpus:
+            cmd += ["--cpuset-cpus", args.cpuset_cpus]
         if args.smoke:
             cmd += ["--limit", str(args.smoke)]
         if not args.metrics:
@@ -672,6 +676,9 @@ def main():
                          "只用来确认容器能起、cgroup 能读、命令能执行")
     ap.add_argument("--cmd-timeout", type=int, default=30,
                     help="单条命令默认超时秒数，默认 30；命令自带更长 timeout 时自动延长")
+    ap.add_argument("--cpuset-cpus", default="", metavar="LIST",
+                    help="把每个重放容器固定到指定逻辑 CPU，如 0,2；保留原有 --cpus=2 配额。"
+                         "建议串行运行，避免多个容器争抢同一组 CPU")
     ap.add_argument("-j", "--jobs", default="1", metavar="N",
                     help="并发跑几条，默认 1（串行，与加本选项前完全一致，含实时输出）。"
                          "auto = 按本机 CPU 与可用内存自动定。不设上限：并发高只是变慢或撞 OOM，"
@@ -716,6 +723,8 @@ def main():
     args = ap.parse_args()
     if args.cmd_timeout <= 0:
         ap.error("--cmd-timeout 必须大于 0")
+    if args.cpuset_cpus and not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", args.cpuset_cpus):
+        ap.error("--cpuset-cpus 格式应为 CPU 编号或范围，如 0,2 或 0-1")
 
     # --metrics 与 --no-metrics 同时给 = 自相矛盾。不静默挑一个：挑错了的后果是
     # 整批要么白跑（v1 上起不来），要么采了一批没人要的 cgroup 数，都得重来。
@@ -826,6 +835,9 @@ def main():
         asked = f"auto 算出 {jobs}，" if args.jobs == "auto" else f"-j {args.jobs} "
         jobs_note = f"（{asked}收敛到待跑条数 {len(trials)}）"
         jobs = len(trials)
+    if args.cpuset_cpus and jobs > 1:
+        print(f"⚠️  --cpuset-cpus={args.cpuset_cpus} 与 -j {jobs}：所有重放容器会争抢同一组 CPU；"
+              "做性能对照建议 -j 1。")
 
     # 并发采指标 = 采一批看着像真的假数据。这里报错退出而不是警告后继续：
     # 这个项目的原则是「静默采错比报错危险」——警告会被日志淹掉，数字却进了 verdict.json。
@@ -1251,6 +1263,7 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None,
         "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "host": {"kernel": os.uname().release, "nproc": os.cpu_count(), "cgroup_fstype": fstype},
         "options": {"smoke": args.smoke, "cmd_timeout": args.cmd_timeout,
+                    "cpuset_cpus": args.cpuset_cpus or None,
                     "jobs": jobs, "metrics": bool(args.metrics)},
         "elapsed_s": round(elapsed, 1),
         "n_pass": n_ok, "n_total": len(results),
@@ -1295,6 +1308,7 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None,
           f"- 主机：{os.uname().release} / {os.cpu_count()} CPU / cgroup {fstype}",
           f"- 单命令默认超时：{args.cmd_timeout}s；显式 timeout 更长时按命令延长"
           + ("（冒烟模式）" if smoke else ""),
+          f"- CPU 绑核：{args.cpuset_cpus or '未启用'}",
           f"- 并发：{jobs}" + ("（串行，性能数字可比）" if jobs == 1
                               else "（并发，未采指标；墙钟不可与串行批次直接比）"),
           f"- 结果：**{n_ok}/{len(results)} 通过**，总墙钟 {elapsed:.0f}s"]

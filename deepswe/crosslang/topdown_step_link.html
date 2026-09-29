@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Topdown 如何关联到 Replay Step</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18243a;
+      --muted: #5e6b7e;
+      --line: #d9e2eb;
+      --paper: #f6f8fb;
+      --blue: #1666d3;
+      --blue-light: #e6f0ff;
+      --orange: #ec8b36;
+      --orange-light: #fff0df;
+      --green: #177c68;
+      --green-light: #dff5ed;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    header { background: #101d33; color: white; padding: 45px max(24px, calc((100vw - 1180px) / 2)) 38px; }
+    header .eyebrow { color: #8fc2ff; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 8px 0 8px; font-size: clamp(27px, 4vw, 42px); letter-spacing: -.035em; line-height: 1.15; }
+    header p { color: #c5d3e8; max-width: 780px; margin: 0; font-size: 16px; }
+    main { max-width: 1228px; margin: 0 auto; padding: 28px 24px 50px; }
+    .sources { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .source, .panel { background: white; border: 1px solid var(--line); border-radius: 17px; box-shadow: 0 5px 22px #172d4909; }
+    .source { padding: 21px 23px 22px; border-top: 4px solid var(--blue); }
+    .source.replay { border-top-color: var(--orange); }
+    .source h2 { margin: 0 0 6px; font-size: 18px; }
+    .source p { margin: 0 0 11px; color: var(--muted); }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { font-size: .9em; background: #f0f4f8; padding: 2px 5px; border-radius: 4px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 7px; }
+    .tag { border: 1px solid var(--line); border-radius: 7px; padding: 4px 8px; font-size: 12px; color: #34445c; background: #f9fbfd; }
+    .join { display: flex; align-items: center; justify-content: center; gap: 13px; padding: 18px 10px; text-align: center; color: #34445c; font-weight: 650; }
+    .join .arrow { color: var(--green); font-size: 24px; line-height: 1; }
+    .join .formula { background: var(--green-light); border: 1px solid #b7e4d3; color: #126751; border-radius: 9px; padding: 8px 14px; }
+    .panel { padding: 24px; }
+    .panel-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; margin-bottom: 17px; }
+    .panel-head h2 { margin: 0 0 4px; font-size: 22px; }
+    .panel-head p { margin: 0; color: var(--muted); }
+    .demo { color: var(--muted); font-size: 12px; white-space: nowrap; border: 1px solid var(--line); border-radius: 99px; padding: 5px 10px; }
+    .picker { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 0 0 19px; }
+    .picker span { color: var(--muted); font-size: 13px; margin-right: 3px; }
+    button { font: inherit; cursor: pointer; border: 1px solid var(--line); border-radius: 9px; background: white; padding: 8px 13px; color: var(--ink); font-weight: 700; }
+    button:hover { border-color: #9dbde7; }
+    button[aria-pressed="true"] { background: var(--blue); border-color: var(--blue); color: white; }
+    .scroll { overflow-x: auto; padding-bottom: 7px; }
+    .chart { min-width: 900px; }
+    .chart-row { display: grid; grid-template-columns: 174px 1fr; gap: 11px; align-items: center; margin: 9px 0; }
+    .row-label { text-align: right; color: #31425a; font-size: 13px; font-weight: 750; padding-right: 7px; }
+    .row-label small { display: block; color: var(--muted); font-weight: 500; font-size: 11px; }
+    .track { height: 53px; position: relative; border-radius: 9px; background: #f2f6fa; overflow: hidden; }
+    .ruler { height: 31px; background: transparent; overflow: visible; border-bottom: 1px solid var(--line); border-radius: 0; }
+    .tick { position: absolute; bottom: 3px; transform: translateX(-50%); color: #637185; font-size: 11px; }
+    .tick:first-child { transform: none; }
+    .tick:last-child { transform: translateX(-100%); }
+    .grid-line { position: absolute; width: 1px; background: #dce5ee; top: 0; bottom: 0; z-index: 0; }
+    .intervals { display: grid; grid-template-columns: repeat(11, 1fr); gap: 3px; background: transparent; }
+    .interval { position: relative; display: flex; align-items: center; justify-content: center; background: var(--blue-light); border: 1px solid #c3d9f6; border-radius: 6px; color: #54729d; font: 700 12px ui-monospace, monospace; transition: background .16s, color .16s, border-color .16s; }
+    .interval.active { background: var(--blue); color: white; border-color: var(--blue); box-shadow: 0 3px 8px #1666d355; }
+    .interval::after { content: ""; position: absolute; right: 4px; bottom: 3px; width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: .75; }
+    .replay-track { background: #fff7ee; }
+    .start-marker { position: absolute; z-index: 3; left: 18.1818%; top: 0; bottom: 0; border-left: 2px dashed var(--orange); }
+    .start-marker span { position: absolute; top: 3px; left: 6px; font-size: 11px; color: #a45714; font-weight: 800; white-space: nowrap; }
+    .window-track { background: #fff7ee; }
+    .step-window { position: absolute; top: 7px; bottom: 7px; display: flex; align-items: center; justify-content: center; white-space: nowrap; border-radius: 7px; border: 1px solid #efba85; background: #ffe2c2; color: #995321; font-weight: 800; font-size: 13px; transition: background .16s, color .16s, box-shadow .16s; }
+    .step-window.active { background: var(--orange); border-color: var(--orange); color: #fff; box-shadow: 0 4px 10px #ec8b3650; }
+    .note { font-size: 12px; color: var(--muted); margin: 10px 0 0 185px; }
+    .readout { display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; margin-top: 22px; }
+    .readout-card { background: #f5f9fe; border: 1px solid #d4e5f8; padding: 17px 19px; border-radius: 12px; }
+    .readout-card.output { background: #f2faf7; border-color: #cbe9df; }
+    .readout-card h3 { margin: 0 0 8px; font-size: 15px; }
+    .readout-card p { margin: 6px 0; }
+    .readout-card .big { color: var(--blue); font-size: 19px; font-weight: 800; letter-spacing: -.02em; }
+    .readout-card.output .big { color: var(--green); }
+    .readout-card .muted { color: var(--muted); font-size: 13px; }
+    .below { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 17px; }
+    .below .panel { padding: 19px 22px; }
+    .below h2 { margin: 0 0 8px; font-size: 17px; }
+    .below p { margin: 0; color: #42526a; }
+    footer { max-width: 1228px; padding: 0 24px 36px; margin: 0 auto; color: var(--muted); font-size: 12px; }
+    @media (max-width: 750px) {
+      header { padding: 32px 22px; }
+      main { padding: 18px 14px 35px; }
+      .sources, .readout, .below { grid-template-columns: 1fr; }
+      .panel { padding: 18px 13px; }
+      .panel-head { display: block; }
+      .demo { display: inline-block; margin-top: 10px; }
+      .join { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">DeepSWE / Replay × ARM PMU</div>
+    <h1>Topdown 是怎样连到每个 step 的？</h1>
+    <p>关键是把 perf 的 10 ms 硬件计数，与 replay 记录的命令时间窗口放到同一条时间轴上，然后按 step 归并。</p>
+  </header>
+  <main>
+    <div class="sources">
+      <section class="source">
+        <h2>① 宿主机的 perf</h2>
+        <p><code>perf stat -a -I 10 -e {事件组} -G 容器cgroup</code>，每 10 ms 输出一组 PMU 事件计数。</p>
+        <div class="tags"><span class="tag">perf.json / perf.csv</span><span class="tag">interval 时间戳 T</span><span class="tag">perf_start_mono</span></div>
+      </section>
+      <section class="source replay">
+        <h2>② 容器中的 replay</h2>
+        <p><code>commands.jsonl</code> 为每条命令记录所属 step、相对开始时间和执行时长。</p>
+        <div class="tags"><span class="tag">step</span><span class="tag">abs_start_s</span><span class="tag">wall_s</span><span class="tag">verdict.t_start_mono</span></div>
+      </section>
+    </div>
+
+    <div class="join"><span class="arrow">↓</span><span class="formula mono">offset = t_start_mono − perf_start_mono</span><span class="arrow">↓</span><span>用 monotonic 时间把两份记录对齐</span></div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div><h2>同一条时间轴上的对应关系</h2><p>点击一个 step，看哪些 10 ms interval 会被归到它名下。</p></div>
+        <span class="demo">示意数据 · 时间单位 ms</span>
+      </div>
+      <div class="picker" role="group" aria-label="选择 step">
+        <span>查看归并：</span>
+        <button type="button" data-step="0" aria-pressed="true">Step 0</button>
+        <button type="button" data-step="1" aria-pressed="false">Step 1 · 两条命令</button>
+        <button type="button" data-step="2" aria-pressed="false">Step 2</button>
+      </div>
+
+      <div class="scroll">
+        <div class="chart">
+          <div class="chart-row"><div class="row-label">perf 时间 <small>相对 perf 启动</small></div><div class="track ruler" id="ruler"></div></div>
+          <div class="chart-row"><div class="row-label">PMU interval <small>方块标记结束时间 T</small></div><div class="track intervals" id="intervals"></div></div>
+          <div class="chart-row"><div class="row-label">replay 起点 <small>offset = 20 ms</small></div><div class="track replay-track"><div class="start-marker"><span>t_start_mono</span></div></div></div>
+          <div class="chart-row"><div class="row-label">命令归属 <small>来自 commands.jsonl</small></div><div class="track window-track" id="windows"></div></div>
+        </div>
+      </div>
+      <p class="note">每个蓝色方块代表前一个 10 ms 区间的计数；代码按其结束时间 T 判断归属。橙色条是同一 step 内命令的最早起点到最晚终点。</p>
+
+      <div class="readout">
+        <div class="readout-card">
+          <h3>③ 把 step 窗口换算到 perf 时间</h3>
+          <p id="window-formula" class="big mono"></p>
+          <p id="command-description" class="muted"></p>
+        </div>
+        <div class="readout-card output">
+          <h3>④ 按结束时间挑 interval，再加总</h3>
+          <p id="selected-bins" class="big mono"></p>
+          <p class="muted">规则：<code>step_lo &lt; T ≤ step_hi</code>。对选中 interval 的各项事件分别求和，再除以 <code>CPU_CYCLES × SLOTS</code> 计算四象限。</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="below">
+      <section class="panel"><h2>一个 step 可以包含多条 command</h2><p>先按 <code>step</code> 分组，再取这些命令的最早开始和最晚结束。图中的 Step 1 有两条命令；两条命令之间的间隙也落在这个整体窗口里。</p></section>
+      <section class="panel"><h2>边界与 sleep</h2><p>interval 边界最多有一个采样间隔（10 ms）的误差。代码会按开头的 <code>sleep</code> 时长推后窗口起点；如果已无有效窗口，就跳过这条命令。末尾的 sleep 不扣。</p></section>
+    </div>
+  </main>
+  <footer>对应实现：topdown_trial.sh 在调用 perf 前记录 perf_start_mono；replay.py 写 commands.jsonl 和 verdict.json；topdown_steps.py 对齐时间并归并 interval。step 边界来自重放命令的实测时间，不使用 trajectory 的 step 时间戳。本图数值仅用于解释算法。</footer>
+  <script>
+    const steps = [
+      {id: 0, lo: 20, hi: 45, label: "Step 0", detail: "1 条命令：abs_start=0 ms，wall=25 ms；加 offset=20 ms。"},
+      {id: 1, lo: 45, hi: 80, label: "Step 1", detail: "2 条命令：在 replay 时间分别为 [25,35] 和 [36,60] ms；合并后加 offset=20 ms。"},
+      {id: 2, lo: 80, hi: 105, label: "Step 2", detail: "1 条命令：abs_start=60 ms，wall=25 ms；加 offset=20 ms。"}
+    ];
+    const maxTime = 110;
+    const ruler = document.querySelector("#ruler");
+    const intervals = document.querySelector("#intervals");
+    const windows = document.querySelector("#windows");
+    for (let t = 0; t <= maxTime; t += 10) {
+      const tick = document.createElement("span");
+      tick.className = "tick";
+      tick.style.left = `${100 * t / maxTime}%`;
+      tick.textContent = t === maxTime ? `${t} ms` : t;
+      ruler.append(tick);
+      if (t < maxTime) {
+        const cell = document.createElement("div");
+        cell.className = "interval";
+        cell.dataset.end = t + 10;
+        cell.textContent = t + 10;
+        cell.title = `(${t}, ${t + 10}] ms 内的 PMU 计数`;
+        intervals.append(cell);
+      }
+    }
+    for (const step of steps) {
+      const bar = document.createElement("div");
+      bar.className = "step-window";
+      bar.dataset.step = step.id;
+      bar.style.left = `${100 * step.lo / maxTime}%`;
+      bar.style.width = `${100 * (step.hi - step.lo) / maxTime}%`;
+      bar.textContent = step.label;
+      windows.append(bar);
+    }
+    function selectStep(id) {
+      const step = steps[id];
+      const selected = [];
+      document.querySelectorAll(".interval").forEach(cell => {
+        const end = Number(cell.dataset.end);
+        const active = step.lo < end && end <= step.hi;
+        cell.classList.toggle("active", active);
+        if (active) selected.push(end);
+      });
+      document.querySelectorAll(".step-window").forEach(bar => bar.classList.toggle("active", Number(bar.dataset.step) === id));
+      document.querySelectorAll("button[data-step]").forEach(button => button.setAttribute("aria-pressed", String(Number(button.dataset.step) === id)));
+      document.querySelector("#window-formula").textContent = `${step.label}: (${step.lo}, ${step.hi}] ms`;
+      document.querySelector("#command-description").textContent = step.detail;
+      document.querySelector("#selected-bins").textContent = `T = ${selected.join(", ")} ms`;
+    }
+    document.querySelectorAll("button[data-step]").forEach(button => button.addEventListener("click", () => selectStep(Number(button.dataset.step))));
+    selectStep(0);
+  </script>
+</body>
+</html>

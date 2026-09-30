@@ -115,14 +115,20 @@ def parse_languages(values):
 def step_program(commands):
     """从 step 的命令列表推断 program 字段。
 
-    多条命令时取优先级最高的（跑测试 > 写文件 > 搜索 > 版本控制 > 读文件 > 其他），
-    用该条命令的 program 字段（如 go test / cargo build / grep / git / python）。
+    多条命令时按原主类别优先级；同属写文件时，cat/tee > mkdir/rm > 其他。
+    用优先级最高的那条命令的 program（如 go test / cat / grep / git / python）。
     空命令或无法分类返回 "unknown"。
     """
+    choice = step_choice(commands)
+    return choice["program"] if choice else "unknown"
+
+
+def step_choice(commands):
+    """返回 step 中优先级最高的命令分类，供 program 归因和截断补救共用。"""
     if not commands:
-        return "unknown"
-    best_prog = None
-    best_rank = len(sr.PRIORITY)
+        return None
+    best = None
+    best_rank = (len(sr.PRIORITY), 0)
     for cmd in commands:
         if not cmd or not cmd.strip():
             continue
@@ -135,13 +141,32 @@ def step_program(commands):
             continue
         cat = c.get("cat", sr.OTHER)
         try:
-            r = sr.PRIORITY.index(cat)
+            r = (sr.PRIORITY.index(cat), sr.write_rank(prog) if cat == sr.WRITE else 0)
         except ValueError:
-            r = len(sr.PRIORITY)
+            r = (len(sr.PRIORITY), 0)
         if r < best_rank:
             best_rank = r
-            best_prog = prog
-    return best_prog or "unknown"
+            best = c
+    return best
+
+
+def full_step_commands(path):
+    """从 replay 的原始 JSONL 取完整命令；cleaned.json 里的 commands 仅保留前 200 字符。"""
+    by_step = {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                step = rec.get("step")
+                cmd = rec.get("cmd_stripped") or rec.get("cmd")
+                if step is not None and cmd:
+                    by_step.setdefault(step, []).append(cmd)
+    except OSError:
+        pass
+    return by_step
 
 
 def regen_step_data(tdir, here):
@@ -267,6 +292,7 @@ def load_steps(topdown_out, trials_dir=None, regen=False):
                     pass
         if lang == "unknown":
             lang = trial_lang(trial, tdir)
+        commands_by_step = full_step_commands(tdir / "commands.jsonl")
         trial_steps_before = len(steps)
         for s in data.get("steps", []):
             td = s.get("topdown")
@@ -274,10 +300,19 @@ def load_steps(topdown_out, trials_dir=None, regen=False):
             cyc = counts.get("cpu_cycles", 0)
             if not td or cyc <= 0:
                 continue
+            # cleaned.json 只留命令前 200 字符。平时保持这份旧口径；仅当它已
+            # 判作「写文件」且完整命令证明有更优先的写法时，才修正 program。
+            # 这样补上长命令里被截掉的 cat/tee，而不改动其他类别的历史归因。
+            choice = step_choice(s.get("commands", []))
+            if choice and choice["cat"] == sr.WRITE and sr.write_rank(choice["program"]) > 0:
+                full_choice = step_choice(commands_by_step.get(s.get("step"), []))
+                if (full_choice and full_choice["cat"] == sr.WRITE
+                        and sr.write_rank(full_choice["program"]) < sr.write_rank(choice["program"])):
+                    choice = full_choice
             steps.append({
                 "trial": trial,
                 "lang": lang,
-                "program": step_program(s.get("commands", [])),
+                "program": choice["program"] if choice else "unknown",
                 "step": s.get("step"),
                 "n_cmds": s.get("n_cmds", 0),
                 "wall_s": s.get("wall_s", 0),

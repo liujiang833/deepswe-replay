@@ -90,6 +90,11 @@ bash build_arm.sh --trials-dir full_trials all                             # 全
 失败的条目会在结尾列出来，按同样的前缀单独重试即可。已存在的镜像会跳过
 （要重建先 `docker rmi <tag>`）。
 
+**代理在批量构建中失效时**，先看第一条失败任务的 `build/<trial>/build.log`。
+`build_arm.sh` 默认 `-j 1`，已一次只建一个镜像；Go 的 `go mod download` 与
+TypeScript 的 `pnpm install` 还有各自的取包并发。按失败步骤调整的命令与
+`git clone` 失败时的判别，见 `RUNBOOK.md` §2b「构建期代理被并发请求压垮」。
+
 **内网环境的两个常用开关：**
 
 ```bash
@@ -201,7 +206,9 @@ python3 run_batch.py --trials-dir full_trials --topdown --per-step \
 bash topdown_trial.sh full_trials/<trial> --per-step --no-metrics
 ```
 
-每条 trial 产出 `<out>/<trial>/topdown/topdown_steps.json`，含每个 step 的四象限向量。
+每条 trial 产出 `<out>/<trial>/topdown/topdown_steps_cleaned.json`，含每个有效 step
+的四象限向量。批次的 `SUMMARY.md` 会记录有效 step 数和全部 interval 的聚合值；
+逐 step 解析没有保存完整 C1~C5 自检，因此报告不计算跨 trial 均值。
 
 ### 7.3 四级聚类分析
 
@@ -211,6 +218,13 @@ bash topdown_trial.sh full_trials/<trial> --per-step --no-metrics
 - **per-language**：同语言的 step 合并后聚类
 - **per-tool-type**：同 program 的 step 合并后聚类
 - **all-trials**：全部 step 合并后聚类
+
+per-tool-type 的 program 通常由 `topdown_steps_cleaned.json` 里的命令判定；
+这里每条命令只保留前 200 字符。若已判为「写文件」，聚类器再检查同轮
+`commands.jsonl` 的完整命令，补救被截断的 `cat`/`tee` 写文件语句。
+同一 step 有多个写文件动作时按 `cat`/`tee` > `mkdir`/`rm` > 其他写法取 program，
+所以 `mkdir ... && cat > large.ts` 归到 `cat`。若旧结果缺 `commands.jsonl`，
+聚类器只能回退到截断文本，program 可能不准。
 
 聚类方法：每个 step 的四象限 `(Ret, Bad, FE, BE)` 作为 4 维向量，使用标准
 K-means 和 L2 欧式距离进行聚类。程序通过二分搜索寻找满足“每个 cluster 内任意
@@ -458,6 +472,7 @@ bash build_arm.sh --trials-dir full_trials --registry https://registry.npmmirror
 | 预检报错 | `RUNBOOK.md` §3 |
 | 拉不到镜像 / ECR 不通 | `RUNBOOK.md` §2b |
 | `git clone` 报证书错误 | `RUNBOOK.md` §2b 证书一节 → `get_ca_cert.sh` |
+| 构建中代理（如 cntlm）失效，Git / Go / pnpm 接连失败 | `RUNBOOK.md` §2b「构建期代理被并发请求压垮」 |
 | **构建**卡在 `pnpm install` | `RUNBOOK.md` §2b「取包慢:换镜像源」 |
 | **重放**某条卡住不动 | `RUNBOOK.md` §6.5（多数是 trace 里本来就有 `sleep` 轮询） |
 | 找不到 cgroup 目录 | `RUNBOOK.md` §6.1（或干脆别加 `--metrics`） |

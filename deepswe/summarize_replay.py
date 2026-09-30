@@ -48,21 +48,32 @@ READ, SEARCH, WRITE, TEST, VCS, OTHER = "读文件", "搜索", "写文件", "跑
 CATS = [TEST, WRITE, SEARCH, VCS, READ, OTHER]
 # 命令级优先级：一条命令混了多种语句时，取排在前面的那一档。
 # 依据：先取「有副作用 / 吃 CPU 的那件事」，纯查看类排最后。
-# 唯一的细分是**语法校验**（`python3 -c "import ast; ast.parse(...)"` 这种一行守卫）：
+# 主类别层级里的特殊细分是**语法校验**（`python3 -c "import ast; ast.parse(...)"` 这种一行守卫）：
 # 它算 TEST，但排在「写文件」之后——因为 trace 里它几乎总是紧跟在一次编辑后面当护栏，
 # 那条命令的正事是改文件，不是跑测试。真跑测试（pytest / 复现脚本 / 内联脚本）仍排第一。
+# 写文件内部再按主要动作取舍：cat/tee 写正文 > mkdir/rm 准备或清理目录 > 其他写法。
+# 例如 `mkdir -p dir && cat > dir/large.ts <<EOF ...` 应归到 cat，而不是先出现的 mkdir。
 SYNTAX_CHECK = "语法/编译校验"
 RANKS = [(TEST, None), (WRITE, None), (TEST, SYNTAX_CHECK), (SEARCH, None),
          (VCS, None), (READ, None), (OTHER, None)]
 PRIORITY = [TEST, WRITE, SEARCH, VCS, READ, OTHER]
 
 
+def write_rank(program):
+    """同属写文件时的 program 优先级；数字越小越优先。"""
+    return 0 if program in ("cat", "tee") else 1 if program in ("mkdir", "rm") else 2
+
+
 def rank(pair):
-    """(类别, 细类[, program]) -> 档位序号，越小越优先。只看前两项。"""
+    """(类别, 细类[, program]) -> (主档位, 写文件细档位)，越小越优先。"""
     cat, detail = pair[0], pair[1]
     if cat == TEST and detail == SYNTAX_CHECK:
-        return RANKS.index((TEST, SYNTAX_CHECK))
-    return RANKS.index((cat, None))
+        return RANKS.index((TEST, SYNTAX_CHECK)), 0
+    major = RANKS.index((cat, None))
+    if cat == WRITE:
+        program = pair[2] if len(pair) > 2 else None
+        return major, write_rank(program)
+    return major, 0
 
 PROG_CAT = {
     # 读

@@ -8,7 +8,7 @@
 | 怎么一步步跑完 | **`README.md`** |
 | 前置条件的细节 | §2 |
 | 拉不到镜像怎么办（重建路线） | §2b |
-| 代理 / 证书 / 换源 | §2b 的三小节 |
+| 代理 / 证书 / 换源 / 构建并发 | §2b 的相关小节 |
 | 预检在检什么 | §3 |
 | 怎么跑、有哪些开关 | §4 |
 | 结果怎么读、什么算通过 | §5 |
@@ -127,6 +127,52 @@ bash build_arm.sh python
 sinkhole 压住它;`preflight.sh` 也会检查并提示。若重放时外连报错不是 403 而是
 连接失败,先查这里。
 
+### 构建期代理被并发请求压垮（如 cntlm）
+
+**适用症状**：构建一开始还能访问 GitHub / 包源，随后 cntlm 进程退出或不再响应；
+多条 task 接连在 `git clone`、`go mod download`、`pnpm install` 等联网步骤失败。
+先看**第一条失败 task 的** `build/<trial>/build.log` 和同时段的代理日志，确认是
+代理失效，而不是证书错误、目标源 403 或某条仓库自身的问题。
+`check_sources.sh` 只探宿主机在当时能否访问各源，不能证明代理承受得住后续并发。
+
+本脚本有两层并发：**同时构建多少个镜像**，以及**单个镜像内的取包工具同时发多少请求**。
+按失败发生的步骤调对应的一层：
+
+| 失败位置 | 降并发办法 | 范围与限制 |
+|---|---|---|
+| 多个 task 同时构建、代理随后失效 | `-j 1`（**脚本默认值**） | 一次只运行一个 `docker build`；若没有传 `-j`，这层已经降到最低。还要确认没有第二个构建进程共用同一个代理 |
+| Go 的 `go mod download` / `go install` | `--gomaxprocs 4`，必要时试 `2`、最后才试 `1` | 降低 Go 取模块并发，也会降低编译并行、显著拖慢构建；**不影响前面的 `git clone`** |
+| TypeScript 的 `pnpm install` | `--build-env NPM_CONFIG_NETWORK_CONCURRENCY=4` | 限制 pnpm 同时处理的 HTTP(S) 请求；适用于当前基座的 pnpm 10。只影响 pnpm，不影响 `git clone` 或后续独立运行的 npm |
+| `npm install -g` | `--build-env NPM_CONFIG_MAXSOCKETS=4` | 限制 npm 对**每个来源**的连接数，不是整个代理的全局连接数上限 |
+
+在仓库的 `crosslang/` 目录重试单条（解包后的 bundle 中 trial 平铺，**去掉**
+`--trials-dir full_trials`）：
+
+```bash
+# 先只跑一条，确认代理稳定后再扩到整批。-j 1 写出来是为了强调口径，省略也一样。
+bash build_arm.sh --trials-dir full_trials -j 1 --gomaxprocs 4 abs-module-cache-flags__RiQqZb3
+bash build_arm.sh --trials-dir full_trials -j 1 \
+  --build-env NPM_CONFIG_NETWORK_CONCURRENCY=4 \
+  --build-env NPM_CONFIG_MAXSOCKETS=4 true-myth-iterable-collection-co__zVw8vPV
+```
+
+`--build-env` 只向**构建期**注入变量，镜像构建完成后脚本会检查它们是否残留在
+image config 中。本地 `mars-base:amd64` 的 pnpm 10.26.1 实测
+`NPM_CONFIG_NETWORK_CONCURRENCY=4 pnpm config get network-concurrency` 返回 `4`；
+换了基座或 pnpm 大版本时，先在该基座内用 `pnpm --version` 和
+`pnpm config get network-concurrency` 复核。pnpm 11 改为读取
+`PNPM_CONFIG_NETWORK_CONCURRENCY`，也可通过同一个 `--build-env` 传入
+（见 [pnpm 10 设置](https://pnpm.io/10.x/settings#networkconcurrency)、
+[pnpm 11 环境变量](https://pnpm.io/11.x/configuring)、
+[npm maxsockets](https://docs.npmjs.com/cli/v11/using-npm/config/#maxsockets)）。
+
+**若第一条失败就停在 `RUN git clone`**：此时 Go/pnpm/npm 都还没运行，上表后三个
+参数不会生效。先确认 `-j 1`、没有其他构建共用 cntlm，再排查 cntlm 自身的并发容量
+和稳定性；已经退出的代理需要先恢复，调小后续并发不会让它自动重新可用。
+`--build-network` 改的是构建网络模式，`--stall-timeout` 改的是等待多久，
+两者都**不是**限并发开关。若报的是 `read: connection reset by peer`，
+`--godebug http2client=0` 可单独测试 HTTP/2 兼容性，但同样不是请求数上限。
+
 ### 证书:公司内网做 TLS 中间人时
 
 症状是 `git clone` 报 `server certificate verification failed`。公司代理用内网 CA
@@ -229,7 +275,10 @@ RX 还在涨(哪怕几十 KB/min)就是在爬,等着就行。
 体积差 67 倍、耗时反而小的那个更久;29 条整体落在 1~11 s,均值 5.4 s,**与 size 无关**。
 带宽受限会呈现「小文件快、大文件慢」,这里没有。→ **延迟受限**(RTT + TLS 握手)。
 
-推论:这种情况下 `network-concurrency` 应当**调高**而不是调低——调低是带宽争抢的对策。
+推论:在**代理稳定、只是单次请求高延迟**的前提下，`network-concurrency` 应当
+**调高**而不是调低，以便等待网络时继续处理其他请求。但如果代理本身被并发压垮、
+进程退出或拒绝连接，就该先**调低**请求并发；判据和命令见上面的
+「构建期代理被并发请求压垮」。这两种现象不能混用同一条建议。
 
 **第三步:换源之前先测它值不值**
 
@@ -502,6 +551,8 @@ python3 cmd_stats.py aggregate runs/<批次>/cmd_stats # 只做第二步（只�
 分类器是 `summarize_replay.classify_command_full`）：
 
 - **主类别 / 细类**：跑测试 > 写文件 > 语法校验 > 搜索 > 版本控制 > 读文件 > 其他（优先级）。
+  同属「写文件」时，`cat`/`tee` 写正文 > `mkdir`/`rm` > 其他写法；例如
+  `mkdir -p dir && cat > dir/large.ts <<EOF` 由 `cat` 决定细类和 program。
   跨语言的口径：测试、编译/构建、类型检查、lint/格式化都归「跑测试」，细类是工具名
   （`go test` / `cargo check` / `vitest` / `tsc` / `gofmt`）；装包、查版本归「其他 › 环境查询」；
   跑脚本文件（`node x.mjs` / `tsx x.ts` / `bun run x.ts`）归「跑测试 › 复现脚本」，与 `python3 x.py` 同口径

@@ -17,11 +17,11 @@
 
 先填好上级目录的 `topdown.conf`，运行 `bash ../probe_pmu.sh` 验证事件号和 PMU。
 宿主机需要 `gcc`、`docker`、可用的 `perf` 和 perf 所需权限；镜像须已在本机，
-脚本不会自动拉取。首次执行前运行 `sudo -v`，避免 perf 的 sudo 提示打断测量。
+脚本不会自动拉取。完整采集请从 root shell 启动，demo 内部不调用 `sudo`，
+perf 后面的控制程序和解析器使用启动 demo 的同一个 Python 解释器。
 
 ```bash
 cd deepswe/crosslang/perf_cgroup_demo
-sudo -v
 python3 demo.py --image ubuntu:24.04 --repeats 3
 ```
 

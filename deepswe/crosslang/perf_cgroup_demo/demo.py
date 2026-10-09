@@ -168,15 +168,12 @@ def docker_image_check(image, binary):
 
 
 def perf_prefix():
+    if os.geteuid() != 0:
+        raise RuntimeError("完整 perf 采集请以 root 运行 demo（--smoke 无需 root）")
     version = subprocess.run(["perf", "--version"], text=True, capture_output=True)
     if version.returncode or not re.search(r"perf version \d", version.stdout):
         raise RuntimeError("perf 不可用：" + (version.stdout + version.stderr).strip())
-    if os.geteuid() == 0:
-        return ["perf"]
-    auth = subprocess.run(["sudo", "-n", "true"], capture_output=True)
-    if auth.returncode:
-        raise RuntimeError("perf 需要 sudo；请先运行 sudo -v，再启动 demo")
-    return ["sudo", "-n", "perf"]
+    return ["perf"]
 
 
 def run_case(mode, repeat, root, binary, image, size, cpu, timeout_s,

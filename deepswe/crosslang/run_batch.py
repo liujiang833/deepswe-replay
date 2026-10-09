@@ -341,8 +341,8 @@ def print_pick(report, n, strategy):
 def toml_field(text, key, default):
     """与 replay.py 的 `task_field` 同一个正则、同一个默认值。
 
-    刻意重复而不是 import：两边算的必须是同一个数，资源账才和真正下给 docker 的
-    `--cpus/--memory` 对得上；口径一旦分叉，警告就成了误导。
+    刻意重复而不是 import：未绑核时资源账要和真正下给 docker 的
+    `--cpus/--memory` 对得上；显式绑核时 CPU 配额由 cpuset 覆盖。
     """
     m = re.search(rf'^{key}\s*=\s*"?([^"\n]+)"?', text, re.M)
     return m.group(1).strip() if m else default
@@ -463,8 +463,20 @@ def worst_case_limits(trials):
     return cpus, mem
 
 
-def auto_jobs(trials):
-    """`--jobs auto`：取 CPU 与内存两个约束里更紧的那个，返回 (jobs, 推导说明)。
+def cpuset_cpu_count(spec):
+    """计算显式绑定的不同逻辑 CPU 数（如 0,2-3 → 3）。"""
+    ids = set()
+    for part in spec.split(","):
+        first, sep, last = part.partition("-")
+        start, end = int(first), int(last) if sep else int(first)
+        if end < start:
+            raise ValueError("CPU 范围的终点不能小于起点")
+        ids.update(range(start, end + 1))
+    return len(ids)
+
+
+def auto_jobs(trials, cpuset_cpus=""):
+    """`--jobs auto`：绑核时串行；否则取 CPU 与内存里更紧的约束。
 
     CPU 侧：os.cpu_count() // 每条 cpus —— 一条一份配额，不超卖。
     内存侧：用 MemAvailable 而不是 MemTotal。page cache 可回收，但已被别的进程真正
@@ -473,6 +485,8 @@ def auto_jobs(trials):
 
     推导说明要打出来让人能复核：auto 是个估算，估错了得看得见是哪一侧卡住的。
     """
+    if cpuset_cpus:
+        return 1, f"固定 cpuset={cpuset_cpus}；同一组 CPU 上串行采集"
     cpus, mem_mb = worst_case_limits(trials)
     per_mb = mem_mb + SINK_MB
 
@@ -492,27 +506,35 @@ def auto_jobs(trials):
     return jobs, why
 
 
-def print_budget(trials, jobs):
+def print_budget(trials, jobs, cpuset_cpus=""):
     """开跑前把资源账摆出来，超配只警告不拦。
 
     不拦的理由：现阶段目标是「先跑通」，并发度由跑的人决定；而且限额是上限不是预留，
     超配不等于一定出事。但两侧风险完全不同，必须分开说——见下面的警告文案。
     """
-    cpus, mem_mb = worst_case_limits(trials)
+    task_cpus, mem_mb = worst_case_limits(trials)
+    cpus = cpuset_cpu_count(cpuset_cpus) if cpuset_cpus else task_cpus
     per_mb = mem_mb + SINK_MB
     need_cpu, need_mb = jobs * cpus, jobs * per_mb
     ncpu = os.cpu_count() or 1
+    available_cpu = cpus if cpuset_cpus else ncpu
     total, avail = meminfo_mb("MemTotal"), meminfo_mb("MemAvailable")
 
-    print(f"资源账    {jobs} × (cpus={cpus:g}, mem={mem_mb}MB + sinkhole {SINK_MB}MB)")
-    print(f"          CPU   需 {need_cpu:g} 核配额  /  本机 {ncpu} 核")
+    cpu_label = (f"cpuset={cpuset_cpus}（{cpus:g} 核，无 --cpus 配额）"
+                 if cpuset_cpus else f"cpus={cpus:g}")
+    print(f"资源账    {jobs} × ({cpu_label}, mem={mem_mb}MB + sinkhole {SINK_MB}MB)")
+    cpu_available = (f"绑定集合 {available_cpu:g} 核" if cpuset_cpus else f"本机 {ncpu} 核")
+    print(f"          CPU   需 {need_cpu:g} 核{'使用量' if cpuset_cpus else '配额'}  /  {cpu_available}")
     host_mem = f"本机 {total}MB 总" + (f"、{avail}MB 可用" if avail is not None else "")
     print(f"          内存  需 {need_mb}MB  /  {host_mem}" if total is not None
           else f"          内存  需 {need_mb}MB  /  本机内存未知（读不到 /proc/meminfo）")
 
-    if need_cpu > ncpu:
-        print(f"\n⚠️  CPU 超配（需 {need_cpu:g} 核 / 本机 {ncpu} 核）：只是变慢，不会坏。")
-        print(f"    --cpus 是 CFS 配额不是绑核，超了内核按比例分时，每条各自变慢而已。")
+    if need_cpu > available_cpu:
+        print(f"\n⚠️  CPU 超配（需 {need_cpu:g} 核 / {cpu_available}）：只是变慢，不会坏。")
+        if cpuset_cpus:
+            print("    所有容器绑定同一组 CPU，会在这些核上争抢时间；做性能对照请用 -j 1。")
+        else:
+            print("    --cpus 是 CFS 配额不是绑核，超了内核按比例分时，每条各自变慢而已。")
     if avail is not None and need_mb > avail:
         print(f"\n⚠️  内存超配（需 {need_mb}MB / 可用 {avail}MB）：这一侧才会真出事。")
         print(f"    --memory 是上限不是预留，实际占用通常远低于限额，所以超配不等于一定 OOM；")
@@ -680,7 +702,7 @@ def main():
     ap.add_argument("--cmd-timeout", type=int, default=30,
                     help="单条命令默认超时秒数，默认 30；命令自带更长 timeout 时自动延长")
     ap.add_argument("--cpuset-cpus", default="", metavar="LIST",
-                    help="把每个重放容器固定到指定逻辑 CPU，如 0,2；保留原有 --cpus=2 配额。"
+                    help="把每个重放容器固定到指定逻辑 CPU，如 0,2；指定后覆盖 task 的 --cpus 配额。"
                          "建议串行运行，避免多个容器争抢同一组 CPU")
     ap.add_argument("-j", "--jobs", default="1", metavar="N",
                     help="并发跑几条，默认 1（串行，与加本选项前完全一致，含实时输出）。"
@@ -726,8 +748,13 @@ def main():
     args = ap.parse_args()
     if args.cmd_timeout <= 0:
         ap.error("--cmd-timeout 必须大于 0")
-    if args.cpuset_cpus and not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", args.cpuset_cpus):
-        ap.error("--cpuset-cpus 格式应为 CPU 编号或范围，如 0,2 或 0-1")
+    if args.cpuset_cpus:
+        if not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", args.cpuset_cpus):
+            ap.error("--cpuset-cpus 格式应为 CPU 编号或范围，如 0,2 或 0-1")
+        try:
+            cpuset_cpu_count(args.cpuset_cpus)
+        except ValueError as exc:
+            ap.error(f"--cpuset-cpus: {exc}")
 
     # --metrics 与 --no-metrics 同时给 = 自相矛盾。不静默挑一个：挑错了的后果是
     # 整批要么白跑（v1 上起不来），要么采了一批没人要的 cgroup 数，都得重来。
@@ -813,7 +840,7 @@ def main():
             return 1
 
     if args.jobs == "auto":
-        jobs, jobs_why = auto_jobs(trials)
+        jobs, jobs_why = auto_jobs(trials, args.cpuset_cpus)
         jobs_src = f"auto → {jobs}（{jobs_why}）"
     else:
         try:
@@ -930,7 +957,7 @@ def main():
         print(f"          配置 {topdown.parent / 'topdown.conf'}")
         print(f"          ⚠️ 采到的是**整条 trial 的聚合值**：含容器启动与收尾 git diff，")
         print(f"             各 trial 的命令数差异很大，跨 trial 横向比要带上这个背景")
-    print_budget(trials, jobs)
+    print_budget(trials, jobs, args.cpuset_cpus)
     print("=" * 78)
     # 全量集下逐条列出会刷几百行；只在小批量时详列
     listing = trials if len(trials) <= 12 else []
@@ -1281,6 +1308,8 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None,
         "not_run_reason": (not_run_why if n_not_run else None),
         "results": results,
     }
+    if args.cpuset_cpus:
+        doc["options"]["cpu_limit_policy"] = "cpuset_only"
     # 抽样跑必须留痕：抽样批次的 summary.json 和全量批次长得一模一样，没有这一块
     # 事后会被当成全量结论去引用。策略也要记 —— median 那批天生更轻、固定开销占比更大，
     # 和 heaviest 那批**不可直接比较**。
@@ -1315,7 +1344,8 @@ def write_summary(out, results, elapsed, args, fstype, jobs=1, n_planned=None,
           f"- 主机：{os.uname().release} / {os.cpu_count()} CPU / cgroup {fstype}",
           f"- 单命令默认超时：{args.cmd_timeout}s；显式 timeout 更长时按命令延长"
           + ("（冒烟模式）" if smoke else ""),
-          f"- CPU 绑核：{args.cpuset_cpus or '未启用'}",
+          f"- CPU 绑核：{args.cpuset_cpus or '未启用'}"
+          + ("（覆盖 task --cpus 配额）" if args.cpuset_cpus else ""),
           f"- 并发：{jobs}" + ("（串行，性能数字可比）" if jobs == 1
                               else "（并发，未采指标；墙钟不可与串行批次直接比）"),
           f"- 结果：**{n_ok}/{len(results)} 通过**，总墙钟 {elapsed:.0f}s"]

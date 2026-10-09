@@ -263,6 +263,11 @@ def cpuset_ids(spec):
     return ids
 
 
+def docker_cpu_args(cpus, cpuset_cpus):
+    """显式绑核时让 cpuset 单独决定可用 CPU，不再叠加 task 的 CPU 配额。"""
+    return [f"--cpuset-cpus={cpuset_cpus}"] if cpuset_cpus else [f"--cpus={cpus}"]
+
+
 def cgroup_fstype():
     """`/sys/fs/cgroup` 的文件系统类型。v2 统一层级是 `cgroup2fs`。"""
     r = sh(["stat", "-fc", "%T", str(CGROUP_ROOT)])
@@ -584,7 +589,7 @@ def main():
     ap.add_argument("--cmd-timeout", type=int, default=30,
                     help="单条命令在容器内的默认超时秒数，默认 30；命令里的 timeout/sleep 更长时自动延长")
     ap.add_argument("--cpuset-cpus", default="", metavar="LIST",
-                    help="把重放容器固定到指定逻辑 CPU，如 0,2 或 0-1；仍保留 task.toml 的 CPU 配额")
+                    help="把重放容器固定到指定逻辑 CPU，如 0,2 或 0-1；指定后不再设置 task.toml 的 --cpus 配额")
     ap.add_argument("--interpreter", default="/bin/sh -c",
                     help="执行器 argv（空格分隔），默认 '/bin/sh -c'（dash，对齐原 harness）；"
                          "旧口径是 'bash -lc'")
@@ -654,7 +659,9 @@ def main():
 
     print(f"image     {image}")
     print(f"base_sha  {base_sha}")
-    print(f"limits    cpus={cpus} mem={mem_mb}MB net="
+    cpu_limit = (f"cpuset={args.cpuset_cpus}（覆盖 task cpus={cpus}）"
+                 if args.cpuset_cpus else f"cpus={cpus}")
+    print(f"limits    {cpu_limit} mem={mem_mb}MB net="
           f"{'on' if allow_net else ('none+403-sinkhole' if use_sink else 'none')}")
     print(f"exec      {' '.join(interp)}")
     print(f"commands  {n_all} 条，跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
@@ -686,9 +693,8 @@ def main():
 
     run = ["docker", "run", "-d", "--name", name,
            "--label", f"{owner_label}={run_id}",
-           f"--cpus={cpus}", f"--memory={mem_mb}m", f"--memory-swap={mem_mb}m"]
-    if args.cpuset_cpus:
-        run += [f"--cpuset-cpus={args.cpuset_cpus}"]
+           *docker_cpu_args(cpus, args.cpuset_cpus),
+           f"--memory={mem_mb}m", f"--memory-swap={mem_mb}m"]
     if not allow_net:
         run += ["--network=none"]
     if use_sink:
@@ -888,6 +894,8 @@ def main():
                             "cgroup_discovery": cg.how,
                             "cgroup_has_io": cg.has_io,
                             "cpuset_cpus": actual_cpuset,
+                            "cpu_limit_policy": "cpuset_only" if args.cpuset_cpus else "task_quota",
+                            "task_cpus": cpus,
                             "nproc": os.cpu_count(),
                             "image": image}}
         if sink_cg:

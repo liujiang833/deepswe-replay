@@ -8,6 +8,9 @@ import unittest
 spec = importlib.util.spec_from_file_location("deepswe_replay", Path(__file__).resolve().parents[1] / "replay.py")
 replay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replay)
+crosslang_spec = importlib.util.spec_from_file_location("crosslang_replay", Path(__file__).resolve().parent / "replay.py")
+crosslang_replay = importlib.util.module_from_spec(crosslang_spec)
+crosslang_spec.loader.exec_module(crosslang_replay)
 
 
 class CpuSetTests(unittest.TestCase):
@@ -19,6 +22,13 @@ class CpuSetTests(unittest.TestCase):
         for value in ("2-0", "0,,2", "0;2", ""):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 replay.cpuset_ids(value)
+
+    def test_cpuset_overrides_task_cpu_quota(self):
+        for module in (replay, crosslang_replay):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(module.docker_cpu_args("2", ""), ["--cpus=2"])
+                self.assertEqual(module.docker_cpu_args("2", "3"), ["--cpuset-cpus=3"])
+                self.assertEqual(module.docker_cpu_args("2", "0,2"), ["--cpuset-cpus=0,2"])
 
 
 if __name__ == "__main__":

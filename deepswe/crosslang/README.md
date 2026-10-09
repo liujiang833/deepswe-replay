@@ -133,7 +133,7 @@ python3 run_batch.py --trials-dir full_trials --skip-missing --keep-going   # �
 - `--keep-going` —— 某条失败后继续跑剩下的（默认遇错即停）
 - `--only python,go` —— 只跑指定语言
 - `--exclude python` —— 排除指定语言；支持逗号分隔，也可与 `--only` 叠加
-- `--cpuset-cpus <CPU列表>` —— 固定重放容器使用的逻辑 CPU，同时保留任务声明的 `--cpus=2` 配额。
+- `--cpuset-cpus <CPU列表>` —— 固定重放容器使用的逻辑 CPU，并覆盖任务声明的 `--cpus` 配额；例如指定 `3` 时只传 `--cpuset-cpus=3`。
   编号先用 `lscpu -e=CPU,CORE,SOCKET,NODE` 核对（例如不同 CORE 的 `0,2`）；做性能对照时用 `-j 1`，避免多条
   trial 争抢同一组 CPU。绑核是额外实验条件，结果需与未绑核批次分开比较。
 

@@ -18,8 +18,8 @@
   - 本机 5.15 内核没有 memory.peak（6.8 才有），改用后台线程轮询 memory.current，
     取单条命令执行窗口内的最大值作为 mem_peak。
   - 单命令超时交给**容器内**的 timeout 执行（timeout -k 5 <T>），宿主侧只留一个
-    远高于 T 的兜底值防 docker exec 本身挂死。无显式时限时 T=30s；agent 命令
-    自带更长的 timeout 时按该时限延长外层限制，避免提前截断测试。
+    远高于 T 的兜底值防 docker exec 本身挂死。无显式等待时 T=30s；agent 命令
+    自带 timeout 或 sleep 时延长限制，避免提前截断后续命令。
 
 保真度口径（v3，两处对齐原 harness）：
   - **执行器 `/bin/sh -c`（dash），不是 `bash -lc`**。证据是 trace 侧的 observation：
@@ -82,7 +82,7 @@ from datetime import datetime
 
 MEM_POLL_S = 0.02      # memory.current 轮询间隔
 OUTER_SLACK_S = 60     # 宿主侧兜底超时 = 本条命令时限 + 该值（正常绝不触发）
-INNER_TIMEOUT_GRACE_S = 10  # agent 命令里的 timeout 结束后，留给管道和收尾命令
+INNER_TIMEOUT_GRACE_S = 10  # agent 命令里的 timeout/sleep 结束后，留给管道和收尾命令
 SINK_PORT = 3128       # sinkhole 代理监听端口（容器 netns 内的 127.0.0.1）
 CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
 
@@ -92,9 +92,9 @@ DURATION_MULTIPLIER = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def command_timeout_s(command, default_s):
-    """为命令里的 GNU timeout / go test -timeout 留够时间。
+    """为命令里的 GNU timeout / go test -timeout / sleep 留够时间。
 
-    多个 timeout 可能顺序执行，因此累加时限。这里只分析命令文本，不执行任何内容。
+    多个等待可能顺序执行，因此累加时限。这里只分析命令文本，不执行任何内容。
     here-doc 的正文是写入文件的数据，不是当前 shell 要执行的命令。
     """
     lines, pending = [], []
@@ -107,6 +107,10 @@ def command_timeout_s(command, default_s):
         pending.extend(m.group(2) for m in HEREDOC_RE.finditer(line))
     try:
         tokens = shlex.split("".join(lines), comments=True)
+        lexer = shlex.shlex("".join(lines), posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"  # 保留换行作为命令分隔符
+        lexer.whitespace_split = True
+        sleep_tokens = list(lexer)
     except ValueError:
         return default_s  # 无法可靠解析的命令仍按调用方指定的默认时限执行
 
@@ -142,10 +146,29 @@ def command_timeout_s(command, default_s):
         match = DURATION_RE.fullmatch(tokens[j])
         if match:
             durations.append(float(match.group(1)) * DURATION_MULTIPLIER[match.group(2)])
-    if not durations and not go_test_durations:
-        return default_s
-    # 两种超时可能分属顺序执行的命令；保守地累加，避免外层提前截断。
+    sleep_durations = []
+    command_start = True
+    for i, token in enumerate(sleep_tokens):
+        if token and all(c in ";&|()\n" for c in token):
+            command_start = True
+            continue
+        if token in ("then", "do", "else"):
+            command_start = True
+            continue
+        if command_start and token in ("nohup", "time"):
+            continue
+        if command_start and token in ("sleep", "/bin/sleep", "/usr/bin/sleep"):
+            for arg in sleep_tokens[i + 1:]:
+                match = DURATION_RE.fullmatch(arg)
+                if not match:
+                    break
+                sleep_durations.append(float(match.group(1)) * DURATION_MULTIPLIER[match.group(2)])
+        command_start = False
     explicit_s = sum(durations) + sum(go_test_durations)
+    sleep_s = sum(sleep_durations)
+    # 在原有命令预算之外加上等待时间，给 sleep 后面的命令保留完整执行窗口。
+    if sleep_s:
+        return math.ceil(sleep_s + max(default_s, explicit_s + INNER_TIMEOUT_GRACE_S))
     if explicit_s <= default_s:
         return default_s
     return math.ceil(explicit_s + INNER_TIMEOUT_GRACE_S)
@@ -558,7 +581,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 条命令（冒烟用）")
     ap.add_argument("--keep", action="store_true", help="结束后保留容器")
     ap.add_argument("--cmd-timeout", type=int, default=30,
-                    help="单条命令在容器内的默认超时秒数，默认 30；命令自带更长的 timeout 时自动延长")
+                    help="单条命令在容器内的默认超时秒数，默认 30；命令里的 timeout/sleep 更长时自动延长")
     ap.add_argument("--cpuset-cpus", default="", metavar="LIST",
                     help="把重放容器固定到指定逻辑 CPU，如 0,2 或 0-1；仍保留 task.toml 的 CPU 配额")
     ap.add_argument("--interpreter", default="/bin/sh -c",
@@ -627,7 +650,7 @@ def main():
     print(f"exec      {' '.join(interp)}")
     print(f"commands  {n_all} 条，跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
     print(f"cpuset    {args.cpuset_cpus or '不绑核'}")
-    print(f"timeout   默认 {args.cmd_timeout}s；命令显式 timeout 更长时自动延长"
+    print(f"timeout   默认 {args.cmd_timeout}s；命令中的 timeout/sleep 更长时自动延长"
           f"（宿主兜底另加 {OUTER_SLACK_S}s）")
     print(f"container {name}")
 

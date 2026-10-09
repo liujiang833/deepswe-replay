@@ -431,6 +431,9 @@ python3 run_batch.py --topdown --per-lang 2 --no-metrics
 # 只看某几种语言
 python3 run_batch.py --topdown --per-lang 2 --only python,go --no-metrics
 
+# 跳过 Python，其他语言照常参与抽样
+python3 run_batch.py --topdown --per-lang 2 --exclude python --no-metrics
+
 # 不真跑，只看这轮会选中哪些、资源账多少
 python3 run_batch.py --topdown --per-lang 2 --dry-run
 ```

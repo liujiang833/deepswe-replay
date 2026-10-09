@@ -639,7 +639,8 @@ WSL 上实测过这个假阳性：`docker inspect .State.Pid` 给的是 dockerd 
 
 `logs/<trial>.log` 是实时写的，`tail -f` 看。单条命令默认最长 30s；若命令里显式写了
 更长的 GNU `timeout` 或 `go test -timeout`，重放器会按其时限加 10s 收尾时间设置外层限制。
-多个顺序执行的 `timeout` 会累加。宿主侧另加
+多个顺序执行的 `timeout` 会累加。命令里的 `sleep N` 会在原有预算上增加 N 秒，
+例如 `sleep 120 && tail ...` 默认限时 150s，让 `tail` 仍有 30s 执行窗口。宿主侧另加
 60s 兜底，正常不会真卡死。rust 那条基线里 agent 自己有大量 `sleep 25~29`
 在等后台编译，看着像卡住但是正常的。
 

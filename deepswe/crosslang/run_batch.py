@@ -672,6 +672,8 @@ def main():
                     help="输出根目录，默认 ./runs/<UTC 时间戳>")
     ap.add_argument("--only", default="",
                     help="只跑这些语言，逗号分隔（python,go,rust,typescript,javascript）")
+    ap.add_argument("--exclude", default="",
+                    help="排除这些语言，逗号分隔（如 python 或 python,go）；可与 --only 叠加")
     ap.add_argument("--smoke", type=int, default=0,
                     help="每条只跑前 N 条命令。注意：这会跳过 patch 保真度校验（patch 不完整），"
                          "只用来确认容器能起、cgroup 能读、命令能执行")
@@ -701,7 +703,7 @@ def main():
                          "事后用 topdown_cluster.py 做多级聚类（per-trial / per-language / all）")
     ap.add_argument("--per-lang", type=int, default=0, metavar="N",
                     help="每种语言只抽 N 条跑（只在镜像已建好的里面挑）。"
-                         "某语言一条都没建好就贡献 0 条，不报错。可与 --only 叠加")
+                         "某语言一条都没建好就贡献 0 条，不报错。可与 --only/--exclude 叠加")
     ap.add_argument("--pick", choices=("median", "heaviest", "lightest"), default="median",
                     help="--per-lang 的选取策略，默认 median（按命令数取中位）。"
                          "heaviest = 取命令最多的，数据更干净但慢几倍"
@@ -776,8 +778,11 @@ def main():
     if args.only:
         want = {s.strip() for s in args.only.split(",") if s.strip()}
         trials = [t for t in trials if t["lang"] in want]
+    if args.exclude:
+        omit = {s.strip() for s in args.exclude.split(",") if s.strip()}
+        trials = [t for t in trials if t["lang"] not in omit]
     if not trials:
-        print("没有可跑的 trial（--only 过滤掉了全部，或目录里没有合规的 trial）")
+        print("没有可跑的 trial（--only/--exclude 过滤掉了全部，或目录里没有合规的 trial）")
         return 1
 
     # --per-lang 天然只在「镜像已建好」的里面挑，所以它和 --skip-missing 是同一个前提：

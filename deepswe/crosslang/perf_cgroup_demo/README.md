@@ -8,6 +8,27 @@
 | `docker_pid` | 容器内矩阵乘进程对应的宿主机 PID：`perf stat -p PID` | 容器中的进程直采基线 |
 | `docker_cgroup` | 同一容器的 cgroup：`perf stat -a -G CGROUP` | 检验正式 replay 的 cgroup 采法 |
 
+三种模式实际执行的核心采集命令如下（变量代表每次运行时生成的路径和 PID）：
+
+```bash
+# native_pid：宿主机直接启动 matmul，取得它的 PID
+perf stat -x, -o "$PERF_CSV" -e "$EVENTS" -p "$NATIVE_PID" \
+  -- python3 -c "$PERF_GATE" "$CASE_DIR"
+
+# docker_pid：docker inspect 取得容器内 matmul 对应的宿主机 PID
+perf stat -x, -o "$PERF_CSV" -e "$EVENTS" -p "$CONTAINER_HOST_PID" \
+  -- python3 -c "$PERF_GATE" "$CASE_DIR"
+
+# docker_cgroup：从 /proc/<容器主进程PID>/cgroup 取得路径
+perf stat -x, -o "$PERF_CSV" -e "$EVENTS" -a -G "$CGROUP" \
+  -- python3 -c "$PERF_GATE" "$CASE_DIR"
+```
+
+`$EVENTS` 是从 `topdown.conf` 组装的同一组事件。`--` 后的 Python 仅等待停止信号，
+用来确定 perf 的采集时长；被计数的是 `-p` 指定的进程或 `-G` 指定的容器 cgroup。
+脚本实际使用的是启动 demo 的 `sys.executable`。每次运行的完整参数（包括控制代码）
+保存在对应目录的 `perf_argv.json`。
+
 每种模式使用**新的进程或容器**，采集**串行**进行，避免两套 perf 会话抢 PMU 计数器。
 矩阵乘进程是容器 PID 1，单线程、无子进程；它完成初始化后阻塞在 FIFO，等 perf
 启动并确认就绪才进入三层循环。计算结束后仍保持存活，等 perf 收尾再退出。

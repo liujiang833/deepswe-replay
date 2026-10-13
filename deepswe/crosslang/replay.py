@@ -578,6 +578,14 @@ def load_trace(traj):
     return items
 
 
+def select_trace_commands(items, start_step, stop_step):
+    """Keep all commands of each selected step, preserving original command indexes."""
+    selected = [(i, it) for i, it in enumerate(items)
+                if start_step <= it["step"] < stop_step]
+    todo = [(i, it) for i, it in selected if not it["sentinel"]]
+    return todo, len(selected) - len(todo)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trial_dir", help="含 trajectory.json / model.patch 的目录")
@@ -585,6 +593,12 @@ def main():
     ap.add_argument("-o", "--outdir", default="",
                     help="输出根目录；默认每次运行在 deepswe/replay_out/ 下新建目录")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 条命令（冒烟用）")
+    ap.add_argument("--start-step", type=int, default=0,
+                    help="只重放此 step 起的命令（含）；step 为 load_trace 的 0 基编号")
+    ap.add_argument("--stop-before-step", type=int, default=None,
+                    help="在此 step 前停止（不含）；可用于构建 step 前检查点")
+    ap.add_argument("--from-image", default="",
+                    help="从指定的本地检查点镜像启动，覆盖 task.toml 中的原始镜像")
     ap.add_argument("--keep", action="store_true", help="结束后保留容器")
     ap.add_argument("--cmd-timeout", type=int, default=30,
                     help="单条命令在容器内的默认超时秒数，默认 30；命令里的 timeout/sleep 更长时自动延长")
@@ -611,6 +625,8 @@ def main():
     args = ap.parse_args()
     if args.cmd_timeout <= 0:
         ap.error("--cmd-timeout 必须大于 0")
+    if args.limit and (args.start_step or args.stop_before_step is not None):
+        ap.error("--limit 不能与 step 范围参数同时使用")
     if args.cpuset_cpus:
         try:
             cpuset_ids(args.cpuset_cpus)
@@ -628,18 +644,21 @@ def main():
     files = {f["path"]: f["content"] for f in task["files"]}
     toml = files["task.toml"]
 
-    image = task_field(toml, "docker_image")
+    image = args.from_image or task_field(toml, "docker_image")
     base_sha = task_field(toml, "base_commit_hash")
     cpus = task_field(toml, "cpus", "2")
     mem_mb = task_field(toml, "memory_mb", "8192")
     allow_net = task_field(toml, "allow_internet", "false") == "true"
 
-    items = load_trace(traj)
-    n_all = len(items)
-    if args.limit:
-        items = items[: args.limit]
-    todo = [(i, it) for i, it in enumerate(items) if not it["sentinel"]]
-    n_skipped = len(items) - len(todo)
+    all_items = load_trace(traj)
+    n_all = len(all_items)
+    n_steps = max((it["step"] for it in all_items), default=-1) + 1
+    stop_step = n_steps if args.stop_before_step is None else args.stop_before_step
+    if not 0 <= args.start_step <= stop_step <= n_steps:
+        ap.error(f"step 范围须满足 0 <= start <= stop <= {n_steps}")
+    items = all_items[:args.limit] if args.limit else all_items
+    todo, n_skipped = select_trace_commands(items, args.start_step, stop_step)
+    partial_replay = bool(args.limit or args.start_step or stop_step != n_steps)
 
     # PID + 随机 salt：即使 PID 被复用，同一 trial 的两次运行也不会撞容器名。
     prefix = "replay_" + re.sub(r"[^A-Za-z0-9_.-]", "_", tdir.name)[:44]
@@ -664,7 +683,8 @@ def main():
     print(f"limits    {cpu_limit} mem={mem_mb}MB net="
           f"{'on' if allow_net else ('none+403-sinkhole' if use_sink else 'none')}")
     print(f"exec      {' '.join(interp)}")
-    print(f"commands  {n_all} 条，跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
+    print(f"commands  {n_all} 条，step [{args.start_step}, {stop_step})，"
+          f"跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
     print(f"cpuset    {args.cpuset_cpus or '不绑核'}")
     print(f"timeout   默认 {args.cmd_timeout}s；命令中的 timeout/sleep 更长时自动延长"
           f"（宿主兜底另加 {OUTER_SLACK_S}s）")
@@ -879,6 +899,11 @@ def main():
         (out / "replayed.patch").write_bytes(replayed)
         orig_p = tdir / "model.patch"
         verdict = {"elapsed_s": round(elapsed, 1),
+                   "container_name": name,
+                   "start_step": args.start_step,
+                   "stop_before_step": stop_step,
+                   "partial_replay": partial_replay,
+                   "source_image": image,
                    "cmd_timeout_s": args.cmd_timeout,
                    "cmd_timeout_policy": "default_with_explicit_command_timeout",
                    "interpreter": interp,
@@ -907,7 +932,7 @@ def main():
             print(f"  sinkhole 开销  CPU {(sk['usage_usec'] - sink_cpu0) / 1e6:.3f}s"
                   f"（全生命周期 {sk['usage_usec'] / 1e6:.3f}s）"
                   f" / RSS {sk['memory_current'] / 1e6:.1f}MB —— 独立 cgroup，未计入被测指标")
-        if orig_p.exists() and not args.limit:
+        if orig_p.exists() and not partial_replay:
             orig = orig_p.read_bytes()
             verdict["model_patch_bytes"] = len(orig)
             verdict["patch_identical"] = (replayed == orig)
@@ -916,7 +941,7 @@ def main():
             print(f"  原始 patch  {len(orig):>9,}B")
             print(f"  逐字节一致  {'✅ 是' if replayed == orig else '❌ 否'}")
         else:
-            print("\n（--limit 模式或缺 model.patch，跳过硬校验）")
+            print("\n（局部重放或缺 model.patch，跳过整条 trial 的 patch 硬校验）")
 
         # ---- 软校验：rc 序列与 trace 记录逐条比对（哨兵已排除在 recs 之外）----
         # 两个口径都保留：

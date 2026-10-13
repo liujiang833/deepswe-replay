@@ -211,6 +211,52 @@ bash topdown_trial.sh full_trials/<trial> --per-step --no-metrics
 的四象限向量。批次的 `SUMMARY.md` 会记录有效 step 数和全部 interval 的聚合值；
 逐 step 解析没有保存完整 C1~C5 自检，因此报告不计算跨 trial 均值。
 
+#### 只重放选中的 step：检查点镜像 + 预热
+
+输入 CSV 只要求 `trial,step` 两列。`trial` 是 `full_trials/` 下的完整目录名；
+`step` 默认采用 `commands.jsonl` / 聚类结果中的 **0 基** tool-call step 编号。
+若输入是 1 基编号，构建时加 `--step-base 1`；输出的 `step` 会统一变成 0 基，
+原值保存在 `input_step`。其它输入列原样保留。
+
+```bash
+python3 prepare_step_dockers.py steps.csv \
+    --trials-dir full_trials --buffer-steps 5 -o steps_docker.csv
+python3 replay_selected_steps.py steps_docker.csv \
+    --trials-dir full_trials --repeat 3
+```
+
+目标 step 为 `s` 时，第一阶段执行 `[0, max(0,s-5))` 的完整 step，
+在下一个 step **开始前** `docker commit`。相同 `trial + checkpoint_step` 的输入行
+在本次构建中共用一个镜像。镜像 tag 沿用 `build_arm.sh` 从 `task.toml` 读取的
+原始 `docker_image`，追加 `-<来源哈希>-replay-step<输入 CSV 的 step>`；step 在 tag 末尾，
+来源哈希避免同一个 task 的不同 trial 使用相同 tag。`steps_docker.csv` 保留输入行，
+并附上 `image_tag`、不可变的镜像 ID、
+trajectory 哈希、实际预热步数和构建状态。检查点属于本机 Docker 镜像，
+在另一台机器上重放前需要搬运镜像。
+每个检查点镜像还带有 `org.deepswe.per-step-replay=true` 标签；即使检查点在
+step 0，也创建独立的带标签镜像，不把 replay 标签加到原始任务镜像上。
+
+第二阶段每轮从检查点镜像新建容器，重放 `[checkpoint_step, s+1)`。
+容器 cgroup 出现后启动 `perf stat -I 10`，采集期间不控制计数器；
+沿用 `topdown_steps.py` 的时间戳对齐与 step 窗口归并，最终只取目标 step 的行。
+`step_replay_runs/<批次>/results.csv` 保存目标四象限、cycles、退出码及数据状态，
+原始 perf、预热步和目标步的完整结果保留在各轮目录中。
+
+如果 perf 启动得太晚、目标时间窗没有足够 interval 覆盖，或者目标行没有 cycles，
+这一轮会写 `status=error`；增大 `--buffer-steps` 后重新构建检查点。
+局部重放不会拿整条 trial 的 `model.patch` 作最终校验，改为检查所执行命令的
+退出码与轨迹是否一致。`--limit` 是**命令数量**截断，不能替代 step 范围。
+
+反复准备环境前，可清理这批检查点镜像。脚本逐个核对 tag、镜像 ID 和 replay 标签，
+只调用 `docker image rm` 删除匹配的镜像引用；原始任务镜像不会进入候选名单。
+若镜像仍被容器使用，Docker 会拒绝删除，脚本记录失败并继续处理其它镜像。
+
+```bash
+python3 cleanup_step_dockers.py steps_docker.csv --dry-run  # 先查看匹配项
+python3 cleanup_step_dockers.py steps_docker.csv            # 删除本批次
+python3 cleanup_step_dockers.py --all                       # 删除本机全部已标记的检查点
+```
+
 ### 7.3 四级聚类分析
 
 收集完 per-step 数据后，用 `topdown_cluster.py` 做四级聚类：

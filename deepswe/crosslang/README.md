@@ -219,23 +219,26 @@ bash topdown_trial.sh full_trials/<trial> --per-step --no-metrics
 原值保存在 `input_step`。其它输入列原样保留。
 
 ```bash
-python3 prepare_step_dockers.py steps.csv \
+python3 prepare_step_dockers.py exp_steps.csv \
     --trials-dir full_trials --buffer-steps 5 --dry-run
-python3 prepare_step_dockers.py steps.csv \
-    --trials-dir full_trials --buffer-steps 5 -o steps_docker.csv
-python3 replay_selected_steps.py steps_docker.csv \
+python3 prepare_step_dockers.py exp_steps.csv \
+    --trials-dir full_trials --buffer-steps 5
+python3 replay_selected_steps.py exp_steps_docker.csv \
     --trials-dir full_trials --repeat 3
 ```
 
 `--dry-run` 只读 CSV、trajectory、task 定义和本地原始镜像信息，不启动容器、
-不执行命令，也不创建或修改镜像。默认写 `steps_docker.plan.csv`，行状态为
-`planned`，`image_id` 留空；正式执行仍生成 `steps_docker.csv`，后续重放只读正式文件。
+不执行命令，也不创建或修改镜像。默认在输入文件旁写
+`<原文件名>_docker.plan.csv`，行状态为 `planned`，`image_id` 留空；
+正式执行生成 `<原文件名>_docker.csv`，例如 `exp_steps.csv` 对应
+`exp_steps_docker.csv`、`foo.csv` 对应 `foo_docker.csv`；前缀完全取自输入文件名。
+后续重放只读正式文件。
 
 目标 step 为 `s` 时，第一阶段执行 `[0, max(0,s-5))` 的完整 step，
 在下一个 step **开始前** `docker commit`。相同 `trial + checkpoint_step` 的输入行
 在本次构建中共用一个镜像。镜像 tag 沿用 `build_arm.sh` 从 `task.toml` 读取的
 原始 `docker_image`，追加 `-<来源哈希>-replay-step<输入 CSV 的 step>`；step 在 tag 末尾，
-来源哈希避免同一个 task 的不同 trial 使用相同 tag。`steps_docker.csv` 保留输入行，
+来源哈希避免同一个 task 的不同 trial 使用相同 tag。`*_docker.csv` 保留输入行，
 并附上 `image_tag`、不可变的镜像 ID、
 trajectory 哈希、实际预热步数和构建状态。检查点属于本机 Docker 镜像，
 在另一台机器上重放前需要搬运镜像。
@@ -264,8 +267,8 @@ python3 diagnose_step_prepare.py step_prepare_logs -o step_prepare_diagnosis.txt
 只重试失败项时，用上一次的清单作为输入：
 
 ```bash
-# 准备阶段失败：只重建 steps_docker.csv 中 status=error 的行，原位更新清单
-python3 prepare_step_dockers.py steps_docker.csv --retry-failed --trials-dir full_trials
+# 准备阶段失败：只重建 exp_steps_docker.csv 中 status=error 的行，原位更新清单
+python3 prepare_step_dockers.py exp_steps_docker.csv --retry-failed --trials-dir full_trials
 
 # 测量阶段失败：只重新运行上一次 results.csv 中 status=error 的行，产生新批次
 python3 replay_selected_steps.py step_replay_runs/<批次>/results.csv \
@@ -280,8 +283,8 @@ python3 replay_selected_steps.py step_replay_runs/<批次>/results.csv \
 若镜像仍被容器使用，Docker 会拒绝删除，脚本记录失败并继续处理其它镜像。
 
 ```bash
-python3 cleanup_step_dockers.py steps_docker.csv --dry-run  # 先查看匹配项
-python3 cleanup_step_dockers.py steps_docker.csv            # 删除本批次
+python3 cleanup_step_dockers.py exp_steps_docker.csv --dry-run  # 先查看匹配项
+python3 cleanup_step_dockers.py exp_steps_docker.csv            # 删除本批次
 python3 cleanup_step_dockers.py --all                       # 删除本机全部已标记的检查点
 ```
 

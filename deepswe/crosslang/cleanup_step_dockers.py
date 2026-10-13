@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Remove only images labeled for DeepSWE per-step replay.
 
-Pass steps_docker.csv to remove that batch, or --all for every locally labeled
+Pass the generated *_docker.csv to remove that batch, or --all for every locally labeled
 per-step replay image. The original task images are never removal candidates.
 """
 

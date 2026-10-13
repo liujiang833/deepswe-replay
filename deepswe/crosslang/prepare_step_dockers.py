@@ -48,6 +48,11 @@ def checkpoint_tag(base_ref, token, input_step):
     return base_ref + suffix
 
 
+def default_output_path(source, dry_run=False):
+    suffix = "_docker.plan.csv" if dry_run else "_docker.csv"
+    return source.with_name(source.stem + suffix)
+
+
 def trial_info(trials_dir, trial):
     if not trial or Path(trial).name != trial or trial in (".", ".."):
         raise ValueError(f"trial 必须是 full_trials 下的目录名: {trial!r}")
@@ -137,11 +142,11 @@ def main():
     ap.add_argument("steps_csv", type=Path, help="含 trial,step 两列；step 为 0 基 tool-call step")
     ap.add_argument("--trials-dir", type=Path, default=HERE / "full_trials")
     ap.add_argument("-o", "--output", type=Path,
-                    help="输出 CSV；正式构建默认 steps_docker.csv，预览默认 steps_docker.plan.csv")
+                    help="输出 CSV；默认在输入文件旁生成 <原文件名>_docker.csv，预览加 .plan")
     ap.add_argument("--dry-run", action="store_true",
                     help="只验证输入、检查原始镜像并生成计划 CSV；不启动容器或创建镜像")
     ap.add_argument("--retry-failed", action="store_true",
-                    help="输入上次的 steps_docker.csv，只重试 status=error 的行；默认原位更新清单")
+                    help="输入上次的 *_docker.csv，只重试 status=error 的行；默认原位更新清单")
     ap.add_argument("--buffer-steps", type=int,
                     help="预热 step 数；首次默认 5，重试默认沿用清单中的 warmup_steps")
     ap.add_argument("--step-base", type=int, choices=(0, 1), default=0,
@@ -156,15 +161,15 @@ def main():
         ap.error("重试清单中的 step 已是 0 基编号，不要再传 --step-base")
     if args.output is None:
         args.output = (args.steps_csv if args.retry_failed else
-                       Path("steps_docker.plan.csv" if args.dry_run else "steps_docker.csv"))
+                       default_output_path(args.steps_csv, args.dry_run))
     if not args.retry_failed and args.output.resolve() == args.steps_csv.resolve():
-        ap.error("输出 CSV 不能覆盖输入 steps.csv")
+        ap.error("输出 CSV 不能覆盖输入文件")
     with args.steps_csv.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or not {"trial", "step"}.issubset(reader.fieldnames):
             ap.error("steps.csv 必须包含 trial 和 step 两列")
         if args.retry_failed and not {"status", "input_step", "step_base"}.issubset(reader.fieldnames):
-            ap.error("--retry-failed 需要上次生成的 steps_docker.csv")
+            ap.error("--retry-failed 需要上次生成的 *_docker.csv")
         source_fields = list(reader.fieldnames)
         rows = list(reader)
     output_fields = source_fields + [field for field in FIELDS if field not in source_fields]

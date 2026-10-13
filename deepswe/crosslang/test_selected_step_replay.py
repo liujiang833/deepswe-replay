@@ -41,11 +41,11 @@ class SelectedStepReplayTest(unittest.TestCase):
             (trial / "trajectory.json").write_text(json.dumps(trajectory()))
             (trial / "task.json").write_text(json.dumps({"files": [
                 {"path": "task.toml", "content": 'docker_image = "example:fixed"\n'}]}))
-            input_csv = root / "steps.csv"
+            input_csv = root / "exp_steps.csv"
             input_csv.write_text("trial,step,cluster\nsample,5,C1\nsample,5,C2\n")
-            output_csv = root / "steps_docker.csv"
+            output_csv = root / "exp_steps_docker.csv"
             argv = ["prepare_step_dockers.py", str(input_csv), "--trials-dir", str(root / "trials"),
-                    "-o", str(output_csv), "--logs-dir", str(root / "logs"),
+                    "--logs-dir", str(root / "logs"),
                     "--step-base", "1", "--buffer-steps", "2"]
             with patch.object(sys, "argv", argv), \
                  patch.object(prepare, "image_id", return_value="sha256:base"), \
@@ -71,11 +71,11 @@ class SelectedStepReplayTest(unittest.TestCase):
             (trial / "trajectory.json").write_text(json.dumps(trajectory()))
             (trial / "task.json").write_text(json.dumps({"files": [
                 {"path": "task.toml", "content": 'docker_image = "example:fixed"\n'}]}))
-            input_csv = root / "steps.csv"
+            input_csv = root / "exp_steps.csv"
             input_csv.write_text("trial,step\nsample,4\n")
-            output_csv = root / "steps_docker.plan.csv"
+            output_csv = root / "exp_steps_docker.plan.csv"
             argv = ["prepare_step_dockers.py", str(input_csv), "--trials-dir", str(root / "trials"),
-                    "--dry-run", "--buffer-steps", "2", "-o", str(output_csv)]
+                    "--dry-run", "--buffer-steps", "2"]
             with patch.object(sys, "argv", argv), \
                  patch.object(prepare, "image_id", return_value="sha256:base"), \
                  patch.object(prepare, "prepare_checkpoint") as commit, \

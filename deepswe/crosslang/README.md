@@ -220,10 +220,16 @@ bash topdown_trial.sh full_trials/<trial> --per-step --no-metrics
 
 ```bash
 python3 prepare_step_dockers.py steps.csv \
+    --trials-dir full_trials --buffer-steps 5 --dry-run
+python3 prepare_step_dockers.py steps.csv \
     --trials-dir full_trials --buffer-steps 5 -o steps_docker.csv
 python3 replay_selected_steps.py steps_docker.csv \
     --trials-dir full_trials --repeat 3
 ```
+
+`--dry-run` 只读 CSV、trajectory、task 定义和本地原始镜像信息，不启动容器、
+不执行命令，也不创建或修改镜像。默认写 `steps_docker.plan.csv`，行状态为
+`planned`，`image_id` 留空；正式执行仍生成 `steps_docker.csv`，后续重放只读正式文件。
 
 目标 step 为 `s` 时，第一阶段执行 `[0, max(0,s-5))` 的完整 step，
 在下一个 step **开始前** `docker commit`。相同 `trial + checkpoint_step` 的输入行

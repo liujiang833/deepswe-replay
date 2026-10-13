@@ -63,6 +63,33 @@ class SelectedStepReplayTest(unittest.TestCase):
             self.assertEqual([row["cluster"] for row in rows], ["C1", "C2"])
             self.assertEqual(commit.call_count, 1)
 
+    def test_prepare_dry_run_writes_plan_without_creating_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trial = root / "trials" / "sample"
+            trial.mkdir(parents=True)
+            (trial / "trajectory.json").write_text(json.dumps(trajectory()))
+            (trial / "task.json").write_text(json.dumps({"files": [
+                {"path": "task.toml", "content": 'docker_image = "example:fixed"\n'}]}))
+            input_csv = root / "steps.csv"
+            input_csv.write_text("trial,step\nsample,4\n")
+            output_csv = root / "steps_docker.plan.csv"
+            argv = ["prepare_step_dockers.py", str(input_csv), "--trials-dir", str(root / "trials"),
+                    "--dry-run", "--buffer-steps", "2", "-o", str(output_csv)]
+            with patch.object(sys, "argv", argv), \
+                 patch.object(prepare, "image_id", return_value="sha256:base"), \
+                 patch.object(prepare, "prepare_checkpoint") as commit, \
+                 patch.object(prepare, "docker") as docker_call:
+                self.assertEqual(prepare.main(), 0)
+            commit.assert_not_called()
+            docker_call.assert_not_called()
+            with output_csv.open(newline="") as f:
+                row = next(csv.DictReader(f))
+            self.assertEqual(row["status"], "planned")
+            self.assertEqual(row["checkpoint_step"], "2")
+            self.assertEqual(row["image_id"], "")
+            self.assertTrue(row["image_tag"].endswith("-replay-step4"))
+
     def test_initial_checkpoint_gets_its_own_labeled_image(self):
         calls = []
 

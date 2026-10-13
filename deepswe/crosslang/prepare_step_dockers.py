@@ -135,7 +135,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("steps_csv", type=Path, help="含 trial,step 两列；step 为 0 基 tool-call step")
     ap.add_argument("--trials-dir", type=Path, default=HERE / "full_trials")
-    ap.add_argument("-o", "--output", type=Path, default=Path("steps_docker.csv"))
+    ap.add_argument("-o", "--output", type=Path,
+                    help="输出 CSV；正式构建默认 steps_docker.csv，预览默认 steps_docker.plan.csv")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只验证输入、检查原始镜像并生成计划 CSV；不启动容器或创建镜像")
     ap.add_argument("--buffer-steps", type=int, default=5)
     ap.add_argument("--step-base", type=int, choices=(0, 1), default=0,
                     help="输入 CSV 的 step 编号起点；输出统一转换为 0 基（默认 0）")
@@ -143,6 +146,10 @@ def main():
     args = ap.parse_args()
     if args.buffer_steps < 0:
         ap.error("--buffer-steps 不能为负")
+    if args.output is None:
+        args.output = Path("steps_docker.plan.csv" if args.dry_run else "steps_docker.csv")
+    if args.output.resolve() == args.steps_csv.resolve():
+        ap.error("输出 CSV 不能覆盖输入 steps.csv")
     with args.steps_csv.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or not {"trial", "step"}.issubset(reader.fieldnames):
@@ -177,6 +184,11 @@ def main():
             key = (trial, checkpoint, trace_hash, task_hash, base_id)
             token = hashlib.sha256(repr(key).encode()).hexdigest()[:20]
             tag = checkpoint_tag(base_ref, token, row["input_step"])
+            row["image_tag"] = tag
+            if args.dry_run:
+                row["status"] = "planned"
+                print(f"[{index}/{len(rows)}] PLAN {trial} step={step} checkpoint={checkpoint} {tag}")
+                continue
             if key not in cache:
                 log_dir = args.logs_dir / f"{index:04d}-{token}"
                 cache[key] = prepare_checkpoint(directory, checkpoint, base_ref, log_dir, tag, token)
@@ -184,7 +196,6 @@ def main():
                 tagged = docker("tag", cache[key], tag)
                 if tagged.returncode:
                     raise RuntimeError(f"给共用检查点添加 step tag 失败: {tagged.stderr.strip()[:300]}")
-            row["image_tag"] = tag
             row["image_id"] = cache[key]
             row["status"] = "ready"
             print(f"[{index}/{len(rows)}] {trial} step={step} checkpoint={checkpoint} {tag}")
@@ -200,7 +211,8 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(args.output)
-    print(f"输出 {args.output}；ready={len(rows)-failed} error={failed}")
+    state = "planned" if args.dry_run else "ready"
+    print(f"输出 {args.output}；{state}={len(rows)-failed} error={failed}")
     return 1 if failed else 0
 
 

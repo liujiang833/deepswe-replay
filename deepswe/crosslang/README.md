@@ -261,6 +261,20 @@ step 0，也创建独立的带标签镜像，不把 replay 标签加到原始任
 python3 diagnose_step_prepare.py step_prepare_logs -o step_prepare_diagnosis.txt
 ```
 
+只重试失败项时，用上一次的清单作为输入：
+
+```bash
+# 准备阶段失败：只重建 steps_docker.csv 中 status=error 的行，原位更新清单
+python3 prepare_step_dockers.py steps_docker.csv --retry-failed --trials-dir full_trials
+
+# 测量阶段失败：只重新运行上一次 results.csv 中 status=error 的行，产生新批次
+python3 replay_selected_steps.py step_replay_runs/<批次>/results.csv \
+    --retry-failed --trials-dir full_trials
+```
+
+准备阶段重试会沿用失败行原来的预热步数；要改变预热长度，可同时传
+`--buffer-steps N`。每次准备的日志目录会加随机后缀，保留上次失败的诊断文件。
+
 反复准备环境前，可清理这批检查点镜像。脚本逐个核对 tag、镜像 ID 和 replay 标签，
 只调用 `docker image rm` 删除匹配的镜像引用；原始任务镜像不会进入候选名单。
 若镜像仍被容器使用，Docker 会拒绝删除，脚本记录失败并继续处理其它镜像。

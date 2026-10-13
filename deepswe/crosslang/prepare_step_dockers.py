@@ -140,34 +140,51 @@ def main():
                     help="输出 CSV；正式构建默认 steps_docker.csv，预览默认 steps_docker.plan.csv")
     ap.add_argument("--dry-run", action="store_true",
                     help="只验证输入、检查原始镜像并生成计划 CSV；不启动容器或创建镜像")
-    ap.add_argument("--buffer-steps", type=int, default=5)
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="输入上次的 steps_docker.csv，只重试 status=error 的行；默认原位更新清单")
+    ap.add_argument("--buffer-steps", type=int,
+                    help="预热 step 数；首次默认 5，重试默认沿用清单中的 warmup_steps")
     ap.add_argument("--step-base", type=int, choices=(0, 1), default=0,
                     help="输入 CSV 的 step 编号起点；输出统一转换为 0 基（默认 0）")
     ap.add_argument("--logs-dir", type=Path, default=Path("step_prepare_logs"))
     args = ap.parse_args()
-    if args.buffer_steps < 0:
+    if args.buffer_steps is not None and args.buffer_steps < 0:
         ap.error("--buffer-steps 不能为负")
+    if args.retry_failed and args.dry_run:
+        ap.error("--retry-failed 不能与 --dry-run 同时使用")
+    if args.retry_failed and args.step_base != 0:
+        ap.error("重试清单中的 step 已是 0 基编号，不要再传 --step-base")
     if args.output is None:
-        args.output = Path("steps_docker.plan.csv" if args.dry_run else "steps_docker.csv")
-    if args.output.resolve() == args.steps_csv.resolve():
+        args.output = (args.steps_csv if args.retry_failed else
+                       Path("steps_docker.plan.csv" if args.dry_run else "steps_docker.csv"))
+    if not args.retry_failed and args.output.resolve() == args.steps_csv.resolve():
         ap.error("输出 CSV 不能覆盖输入 steps.csv")
     with args.steps_csv.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or not {"trial", "step"}.issubset(reader.fieldnames):
             ap.error("steps.csv 必须包含 trial 和 step 两列")
+        if args.retry_failed and not {"status", "input_step", "step_base"}.issubset(reader.fieldnames):
+            ap.error("--retry-failed 需要上次生成的 steps_docker.csv")
         source_fields = list(reader.fieldnames)
         rows = list(reader)
     output_fields = source_fields + [field for field in FIELDS if field not in source_fields]
     cache = {}
     trial_cache = {}
     failed = 0
+    skipped = 0
     for index, row in enumerate(rows, 1):
+        if args.retry_failed and row.get("status") != "error":
+            skipped += 1
+            continue
+        previous_input_step = row.get("input_step", "").strip() if args.retry_failed else ""
+        previous_step_base = (row.get("step_base", "0").strip() or "0") if args.retry_failed else "0"
+        previous_warmup = row.get("warmup_steps", "").strip() if args.retry_failed else ""
         row.update({key: "" for key in FIELDS})
         try:
             trial = row["trial"].strip()
-            row["input_step"] = row["step"].strip()
-            row["step_base"] = str(args.step_base)
-            step = int(row["input_step"]) - args.step_base
+            row["input_step"] = previous_input_step or row["step"].strip()
+            row["step_base"] = previous_step_base if args.retry_failed else str(args.step_base)
+            step = int(row["input_step"]) - int(row["step_base"])
             row["step"] = str(step)
             if trial not in trial_cache:
                 trial_cache[trial] = trial_info(args.trials_dir, trial)
@@ -175,7 +192,9 @@ def main():
             if not 0 <= step < n_steps or not any(
                     it["step"] == step and not it["sentinel"] for it in items):
                 raise ValueError(f"step {step} 不存在或没有可执行命令；有效范围 0..{n_steps-1}")
-            checkpoint = max(0, step - args.buffer_steps)
+            buffer_steps = (args.buffer_steps if args.buffer_steps is not None else
+                            int(previous_warmup) if previous_warmup else 5)
+            checkpoint = max(0, step - buffer_steps)
             base_id = image_id(base_ref)
             row["checkpoint_step"] = str(checkpoint)
             row["warmup_steps"] = str(step - checkpoint)
@@ -191,7 +210,7 @@ def main():
                 print(f"[{index}/{len(rows)}] PLAN {trial} step={step} checkpoint={checkpoint} {tag}")
                 continue
             if key not in cache:
-                log_dir = args.logs_dir / f"{index:04d}-{token}"
+                log_dir = args.logs_dir / f"{index:04d}-{token}-{secrets.token_hex(3)}"
                 cache[key] = prepare_checkpoint(directory, checkpoint, base_ref, log_dir, tag, token)
             else:
                 tagged = docker("tag", cache[key], tag)
@@ -213,7 +232,8 @@ def main():
         writer.writerows(rows)
     temporary.replace(args.output)
     state = "planned" if args.dry_run else "ready"
-    print(f"输出 {args.output}；{state}={len(rows)-failed} error={failed}")
+    print(f"输出 {args.output}；{state}={len(rows)-failed} error={failed}"
+          + (f"；跳过已有结果 {skipped}" if args.retry_failed else ""))
     return 1 if failed else 0
 
 

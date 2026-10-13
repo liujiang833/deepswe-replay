@@ -90,6 +90,65 @@ class SelectedStepReplayTest(unittest.TestCase):
             self.assertEqual(row["image_id"], "")
             self.assertTrue(row["image_tag"].endswith("-replay-step4"))
 
+    def test_prepare_retry_keeps_ready_row_and_replays_only_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trial = root / "trials" / "sample"
+            trial.mkdir(parents=True)
+            (trial / "trajectory.json").write_text(json.dumps(trajectory()))
+            (trial / "task.json").write_text(json.dumps({"files": [
+                {"path": "task.toml", "content": 'docker_image = "example:fixed"\n'}]}))
+            manifest = root / "steps_docker.csv"
+            fields = ["trial", "step", "input_step", "step_base", "warmup_steps",
+                      "image_tag", "image_id", "status", "error"]
+            with manifest.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow({"trial": "sample", "step": "1", "input_step": "2",
+                                 "step_base": "1", "warmup_steps": "1", "image_id": "sha256:old",
+                                 "status": "ready"})
+                writer.writerow({"trial": "sample", "step": "4", "input_step": "5",
+                                 "step_base": "1", "warmup_steps": "2", "status": "error"})
+            argv = ["prepare_step_dockers.py", str(manifest), "--trials-dir", str(root / "trials"),
+                    "--retry-failed", "--logs-dir", str(root / "logs")]
+            with patch.object(sys, "argv", argv), \
+                 patch.object(prepare, "image_id", return_value="sha256:base"), \
+                 patch.object(prepare, "prepare_checkpoint", return_value="sha256:new") as commit:
+                self.assertEqual(prepare.main(), 0)
+            with manifest.open(newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["image_id"], "sha256:old")
+            self.assertEqual(rows[0]["status"], "ready")
+            self.assertEqual(rows[1]["step"], "4")
+            self.assertEqual(rows[1]["checkpoint_step"], "2")
+            self.assertEqual(rows[1]["input_step"], "5")
+            self.assertEqual(rows[1]["status"], "ready")
+            commit.assert_called_once()
+
+    def test_measure_retry_selects_only_failed_result_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "results.csv"
+            fields = ["trial", "step", "checkpoint_step", "warmup_steps", "image_tag",
+                      "image_id", "trace_sha256", "task_sha256", "status", "error"]
+            with previous.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                for status in ("ok", "error"):
+                    writer.writerow({"trial": "sample", "step": "4", "checkpoint_step": "2",
+                                     "warmup_steps": "2", "image_tag": "example:fixed-replay-step4",
+                                     "image_id": "sha256:prepared", "trace_sha256": "trace",
+                                     "task_sha256": "task", "status": status})
+            argv = ["replay_selected_steps.py", str(previous), "--retry-failed",
+                    "--output-dir", str(root / "retry")]
+            with patch.object(sys, "argv", argv), patch.object(selected, "run_one") as run_one:
+                run_one.side_effect = lambda row, *_: dict(row, status="ok", error="")
+                self.assertEqual(selected.main(), 0)
+            run_one.assert_called_once()
+            self.assertEqual(run_one.call_args.args[0]["status"], "ready")
+            with (root / "retry" / "results.csv").open(newline="") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 1)
+
     def test_initial_checkpoint_gets_its_own_labeled_image(self):
         calls = []
 

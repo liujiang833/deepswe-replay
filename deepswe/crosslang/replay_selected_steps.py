@@ -44,6 +44,8 @@ def run_one(row, index, repetition, trials_dir, root, cpuset):
     try:
         if row.get("status") != "ready":
             raise ValueError("检查点行不是 ready")
+        if not row.get("image_id", "").strip():
+            raise ValueError("该用例没有检查点镜像；请先重试准备阶段")
         trial = row["trial"].strip()
         if not trial or Path(trial).name != trial or trial in (".", ".."):
             raise ValueError(f"非法 trial 目录名: {trial!r}")
@@ -137,6 +139,8 @@ def main():
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--cpuset-cpus", default="")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="输入上次的 results.csv，只重新采集 status=error 的行")
     args = ap.parse_args()
     if args.repeat < 1:
         ap.error("--repeat 必须大于 0")
@@ -148,6 +152,8 @@ def main():
             ap.error(f"steps_docker.csv 缺列: {sorted(required - set(reader.fieldnames or []))}")
         source_fields = list(reader.fieldnames)
         rows = list(reader)
+    if args.retry_failed:
+        rows = [dict(row, status="ready") for row in rows if row.get("status") == "error"]
     root = args.output_dir or (Path("step_replay_runs") /
            (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)))
     root.mkdir(parents=True, exist_ok=False)

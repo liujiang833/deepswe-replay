@@ -104,7 +104,8 @@ def prepare_checkpoint(trial_dir, checkpoint_step, base_ref, log_dir, tag, token
             raise RuntimeError(f"容器身份不一致；见 {verdict_path}")
         n = verdict.get("n_replayed")
         if n is None or verdict.get("rc_match_semantic") != f"{n}/{n}":
-            raise RuntimeError(f"前缀命令退出码与轨迹不符；见 {verdict_path}")
+            raise RuntimeError(f"前缀命令退出码与轨迹不符；运行 python3 "
+                               f"{HERE / 'diagnose_step_prepare.py'} {verdict_path}")
         mounts = docker("inspect", "-f", "{{json .Mounts}}", container)
         if mounts.returncode:
             raise RuntimeError(f"读取容器挂载失败: {mounts.stderr.strip()[:300]}")

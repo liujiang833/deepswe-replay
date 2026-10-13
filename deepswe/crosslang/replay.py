@@ -878,7 +878,8 @@ def main():
                    "rbytes": d("rbytes"), "wbytes": d("wbytes"),
                    "mem_peak": mem_peak, "mem_samples": mem_n,
                    "cmd": cmd, "cmd_stripped": strip_cd(cmd),
-                   "stdout_head": so[:4000].decode(errors="replace")}
+                   "stdout_head": so[:4000].decode(errors="replace"),
+                   "stderr_head": se[:4000].decode(errors="replace")}
             recs.append(rec)
             # 慢命令（dt > 10）照旧必打——它本身就是最该被看见的那种。
             if i % PROGRESS_EVERY_N == 0 or dt > 10:
@@ -955,7 +956,8 @@ def main():
             if strict:
                 same += 1
             else:
-                mism.append({"i": r["i"], "trace_rc": r["trace_rc"], "replay_rc": r["rc"],
+                mism.append({"i": r["i"], "step": r.get("step"),
+                             "trace_rc": r["trace_rc"], "replay_rc": r["rc"],
                              "timed_out": r["timed_out"], "wall_s": r["wall_s"],
                              "semantic_match": semantic,
                              "cmd": r["cmd"][:100]})

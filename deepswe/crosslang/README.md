@@ -253,6 +253,14 @@ step 0，也创建独立的带标签镜像，不把 replay 标签加到原始任
 局部重放不会拿整条 trial 的 `model.patch` 作最终校验，改为检查所执行命令的
 退出码与轨迹是否一致。`--limit` 是**命令数量**截断，不能替代 step 范围。
 
+若准备时报「前缀命令退出码与轨迹不符」，可直接检查全部准备日志；报告会列出
+不匹配的 step、命令、两边退出码与已有输出。也可以把报错中的 `verdict.json` 路径
+作为参数，只看单条轨迹。
+
+```bash
+python3 diagnose_step_prepare.py step_prepare_logs -o step_prepare_diagnosis.txt
+```
+
 反复准备环境前，可清理这批检查点镜像。脚本逐个核对 tag、镜像 ID 和 replay 标签，
 只调用 `docker image rm` 删除匹配的镜像引用；原始任务镜像不会进入候选名单。
 若镜像仍被容器使用，Docker 会拒绝删除，脚本记录失败并继续处理其它镜像。

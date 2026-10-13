@@ -248,6 +248,11 @@ step 0，也创建独立的带标签镜像，不把 replay 标签加到原始任
 第二阶段每轮从检查点镜像新建容器，重放 `[checkpoint_step, s+1)`。
 容器 cgroup 出现后启动 `perf stat -I 10`，采集期间不控制计数器；
 沿用 `topdown_steps.py` 的时间戳对齐与 step 窗口归并，最终只取目标 step 的行。
+准备与测量都使用原始 mini-swe-agent 的 **宿主侧固定 30 秒命令超时**：
+命令里写 `timeout 600` 也不会延长 agent 的 30 秒上限。原始 Docker harness
+只超时并终止 `docker exec` 客户端，容器内命令可能继续运行；检查点处若仍有后台
+进程，准备脚本会拒绝 `docker commit`。旧的整条 trial 入口仍默认使用此前的
+`adaptive` 超时策略，结果在 `verdict.json` 的 `timeout_policy` 字段区分。
 `step_replay_runs/<批次>/results.csv` 保存目标四象限、cycles、退出码及数据状态，
 原始 perf、预热步和目标步的完整结果保留在各轮目录中。
 

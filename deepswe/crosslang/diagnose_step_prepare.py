@@ -77,6 +77,7 @@ def diagnose_verdict(path, trials_dir, max_chars):
     mismatches = [m for m in verdict.get("rc_mismatches", [])
                   if m.get("semantic_match") is False]
     lines = [f"轨迹: {trial}", f"判定文件: {path}",
+             f"重放超时策略: {verdict.get('timeout_policy', '旧结果未记录')}",
              f"语义匹配: {verdict.get('rc_match_semantic', '未知')}；实际重放: {verdict.get('n_replayed', '未知')} 条",
              f"真正不匹配: {len(mismatches)} 条"]
     if not mismatches:
@@ -90,7 +91,8 @@ def diagnose_verdict(path, trials_dir, max_chars):
         lines.extend([
             "",
             f"命令 i={index}，step={step}，原始 rc={mismatch.get('trace_rc')}，"
-            f"重放 rc={mismatch.get('replay_rc')}，重放耗时={mismatch.get('wall_s', record.get('wall_s', '未知'))}s",
+            f"重放 rc={mismatch.get('replay_rc')}，重放耗时={mismatch.get('wall_s', record.get('wall_s', '未知'))}s，"
+            f"重放上限={record.get('cmd_timeout_s', '未知')}s",
             "命令:", excerpt(record.get("cmd", mismatch.get("cmd", "")), max_chars),
             "原始输出:", excerpt(original.get("output"), max_chars),
             "重放 stdout:", excerpt(record.get("stdout_head"), max_chars),

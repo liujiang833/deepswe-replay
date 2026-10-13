@@ -53,6 +53,9 @@ def run_one(row, index, repetition, trials_dir, root, cpuset):
         checkpoint = int(row["checkpoint_step"])
         if not 0 <= checkpoint <= step or step - checkpoint != int(row["warmup_steps"]):
             raise ValueError("checkpoint_step、step、warmup_steps 不一致")
+        timeout_policy = row.get("timeout_policy") or "adaptive"  # 旧清单沿用原口径
+        if timeout_policy not in ("adaptive", "harness"):
+            raise ValueError(f"未知超时策略: {timeout_policy}")
         directory = trials_dir / trial
         actual_hash = hashlib.sha256((directory / "trajectory.json").read_bytes()).hexdigest()
         if actual_hash != row["trace_sha256"]:
@@ -77,6 +80,7 @@ def run_one(row, index, repetition, trials_dir, root, cpuset):
         cmd = ["bash", str(HERE / "topdown_trial.sh"), str(directory),
                "--per-step", "--no-metrics", "--from-image", image,
                "--start-step", str(checkpoint), "--stop-before-step", str(step + 1),
+               "--timeout-policy", timeout_policy,
                "-o", str(out_root)]
         if cpuset:
             cmd.extend(["--cpuset-cpus", cpuset])
@@ -95,6 +99,8 @@ def run_one(row, index, repetition, trials_dir, root, cpuset):
         verdict = json.loads((trial_out / "verdict.json").read_text())
         if (verdict.get("start_step"), verdict.get("stop_before_step")) != (checkpoint, step + 1):
             raise RuntimeError("重放的 step 范围与 CSV 不一致")
+        if verdict.get("timeout_policy") != timeout_policy:
+            raise RuntimeError("重放的超时策略与检查点清单不一致")
         n = verdict.get("n_replayed")
         if n is None or verdict.get("rc_match_semantic") != f"{n}/{n}":
             raise RuntimeError(f"预热或目标命令退出码与轨迹不符：{verdict.get('rc_match_semantic')}")

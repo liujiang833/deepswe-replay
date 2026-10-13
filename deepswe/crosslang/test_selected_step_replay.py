@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import prepare_step_dockers as prepare
 import cleanup_step_dockers as cleanup
 import replay_selected_steps as selected
+import replay as replay_module
 from replay import load_trace, select_trace_commands
 
 
@@ -27,6 +28,31 @@ def trajectory():
 
 
 class SelectedStepReplayTest(unittest.TestCase):
+    def test_harness_timeout_ignores_inner_600_seconds_and_returns_minus_one(self):
+        command = "timeout 600 true"
+
+        def expire(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], 30)
+            self.assertEqual(argv[5:7], ["/bin/sh", "-c"])
+            raise subprocess.TimeoutExpired(argv, 30, output=b"partial output")
+
+        with patch.object(replay_module.subprocess, "run", side_effect=expire):
+            rc, stdout, _, outer, timed_out, limit = replay_module.execute_docker_command(
+                "container", ["/bin/sh", "-c"], command, 30, "harness")
+        self.assertEqual((rc, stdout, outer, timed_out, limit),
+                         (-1, b"partial output", True, True, 30))
+
+    def test_adaptive_timeout_still_extends_inner_600_seconds(self):
+        def complete(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], 670)
+            self.assertEqual(argv[5:9], ["timeout", "-k", "5", "610"])
+            return subprocess.CompletedProcess(argv, 0, b"done", b"")
+
+        with patch.object(replay_module.subprocess, "run", side_effect=complete):
+            rc, _, _, outer, timed_out, limit = replay_module.execute_docker_command(
+                "container", ["/bin/sh", "-c"], "timeout 600 true", 30, "adaptive")
+        self.assertEqual((rc, outer, timed_out, limit), (0, False, False, 610))
+
     def test_command_range_keeps_every_command_in_step(self):
         items = load_trace(trajectory())
         todo, skipped = select_trace_commands(items, 1, 2)
@@ -58,6 +84,7 @@ class SelectedStepReplayTest(unittest.TestCase):
             self.assertEqual([row["step"] for row in rows], ["4", "4"])
             self.assertEqual([row["checkpoint_step"] for row in rows], ["2", "2"])
             self.assertEqual([row["warmup_steps"] for row in rows], ["2", "2"])
+            self.assertTrue(all(row["timeout_policy"] == "harness" for row in rows))
             self.assertTrue(all(row["image_tag"].startswith("example:fixed-") and
                                 row["image_tag"].endswith("-replay-step5") for row in rows))
             self.assertEqual([row["cluster"] for row in rows], ["C1", "C2"])
@@ -217,7 +244,8 @@ class SelectedStepReplayTest(unittest.TestCase):
                    "warmup_steps": "2", "image_tag": "example:fixed-abc-replay-step5",
                    "image_id": "sha256:prepared",
                    "trace_sha256": hashlib.sha256(raw).hexdigest(),
-                   "task_sha256": hashlib.sha256(task_raw).hexdigest(), "status": "ready"}
+                   "task_sha256": hashlib.sha256(task_raw).hexdigest(),
+                   "timeout_policy": "harness", "status": "ready"}
 
             def fake_run(cmd, **_):
                 if cmd[:3] == ["docker", "image", "inspect"]:
@@ -225,6 +253,7 @@ class SelectedStepReplayTest(unittest.TestCase):
                 self.assertEqual(cmd[0], "bash")
                 self.assertEqual(cmd[cmd.index("--start-step") + 1], "2")
                 self.assertEqual(cmd[cmd.index("--stop-before-step") + 1], "5")
+                self.assertEqual(cmd[cmd.index("--timeout-policy") + 1], "harness")
                 output = Path(cmd[cmd.index("-o") + 1]) / "sample"
                 td = output / "topdown"
                 td.mkdir(parents=True)
@@ -232,7 +261,8 @@ class SelectedStepReplayTest(unittest.TestCase):
                     {"replay_rc": 0, "perf_rc": 0, "parse_rc": 0}))
                 (output / "verdict.json").write_text(json.dumps(
                     {"start_step": 2, "stop_before_step": 5,
-                     "n_replayed": 3, "rc_match_semantic": "3/3"}))
+                     "timeout_policy": "harness", "n_replayed": 3,
+                     "rc_match_semantic": "3/3"}))
                 (output / "commands.jsonl").write_text("\n".join(
                     json.dumps({"step": n}) for n in (2, 3, 4)))
                 (td / "topdown_steps_cleaned.json").write_text(json.dumps({

@@ -22,6 +22,7 @@
 #   bash topdown_trial.sh <trial目录> --limit 5      # 只重放前 5 条命令，冒烟用
 #   bash topdown_trial.sh <trial目录> --no-metrics   # 关掉 replay.py 自己那套 cgroup 指标
 #   bash topdown_trial.sh <trial目录> --cmd-timeout 30   # 透传给 replay.py 的单命令超时
+#   bash topdown_trial.sh <trial目录> --timeout-policy harness  # 原始 agent 的宿主侧固定超时
 #   bash topdown_trial.sh <trial目录> --cpuset-cpus 0,2  # 固定重放容器的逻辑 CPU
 #   bash topdown_trial.sh <trial目录> --per-step       # per-step topdown（perf stat -I 10 + 事后按 step 归并）
 #
@@ -40,7 +41,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$HERE/topdown.conf"
 
 TRIAL=""; OUTDIR=""; LIMIT=""; NO_METRICS=0; CMD_TIMEOUT=""; CPUSET_CPUS=""; PER_STEP=0
-START_STEP=""; STOP_BEFORE_STEP=""; FROM_IMAGE=""
+START_STEP=""; STOP_BEFORE_STEP=""; FROM_IMAGE=""; TIMEOUT_POLICY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--outdir) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; OUTDIR="$2"; shift 2 ;;
@@ -48,6 +49,7 @@ while [ $# -gt 0 ]; do
     --start-step) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; START_STEP="$2"; shift 2 ;;
     --stop-before-step) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; STOP_BEFORE_STEP="$2"; shift 2 ;;
     --from-image) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; FROM_IMAGE="$2"; shift 2 ;;
+    --timeout-policy) [ $# -ge 2 ] || { echo "❌ $1 缺少值"; exit 1; }; TIMEOUT_POLICY="$2"; shift 2 ;;
     # --cmd-timeout 只是原样透传给 replay.py。之所以要有这个口子：批量入口
     # （run_batch.py）一直在给 replay.py 传 --cmd-timeout 30（对齐原 harness 口径），
     # 改走本脚本之后如果这个值传不下去，同一批里 topdown 的那几条就换了口径，
@@ -359,6 +361,7 @@ if [ -n "$LIMIT" ]; then RCMD+=(--limit "$LIMIT"); fi
 if [ -n "$START_STEP" ]; then RCMD+=(--start-step "$START_STEP"); fi
 if [ -n "$STOP_BEFORE_STEP" ]; then RCMD+=(--stop-before-step "$STOP_BEFORE_STEP"); fi
 if [ -n "$FROM_IMAGE" ]; then RCMD+=(--from-image "$FROM_IMAGE"); fi
+if [ -n "$TIMEOUT_POLICY" ]; then RCMD+=(--timeout-policy "$TIMEOUT_POLICY"); fi
 if [ -n "$CMD_TIMEOUT" ]; then RCMD+=(--cmd-timeout "$CMD_TIMEOUT"); fi
 if [ -n "$CPUSET_CPUS" ]; then RCMD+=(--cpuset-cpus "$CPUSET_CPUS"); fi
 # replay.py 的 cgroup 指标和本脚本的 PMU 采集互不相干，关掉不影响四象限

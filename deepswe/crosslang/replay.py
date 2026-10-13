@@ -586,6 +586,27 @@ def select_trace_commands(items, start_step, stop_step):
     return todo, len(selected) - len(todo)
 
 
+def execute_docker_command(container, interp, command, default_timeout, timeout_policy):
+    """Run one action with either the original harness or adaptive timeout policy."""
+    cmd_timeout = (default_timeout if timeout_policy == "harness" else
+                   command_timeout_s(command, default_timeout))
+    argv = ["docker", "exec", "-w", "/app", container]
+    if timeout_policy == "adaptive":
+        argv += ["timeout", "-k", "5", str(cmd_timeout)]
+    argv += interp + [command]
+    outer_limit = cmd_timeout if timeout_policy == "harness" else cmd_timeout + OUTER_SLACK_S
+    try:
+        result = subprocess.run(argv, capture_output=True, timeout=outer_limit)
+        rc, stdout, stderr, outer = result.returncode, result.stdout, result.stderr, False
+    except subprocess.TimeoutExpired as exc:
+        # mini-swe-agent times out the host-side docker exec client and records -1.
+        # This does not necessarily stop the command already running in the container.
+        rc = -1 if timeout_policy == "harness" else -9
+        stdout, stderr, outer = exc.stdout or b"", exc.stderr or b"", True
+    timed_out = outer or rc in (124, 137)
+    return rc, stdout, stderr, outer, timed_out, cmd_timeout
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trial_dir", help="含 trajectory.json / model.patch 的目录")
@@ -601,7 +622,10 @@ def main():
                     help="从指定的本地检查点镜像启动，覆盖 task.toml 中的原始镜像")
     ap.add_argument("--keep", action="store_true", help="结束后保留容器")
     ap.add_argument("--cmd-timeout", type=int, default=30,
-                    help="单条命令在容器内的默认超时秒数，默认 30；命令里的 timeout/sleep 更长时自动延长")
+                    help="单条命令的基准超时秒数，默认 30；仅 adaptive 策略会按命令内 timeout/sleep 延长")
+    ap.add_argument("--timeout-policy", choices=("adaptive", "harness"), default="adaptive",
+                    help="adaptive=按命令内 timeout/sleep 延长容器内上限（旧口径）；"
+                         "harness=宿主侧固定超时，模拟原 mini-swe-agent（默认上限 30s）")
     ap.add_argument("--cpuset-cpus", default="", metavar="LIST",
                     help="把重放容器固定到指定逻辑 CPU，如 0,2 或 0-1；指定后不再设置 task.toml 的 --cpus 配额")
     ap.add_argument("--interpreter", default="/bin/sh -c",
@@ -686,8 +710,12 @@ def main():
     print(f"commands  {n_all} 条，step [{args.start_step}, {stop_step})，"
           f"跳过哨兵 {n_skipped} 条 → 实际重放 {len(todo)} 条")
     print(f"cpuset    {args.cpuset_cpus or '不绑核'}")
-    print(f"timeout   默认 {args.cmd_timeout}s；命令中的 timeout/sleep 更长时自动延长"
-          f"（宿主兜底另加 {OUTER_SLACK_S}s）")
+    if args.timeout_policy == "harness":
+        print(f"timeout   原始 harness 口径：宿主 docker exec 固定 {args.cmd_timeout}s，"
+              "不随命令内 timeout/sleep 延长")
+    else:
+        print(f"timeout   默认 {args.cmd_timeout}s；命令中的 timeout/sleep 更长时自动延长"
+              f"（宿主兜底另加 {OUTER_SLACK_S}s）")
     print(f"container {name}")
     print(f"output    {out}")
 
@@ -837,7 +865,6 @@ def main():
         ticker.start()
         for i, it in todo:
             cmd = it["cmd"]
-            cmd_timeout = command_timeout_s(cmd, args.cmd_timeout)
             # 先算好摘要：进度行和 ticker 的静默行引用的是同一个字符串，
             # 两边长得一样，看日志时才对得上是同一条命令。
             head = strip_cd(cmd)[:88].splitlines()
@@ -847,14 +874,8 @@ def main():
             before = cg.sample()
             mem.reset()
             t0 = time.monotonic()
-            try:
-                p = subprocess.run(
-                    ["docker", "exec", "-w", "/app", name,
-                     "timeout", "-k", "5", str(cmd_timeout)] + interp + [cmd],
-                    capture_output=True, timeout=cmd_timeout + OUTER_SLACK_S)
-                rc, so, se, outer = p.returncode, p.stdout, p.stderr, False
-            except subprocess.TimeoutExpired as e:
-                rc, so, se, outer = -9, (e.stdout or b""), (e.stderr or b""), True
+            rc, so, se, outer, timed_out, cmd_timeout = execute_docker_command(
+                name, interp, cmd, args.cmd_timeout, args.timeout_policy)
             dt = time.monotonic() - t0
             mem_peak, mem_n = mem.take()
             after = cg.sample()
@@ -865,9 +886,6 @@ def main():
                 if not before and not after:
                     return None
                 return after.get(k, 0) - before.get(k, 0)
-
-            # timeout 命令：TERM 超时退 124；-k 之后被 KILL 退 137
-            timed_out = rc in (124, 137)
 
             rec = {"i": i, "step": it.get("step"), "rc": rc, "timed_out": timed_out, "trace_rc": it["trace_rc"],
                    "cmd_timeout_s": cmd_timeout,
@@ -904,9 +922,11 @@ def main():
                    "start_step": args.start_step,
                    "stop_before_step": stop_step,
                    "partial_replay": partial_replay,
+                   "timeout_policy": args.timeout_policy,
                    "source_image": image,
                    "cmd_timeout_s": args.cmd_timeout,
-                   "cmd_timeout_policy": "default_with_explicit_command_timeout",
+                   "cmd_timeout_policy": ("fixed_host_timeout" if args.timeout_policy == "harness"
+                                          else "default_with_explicit_command_timeout"),
                    "interpreter": interp,
                    "net_mode": "internet" if allow_net else ("sinkhole403" if use_sink else "none"),
                    "n_cmds_trace": n_all, "n_skipped_sentinel": n_skipped,

@@ -20,10 +20,11 @@ from replay import load_trace, task_field
 
 
 HERE = Path(__file__).resolve().parent
+TIMEOUT_POLICY = "harness"
 REPLAY_LABEL = "org.deepswe.per-step-replay"
 SOURCE_LABEL = REPLAY_LABEL + ".source"
 FIELDS = ("input_step", "step_base", "checkpoint_step", "warmup_steps", "image_tag", "image_id", "base_image_id",
-          "trace_sha256", "task_sha256", "status", "error")
+          "trace_sha256", "task_sha256", "timeout_policy", "status", "error")
 
 
 def docker(*args):
@@ -93,6 +94,7 @@ def prepare_checkpoint(trial_dir, checkpoint_step, base_ref, log_dir, tag, token
     cmd = [sys.executable, str(HERE / "replay.py"), str(trial_dir),
            str(trial_dir / "task.json"), "-o", str(log_dir),
            "--stop-before-step", str(checkpoint_step), "--no-metrics", "--keep",
+           "--timeout-policy", TIMEOUT_POLICY,
            "--container-salt", salt]
     proc = None
     container = None
@@ -205,8 +207,9 @@ def main():
             row["warmup_steps"] = str(step - checkpoint)
             row["trace_sha256"] = trace_hash
             row["task_sha256"] = task_hash
+            row["timeout_policy"] = TIMEOUT_POLICY
             row["base_image_id"] = base_id
-            key = (trial, checkpoint, trace_hash, task_hash, base_id)
+            key = (trial, checkpoint, trace_hash, task_hash, base_id, TIMEOUT_POLICY)
             token = hashlib.sha256(repr(key).encode()).hexdigest()[:20]
             tag = checkpoint_tag(base_ref, token, row["input_step"])
             row["image_tag"] = tag

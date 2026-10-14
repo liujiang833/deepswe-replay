@@ -14,7 +14,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 RESULT_FIELDS = ("repeat", "run_dir", "status", "error", "replay_rc", "perf_rc",
-                 "parse_rc", "target_cycles", "Retiring", "BadSpec",
+                 "parse_rc", "rc_relaxed_count", "target_cycles", "Retiring", "BadSpec",
                  "FrontendBound", "BackendBound")
 
 
@@ -102,8 +102,9 @@ def run_one(row, index, repetition, trials_dir, root, cpuset):
         if verdict.get("timeout_policy") != timeout_policy:
             raise RuntimeError("重放的超时策略与检查点清单不一致")
         n = verdict.get("n_replayed")
-        if n is None or verdict.get("rc_match_semantic") != f"{n}/{n}":
-            raise RuntimeError(f"预热或目标命令退出码与轨迹不符：{verdict.get('rc_match_semantic')}")
+        if n is None or verdict.get("rc_match_relaxed") != f"{n}/{n}":
+            raise RuntimeError(f"预热或目标命令退出码与轨迹不符：{verdict.get('rc_match_relaxed')}")
+        result["rc_relaxed_count"] = str(verdict.get("rc_relaxed_count", 0))
         commands = [json.loads(line) for line in (trial_out / "commands.jsonl").read_text().splitlines() if line]
         target_commands = [cmd for cmd in commands if cmd.get("step") == step]
         if not target_commands:

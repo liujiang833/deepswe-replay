@@ -74,14 +74,21 @@ def diagnose_verdict(path, trials_dir, max_chars):
     if not trajectory.is_file():
         trajectory = HERE / trial / "trajectory.json"
     originals = trace_details(trajectory)
+    accepted = [m for m in verdict.get("rc_mismatches", [])
+                if m.get("semantic_match") is False and m.get("relaxed_match") is True]
     mismatches = [m for m in verdict.get("rc_mismatches", [])
-                  if m.get("semantic_match") is False]
+                  if m.get("semantic_match") is False and m.get("relaxed_match") is not True]
     lines = [f"轨迹: {trial}", f"判定文件: {path}",
              f"重放超时策略: {verdict.get('timeout_policy', '旧结果未记录')}",
              f"语义匹配: {verdict.get('rc_match_semantic', '未知')}；实际重放: {verdict.get('n_replayed', '未知')} 条",
+             f"原始失败、重放成功（已接受）: {len(accepted)} 条",
              f"真正不匹配: {len(mismatches)} 条"]
+    for mismatch in accepted:
+        index = mismatch.get("i")
+        step = records.get(index, {}).get("step", mismatch.get("step", "未知"))
+        lines.append(f"  已接受 i={index} step={step}: 原始 rc={mismatch.get('trace_rc')}，重放 rc=0")
     if not mismatches:
-        lines.append("没有语义退出码差异。非零退出码若两边相同，也属于匹配。")
+        lines.append("没有阻断检查点构建的退出码差异。")
         return "\n".join(lines)
     for mismatch in mismatches:
         index = mismatch.get("i")

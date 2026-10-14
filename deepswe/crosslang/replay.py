@@ -586,6 +586,16 @@ def select_trace_commands(items, start_step, stop_step):
     return todo, len(selected) - len(todo)
 
 
+def rc_match_kind(trace_rc, replay_rc, timed_out):
+    if trace_rc == replay_rc:
+        return "strict"
+    if trace_rc == -1 and timed_out:
+        return "semantic"
+    if trace_rc is not None and trace_rc != 0 and replay_rc == 0:
+        return "relaxed"
+    return "mismatch"
+
+
 def execute_docker_command(container, interp, command, default_timeout, timeout_policy):
     """Run one action with either the original harness or adaptive timeout policy."""
     cmd_timeout = (default_timeout if timeout_policy == "harness" else
@@ -969,25 +979,32 @@ def main():
         #   rc_match          严格逐值比对
         #   rc_match_semantic trace 侧 -1（被原 harness 打死）与重放侧 timed_out
         #                     （容器内 timeout 打死，rc 124/137）行为一致，视为匹配
-        same, same_sem, mism = 0, 0, []
+        same, same_sem, relaxed_count, mism = 0, 0, 0, []
         for r in recs:
-            strict = (r["trace_rc"] == r["rc"])
-            semantic = strict or (r["trace_rc"] == -1 and r["timed_out"])
+            kind = rc_match_kind(r["trace_rc"], r["rc"], r["timed_out"])
+            strict = kind == "strict"
+            semantic = kind in ("strict", "semantic")
+            relaxed = kind == "relaxed"
             if strict:
                 same += 1
             else:
                 mism.append({"i": r["i"], "step": r.get("step"),
                              "trace_rc": r["trace_rc"], "replay_rc": r["rc"],
                              "timed_out": r["timed_out"], "wall_s": r["wall_s"],
-                             "semantic_match": semantic,
+                             "semantic_match": semantic, "relaxed_match": relaxed,
                              "cmd": r["cmd"][:100]})
             if semantic:
                 same_sem += 1
+            if relaxed:
+                relaxed_count += 1
         verdict["rc_match"] = f"{same}/{len(recs)}"
         verdict["rc_match_semantic"] = f"{same_sem}/{len(recs)}"
+        verdict["rc_match_relaxed"] = f"{same_sem + relaxed_count}/{len(recs)}"
+        verdict["rc_relaxed_count"] = relaxed_count
         verdict["rc_mismatches"] = mism
         print(f"  rc 序列一致 {same}/{len(recs)}（严格）"
-              f" / {same_sem}/{len(recs)}（语义：trace -1 == 重放 timed_out）")
+              f" / {same_sem}/{len(recs)}（语义）"
+              f" / {same_sem + relaxed_count}/{len(recs)}（接受原始失败、重放成功）")
 
         # ---- 时序背离：重放机比原机慢导致的超时口径差（预期存在，不是 bug）----
         div = []

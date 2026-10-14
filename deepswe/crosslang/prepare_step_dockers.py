@@ -24,7 +24,7 @@ TIMEOUT_POLICY = "harness"
 REPLAY_LABEL = "org.deepswe.per-step-replay"
 SOURCE_LABEL = REPLAY_LABEL + ".source"
 FIELDS = ("input_step", "step_base", "checkpoint_step", "warmup_steps", "image_tag", "image_id", "base_image_id",
-          "trace_sha256", "task_sha256", "timeout_policy", "status", "error")
+          "trace_sha256", "task_sha256", "timeout_policy", "checkpoint_rc_relaxed_count", "status", "error")
 
 
 def docker(*args):
@@ -84,7 +84,7 @@ def prepare_checkpoint(trial_dir, checkpoint_step, base_ref, log_dir, tag, token
             committed = docker("commit", *changes, name, tag)
             if committed.returncode:
                 raise RuntimeError(f"docker commit 失败: {committed.stderr.strip()[:300]}")
-            return image_id(tag)
+            return image_id(tag), 0
         finally:
             docker("rm", "-f", name)
     salt = secrets.token_hex(6)
@@ -110,9 +110,13 @@ def prepare_checkpoint(trial_dir, checkpoint_step, base_ref, log_dir, tag, token
         if verdict.get("container_name") != container:
             raise RuntimeError(f"容器身份不一致；见 {verdict_path}")
         n = verdict.get("n_replayed")
-        if n is None or verdict.get("rc_match_semantic") != f"{n}/{n}":
+        if n is None or verdict.get("rc_match_relaxed") != f"{n}/{n}":
             raise RuntimeError(f"前缀命令退出码与轨迹不符；运行 python3 "
                                f"{HERE / 'diagnose_step_prepare.py'} {verdict_path}")
+        relaxed_count = int(verdict.get("rc_relaxed_count", 0))
+        if relaxed_count:
+            print(f"前缀有 {relaxed_count} 条原始失败、重放成功的命令；"
+                  f"已接受并记录于 {verdict_path}")
         mounts = docker("inspect", "-f", "{{json .Mounts}}", container)
         if mounts.returncode:
             raise RuntimeError(f"读取容器挂载失败: {mounts.stderr.strip()[:300]}")
@@ -126,7 +130,7 @@ def prepare_checkpoint(trial_dir, checkpoint_step, base_ref, log_dir, tag, token
         committed = docker("commit", *changes, container, tag)
         if committed.returncode:
             raise RuntimeError(f"docker commit 失败: {committed.stderr.strip()[:300]}")
-        return image_id(tag)
+        return image_id(tag), relaxed_count
     finally:
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -221,10 +225,10 @@ def main():
                 log_dir = args.logs_dir / f"{index:04d}-{token}-{secrets.token_hex(3)}"
                 cache[key] = prepare_checkpoint(directory, checkpoint, base_ref, log_dir, tag, token)
             else:
-                tagged = docker("tag", cache[key], tag)
+                tagged = docker("tag", cache[key][0], tag)
                 if tagged.returncode:
                     raise RuntimeError(f"给共用检查点添加 step tag 失败: {tagged.stderr.strip()[:300]}")
-            row["image_id"] = cache[key]
+            row["image_id"], row["checkpoint_rc_relaxed_count"] = cache[key]
             row["status"] = "ready"
             print(f"[{index}/{len(rows)}] {trial} step={step} checkpoint={checkpoint} {tag}")
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as exc:

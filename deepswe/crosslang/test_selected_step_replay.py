@@ -28,6 +28,14 @@ def trajectory():
 
 
 class SelectedStepReplayTest(unittest.TestCase):
+    def test_original_failure_replay_success_is_accepted_and_other_divergence_is_not(self):
+        cases = [(-1, 0, False, "relaxed"), (1, 0, False, "relaxed"),
+                 (0, 0, False, "strict"), (-1, 124, True, "semantic"),
+                 (0, 1, False, "mismatch"), (None, 0, False, "mismatch")]
+        for trace_rc, replay_rc, timed_out, expected in cases:
+            with self.subTest(trace_rc=trace_rc, replay_rc=replay_rc):
+                self.assertEqual(replay_module.rc_match_kind(trace_rc, replay_rc, timed_out), expected)
+
     def test_harness_timeout_ignores_inner_600_seconds_and_returns_minus_one(self):
         command = "timeout 600 true"
 
@@ -75,7 +83,7 @@ class SelectedStepReplayTest(unittest.TestCase):
                     "--step-base", "1", "--buffer-steps", "2"]
             with patch.object(sys, "argv", argv), \
                  patch.object(prepare, "image_id", return_value="sha256:base"), \
-                 patch.object(prepare, "prepare_checkpoint", return_value="sha256:prepared") as commit, \
+                 patch.object(prepare, "prepare_checkpoint", return_value=("sha256:prepared", 1)) as commit, \
                  patch.object(prepare, "docker", return_value=subprocess.CompletedProcess([], 0)):
                 self.assertEqual(prepare.main(), 0)
             with output_csv.open(newline="") as f:
@@ -84,6 +92,7 @@ class SelectedStepReplayTest(unittest.TestCase):
             self.assertEqual([row["step"] for row in rows], ["4", "4"])
             self.assertEqual([row["checkpoint_step"] for row in rows], ["2", "2"])
             self.assertEqual([row["warmup_steps"] for row in rows], ["2", "2"])
+            self.assertEqual([row["checkpoint_rc_relaxed_count"] for row in rows], ["1", "1"])
             self.assertTrue(all(row["timeout_policy"] == "harness" for row in rows))
             self.assertTrue(all(row["image_tag"].startswith("example:fixed-") and
                                 row["image_tag"].endswith("-replay-step5") for row in rows))
@@ -140,7 +149,7 @@ class SelectedStepReplayTest(unittest.TestCase):
                     "--retry-failed", "--logs-dir", str(root / "logs")]
             with patch.object(sys, "argv", argv), \
                  patch.object(prepare, "image_id", return_value="sha256:base"), \
-                 patch.object(prepare, "prepare_checkpoint", return_value="sha256:new") as commit:
+                 patch.object(prepare, "prepare_checkpoint", return_value=("sha256:new", 0)) as commit:
                 self.assertEqual(prepare.main(), 0)
             with manifest.open(newline="") as f:
                 rows = list(csv.DictReader(f))
@@ -188,7 +197,7 @@ class SelectedStepReplayTest(unittest.TestCase):
             prepared = prepare.prepare_checkpoint(Path("sample"), 0, "example:fixed",
                                                   Path("unused"), "example:fixed-abc-replay-step0",
                                                   "abcdef0123456789abcd")
-        self.assertEqual(prepared, "sha256:prepared")
+        self.assertEqual(prepared, ("sha256:prepared", 0))
         self.assertEqual(calls[0][0], "create")
         self.assertEqual(calls[1][0], "commit")
         self.assertIn(f"LABEL {prepare.REPLAY_LABEL}=true", calls[1])
@@ -262,7 +271,8 @@ class SelectedStepReplayTest(unittest.TestCase):
                 (output / "verdict.json").write_text(json.dumps(
                     {"start_step": 2, "stop_before_step": 5,
                      "timeout_policy": "harness", "n_replayed": 3,
-                     "rc_match_semantic": "3/3"}))
+                     "rc_match_semantic": "2/3", "rc_match_relaxed": "3/3",
+                     "rc_relaxed_count": 1}))
                 (output / "commands.jsonl").write_text("\n".join(
                     json.dumps({"step": n}) for n in (2, 3, 4)))
                 (td / "topdown_steps_cleaned.json").write_text(json.dumps({
@@ -280,6 +290,7 @@ class SelectedStepReplayTest(unittest.TestCase):
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["target_cycles"], "123")
             self.assertEqual(result["Retiring"], "0.1")
+            self.assertEqual(result["rc_relaxed_count"], "1")
 
 
 if __name__ == "__main__":
